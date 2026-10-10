@@ -2,13 +2,13 @@
 name = "homura"
 version = "0.1.0"
 edition = "2024"
-description = "A deep learning framework for AMD ROCm, written in Rust"
+description = "A PyTorch-like tensor computing framework in Rust, built on hardware vendors' official toolchains"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/TOBYYH/homura"
 readme = "README.md"
-keywords = ["deep-learning", "rocm", "amd", "gpu", "tensor"]
+keywords = ["deep-learning", "tensor", "pytorch", "gpu", "rocm"]
 categories = ["science", "mathematics"]
-exclude = ["/tools", "/tests/golden"]
+exclude = ["/tools", "/tests"]
 
 [workspace]
 members = ["homura-derive"]

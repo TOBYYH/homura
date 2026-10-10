@@ -1,8 +1,14 @@
 # homura
 
-A deep learning framework for AMD ROCm, written in Rust.
+A tensor computing framework written in Rust that aims to feel as close to PyTorch as possible.
+Each hardware backend is built directly on the vendor's latest official development tools, so that
+it can get the best performance out of the hardware.
 
-> This project is in early development. The API is not stable yet and it is not ready for real-world use.
+The first GPU backend targets AMD ROCm. Backends for other hardware will be added once the ROCm
+backend is stable.
+
+> This project is in early development: only the CPU reference backend and the meta device are
+> implemented so far. The API is not stable yet and it is not ready for real-world use.
 
 ## License
 

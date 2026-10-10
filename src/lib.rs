@@ -1,4 +1,5 @@
-//! homura: a deep learning framework for AMD ROCm, written in Rust.
+//! homura: a PyTorch-like tensor computing framework written in Rust, with hardware backends built
+//! on the vendors' latest official development tools.
 //!
 //! The design follows PyTorch: [`Tensor`] has reference semantics, operations broadcast and
 //! promote dtypes like PyTorch, and tensor methods use PyTorch's names. Everything else follows

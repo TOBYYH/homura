@@ -8,5 +8,20 @@ repository = "https://github.com/TOBYYH/homura"
 readme = "README.md"
 keywords = ["deep-learning", "rocm", "amd", "gpu", "tensor"]
 categories = ["science", "mathematics"]
+exclude = ["/tools", "/tests/golden"]
+
+[workspace]
+members = ["homura-derive"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[lints]
+workspace = true
 
 [dependencies]
+half = "2.7"

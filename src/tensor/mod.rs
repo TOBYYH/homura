@@ -1,0 +1,326 @@
+//! The [`Tensor`] type.
+
+use std::sync::{Arc, Mutex, RwLock};
+
+use crate::autograd::AutogradMeta;
+use crate::backend::cpu;
+use crate::shape::{contiguous_strides, is_contiguous};
+use crate::storage::Storage;
+use crate::{DType, Device, Element, Shape, Strides};
+
+mod convert;
+mod create;
+mod fmt;
+mod index;
+mod view;
+
+pub use create::*;
+pub use index::{Ellipsis, IndexItem, IndexSpec, NewAxis, TensorIndex};
+
+/// An n-dimensional array with reference semantics, like a PyTorch tensor.
+///
+/// `Clone` copies the handle, not the data: the clone refers to the same tensor, and in-place
+/// operations through either handle are visible through both, just like `y = x` in Python. Use
+/// [`Tensor::deep_clone`] for PyTorch's `x.clone()`.
+///
+/// Programming errors (mismatched shapes, dtypes or devices) panic with PyTorch's error messages.
+#[derive(Clone)]
+pub struct Tensor(Arc<TensorImpl>);
+
+struct TensorImpl {
+    data: RwLock<TensorData>,
+    /// `None` for tensors that don't take part in autograd. Always `None` for now.
+    autograd: Mutex<Option<AutogradMeta>>,
+}
+
+/// How a tensor's elements are placed in its storage.
+#[derive(Clone, Debug)]
+pub(crate) struct Layout {
+    pub shape: Shape,
+    pub strides: Strides,
+    /// Offset of the first element, in elements.
+    pub offset: usize,
+}
+
+/// A snapshot of a tensor's data: storage, layout and dtype.
+#[derive(Clone, Debug)]
+pub(crate) struct TensorData {
+    pub storage: Arc<Storage>,
+    pub layout: Layout,
+    pub dtype: DType,
+}
+
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Tensor>();
+};
+
+impl Layout {
+    pub fn contiguous(shape: Shape) -> Layout {
+        let strides = contiguous_strides(&shape);
+        Layout {
+            shape,
+            strides,
+            offset: 0,
+        }
+    }
+
+    pub fn num_elements(&self) -> usize {
+        self.shape.num_elements()
+    }
+
+    pub fn is_contiguous(&self) -> bool {
+        is_contiguous(&self.shape, &self.strides)
+    }
+
+    /// Broadcasts this layout to `shape` by giving new and size-1 dimensions a stride of 0.
+    pub fn expand_to(&self, shape: &Shape) -> Layout {
+        let n = shape.len();
+        let m = self.shape.len();
+        assert!(
+            m <= n,
+            "cannot broadcast shape {:?} to {:?}",
+            self.shape,
+            shape
+        );
+        let mut strides = vec![0; n];
+        for i in 0..m {
+            let (src, dst) = (self.shape[i], shape[n - m + i]);
+            if src == dst {
+                strides[n - m + i] = self.strides[i];
+            } else if src != 1 {
+                panic!(
+                    "The expanded size of the tensor ({dst}) must match the existing size ({src}) \
+                     at non-singleton dimension {}. Target sizes: {:?}. Tensor sizes: {:?}",
+                    n - m + i,
+                    shape,
+                    self.shape
+                );
+            }
+        }
+        Layout {
+            shape: shape.clone(),
+            strides: Strides::new(&strides),
+            offset: self.offset,
+        }
+    }
+
+    /// The range of element offsets this layout can touch, or `None` if it has no elements.
+    pub fn span(&self) -> Option<(usize, usize)> {
+        if self.num_elements() == 0 {
+            return None;
+        }
+        let last: usize = self
+            .shape
+            .iter()
+            .zip(self.strides.iter())
+            .map(|(&n, &s)| (n - 1) * s)
+            .sum();
+        Some((self.offset, self.offset + last + 1))
+    }
+
+    /// Whether some element is reachable through more than one index.
+    pub fn has_internal_overlap(&self) -> bool {
+        self.shape
+            .iter()
+            .zip(self.strides.iter())
+            .any(|(&n, &s)| n > 1 && s == 0)
+    }
+}
+
+impl TensorData {
+    pub fn device(&self) -> Device {
+        self.storage.device()
+    }
+
+    /// Whether `self` and `other` may refer to the same memory without being the exact same view.
+    pub fn partially_overlaps(&self, other: &TensorData) -> bool {
+        if !Arc::ptr_eq(&self.storage, &other.storage) {
+            return false;
+        }
+        let (Some((a0, a1)), Some((b0, b1))) = (self.layout.span(), other.layout.span()) else {
+            return false;
+        };
+        let disjoint = a1 * self.dtype.size_in_bytes() <= b0 * other.dtype.size_in_bytes()
+            || b1 * other.dtype.size_in_bytes() <= a0 * self.dtype.size_in_bytes();
+        let same = self.dtype == other.dtype
+            && self.layout.offset == other.layout.offset
+            && self.layout.shape == other.layout.shape
+            && self.layout.strides == other.layout.strides;
+        !disjoint && !same
+    }
+
+    /// The same data broadcast to `shape`.
+    pub fn expand_to(&self, shape: &Shape) -> TensorData {
+        TensorData {
+            storage: self.storage.clone(),
+            layout: self.layout.expand_to(shape),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl Tensor {
+    pub(crate) fn from_data(data: TensorData) -> Tensor {
+        Tensor(Arc::new(TensorImpl {
+            data: RwLock::new(data),
+            autograd: Mutex::new(None),
+        }))
+    }
+
+    /// A snapshot of the storage, layout and dtype.
+    pub(crate) fn data(&self) -> TensorData {
+        self.0
+            .data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// A new contiguous, zero-filled tensor.
+    pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
+        let nbytes = shape.num_elements() * dtype.size_in_bytes();
+        let storage = Arc::new(Storage::new(nbytes, device));
+        Tensor::from_data(TensorData {
+            storage,
+            layout: Layout::contiguous(shape),
+            dtype,
+        })
+    }
+
+    /// A new tensor that shares this tensor's storage with a different layout.
+    pub(crate) fn with_layout(&self, layout: Layout) -> Tensor {
+        let data = self.data();
+        Tensor::from_data(TensorData {
+            storage: data.storage,
+            layout,
+            dtype: data.dtype,
+        })
+    }
+
+    /// Creates a tensor from host data with an exact dtype.
+    pub(crate) fn from_host<T: Element>(values: &[T], shape: Shape, device: Device) -> Tensor {
+        assert_eq!(
+            values.len(),
+            shape.num_elements(),
+            "{} values can't fill a tensor of shape {:?}",
+            values.len(),
+            shape
+        );
+        let t = Tensor::empty_on(shape, T::DTYPE, device);
+        if device == Device::Cpu {
+            cpu::write_host(&t.data(), values);
+        }
+        t
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.0
+            .data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .layout
+            .clone()
+    }
+
+    /// The size of each dimension.
+    pub fn shape(&self) -> Shape {
+        self.0
+            .data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .layout
+            .shape
+            .clone()
+    }
+
+    /// The size of dimension `dim` (negative values count from the end).
+    pub fn size(&self, dim: i64) -> usize {
+        let shape = self.shape();
+        shape[crate::shape::normalize_dim(dim, shape.len())]
+    }
+
+    /// The strides of each dimension, in elements.
+    pub fn stride(&self) -> Strides {
+        self.layout().strides
+    }
+
+    /// Offset of the first element in the underlying storage, in elements.
+    pub fn storage_offset(&self) -> usize {
+        self.layout().offset
+    }
+
+    /// Number of dimensions (PyTorch's `dim()`).
+    pub fn num_dims(&self) -> usize {
+        self.shape().len()
+    }
+
+    /// Total number of elements (PyTorch's `numel()`).
+    pub fn num_elements(&self) -> usize {
+        self.shape().num_elements()
+    }
+
+    /// The element type.
+    pub fn dtype(&self) -> DType {
+        self.0.data.read().unwrap_or_else(|e| e.into_inner()).dtype
+    }
+
+    /// The device holding the data.
+    pub fn device(&self) -> Device {
+        self.0
+            .data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .device()
+    }
+
+    /// Whether the elements are laid out in row-major order without gaps.
+    pub fn is_contiguous(&self) -> bool {
+        self.layout().is_contiguous()
+    }
+
+    /// Whether the dtype is a floating point type.
+    pub fn is_floating_point(&self) -> bool {
+        self.dtype().is_floating_point()
+    }
+
+    /// Size of one element in bytes.
+    pub fn element_size(&self) -> usize {
+        self.dtype().size_in_bytes()
+    }
+
+    /// Whether gradients are computed for this tensor. Always `false` until autograd lands.
+    pub fn requires_grad(&self) -> bool {
+        self.0
+            .autograd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Whether `self` and `other` are handles to the same tensor (Python's `x is y`).
+    pub fn is_same(&self, other: &Tensor) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The version counter of the storage, bumped by every in-place operation.
+    #[allow(dead_code)]
+    pub(crate) fn version(&self) -> u64 {
+        self.0
+            .data
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .storage
+            .version()
+    }
+
+    /// Copies the data into a new contiguous tensor (PyTorch's `x.clone()`).
+    pub fn deep_clone(&self) -> Tensor {
+        let src = self.data();
+        let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+        if src.device() == Device::Cpu {
+            cpu::copy(&out.data(), &src);
+        }
+        out
+    }
+}

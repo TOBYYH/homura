@@ -1,0 +1,15 @@
+[package]
+name = "homura-derive"
+version = "0.1.0"
+edition = "2024"
+description = "Procedural macros for homura"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TOBYYH/homura"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]

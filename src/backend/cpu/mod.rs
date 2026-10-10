@@ -233,6 +233,10 @@ pub(crate) fn map3<A: Element, B: Element, C: Element, O: Element>(
 /// Writes host values into a contiguous tensor.
 pub(crate) fn write_host<T: Element>(dst: &TensorData, values: &[T]) {
     assert!(dst.layout.is_contiguous() && dst.layout.num_elements() == values.len());
+    // The offset of an empty layout may lie outside the allocation; don't even form the pointer.
+    if values.is_empty() {
+        return;
+    }
     let p = base::<T>(dst);
     exec(|| {
         // SAFETY: `dst` is contiguous with `values.len()` elements starting at its offset.
@@ -243,9 +247,20 @@ pub(crate) fn write_host<T: Element>(dst: &TensorData, values: &[T]) {
 }
 
 /// Writes raw element bytes into a contiguous tensor.
+///
+/// `Bool` storage must only ever hold the bytes 0 and 1: kernels read it as Rust `bool`, for
+/// which any other byte is undefined behaviour. This function is the only way raw bytes enter a
+/// tensor, so it enforces that invariant.
 pub(crate) fn write_bytes(dst: &TensorData, bytes: &[u8]) {
     let size = dst.dtype.size_in_bytes();
     assert!(dst.layout.is_contiguous() && dst.layout.num_elements() * size == bytes.len());
+    assert!(
+        dst.dtype != DType::Bool || bytes.iter().all(|&b| b <= 1),
+        "bool tensor data must consist of the bytes 0 and 1"
+    );
+    if bytes.is_empty() {
+        return;
+    }
     let p = dst.storage.cpu_ptr();
     exec(|| {
         // SAFETY: `dst` is contiguous and covers exactly `bytes.len()` bytes from its offset.
@@ -264,6 +279,9 @@ pub(crate) fn read_bytes(src: &TensorData) -> Vec<u8> {
     let size = src.dtype.size_in_bytes();
     assert!(src.layout.is_contiguous());
     let n = src.layout.num_elements() * size;
+    if n == 0 {
+        return vec![];
+    }
     let p = src.storage.cpu_ptr();
     let mut out = vec![0u8; n];
     exec(|| {

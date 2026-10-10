@@ -56,7 +56,9 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
                 );
             }
         }
-        shape[dim] += s[dim];
+        shape[dim] = shape[dim]
+            .checked_add(s[dim])
+            .expect("concat(): the result has too many elements");
     }
     let out = Tensor::empty_on(shape, dtype, device);
     if device == Device::Cpu {
@@ -117,8 +119,10 @@ impl Tensor {
     pub fn split_with_sizes(&self, split_sizes: &[usize], dim: i64) -> Vec<Tensor> {
         let d = normalize_dim(dim, self.num_dims());
         let size = self.shape()[d];
-        let total: usize = split_sizes.iter().sum();
-        if total != size {
+        let total = split_sizes
+            .iter()
+            .try_fold(0usize, |a, &n| a.checked_add(n));
+        if total != Some(size) {
             panic!(
                 "split_with_sizes expects split_sizes to sum exactly to {size} (input tensor's \
                  size at dimension {dim}), but got split_sizes={split_sizes:?}"
@@ -193,7 +197,10 @@ impl Tensor {
         for (&r, &s) in repeats.iter().zip(&padded) {
             interleaved.extend([1, s as i64]);
             expanded.extend([r as i64, s as i64]);
-            result.push((r * s) as i64);
+            let n = r
+                .checked_mul(s)
+                .expect("repeat(): the result has too many elements");
+            result.push(n as i64);
         }
         self.reshape(interleaved).expand(expanded).reshape(result)
     }

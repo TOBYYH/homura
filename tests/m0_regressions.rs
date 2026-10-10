@@ -26,7 +26,6 @@ fn file(header: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "M0: BOOL file bytes are copied without validating Rust bool representation"]
 fn invalid_bool_representation_is_rejected_before_typed_reads() {
     let bytes = file(
         r#"{"x":{"dtype":"BOOL","shape":[1],"data_offsets":[0,1]}}"#,
@@ -37,7 +36,6 @@ fn invalid_bool_representation_is_rejected_before_typed_reads() {
 }
 
 #[test]
-#[ignore = "M0: as_strided bounds arithmetic wraps in release builds; test only on Meta"]
 fn as_strided_rejects_overflowing_span() {
     let x = homura::zeros_with([1], (DType::U8, Device::Meta));
     rejects(|| {
@@ -46,7 +44,6 @@ fn as_strided_rejects_overflowing_span() {
 }
 
 #[test]
-#[ignore = "M0: Tensor::empty_on byte count wraps in release builds; test only on Meta"]
 fn allocation_rejects_overflowing_byte_count() {
     rejects(|| {
         homura::zeros_with([usize::MAX / 8 + 1], (DType::F64, Device::Meta));
@@ -288,4 +285,41 @@ fn golden_comparison_detects_adjacent_large_i64_values() {
     rejects(|| {
         common::assert_close(&actual, &expected, "exact i64 comparison");
     });
+}
+
+#[test]
+fn cpu_views_reject_overflowing_layouts() {
+    let x = homura::zeros_with([4], DType::U8);
+    rejects(|| {
+        x.as_strided([2], [usize::MAX], 0);
+    });
+    rejects(|| {
+        x.as_strided([3], [2], usize::MAX - 1);
+    });
+    rejects(|| {
+        x.expand([1 << 40, 1 << 40, 4]);
+    });
+    // A one-element view with a huge stride is valid, but nothing can step past its end.
+    let y = x.as_strided([1], [usize::MAX], 3);
+    rejects(|| {
+        y.narrow(0, 1, 0);
+    });
+}
+
+#[test]
+fn empty_views_beyond_the_storage_are_never_dereferenced() {
+    let x = homura::zeros_with([2], DType::F32);
+    let v = x.as_strided([0, 3], [1, 1], 1000);
+    assert!(v.to_vec::<f32>().is_empty());
+    assert!(v.contiguous().to_vec::<f32>().is_empty());
+    let bytes = homura::save_safetensors_to_bytes([("v", &v)]).unwrap();
+    let loaded = homura::load_safetensors_from_bytes(&bytes).unwrap();
+    assert_eq!(loaded[0].1.shape(), [0, 3]);
+}
+
+#[test]
+fn huge_slice_steps_give_one_element() {
+    let x = homura::arange(5);
+    let y = x.index((0..5).step_by(usize::MAX));
+    assert_eq!(y.to_vec::<i64>(), [0]);
 }

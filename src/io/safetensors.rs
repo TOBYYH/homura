@@ -104,6 +104,11 @@ pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>
             )));
         }
         let mut raw = data[begin as usize..end as usize].to_vec();
+        if dtype == DType::Bool && raw.iter().any(|&b| b > 1) {
+            return Err(bad(&format!(
+                "{name}: BOOL data must consist of the bytes 0 and 1"
+            )));
+        }
         to_from_le(&mut raw, dtype.size_in_bytes());
         let t = Tensor::empty_on(shape, dtype, Device::Cpu);
         cpu::write_bytes(&t.data(), &raw);

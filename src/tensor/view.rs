@@ -152,8 +152,10 @@ impl Tensor {
     pub fn unsqueeze(&self, dim: i64) -> Tensor {
         let mut l = self.layout();
         let d = normalize_dim(dim, l.shape.len() + 1);
+        // The stride of a size-1 dimension is never used to address memory; fall back to 1 in
+        // the unlikely case that PyTorch's choice doesn't fit.
         let stride = if d < l.shape.len() {
-            l.shape[d] * l.strides[d]
+            l.shape[d].checked_mul(l.strides[d]).unwrap_or(1)
         } else {
             1
         };
@@ -178,10 +180,13 @@ impl Tensor {
             );
         }
         let start = if start < 0 { start + size } else { start } as usize;
-        if start + length > size as usize {
+        if start
+            .checked_add(length)
+            .is_none_or(|end| end > size as usize)
+        {
             panic!("start ({start}) + length ({length}) exceeds dimension size ({size}).");
         }
-        l.offset += start * l.strides[d];
+        l.offset = l.offset_at(d, start);
         l.shape[d] = length;
         self.with_layout(l)
     }
@@ -201,7 +206,7 @@ impl Tensor {
             );
         }
         let index = if index < 0 { index + size } else { index } as usize;
-        l.offset += index * l.strides[d];
+        l.offset = l.offset_at(d, index);
         l.shape.remove(d);
         l.strides.remove(d);
         self.with_layout(l)
@@ -225,13 +230,18 @@ impl Tensor {
         let start = clamp(start.unwrap_or(0));
         let end = clamp(end.unwrap_or(size));
         let len = if end > start {
-            (end - start + step - 1) / step
+            (end - start - 1) / step + 1
         } else {
             0
         };
-        l.offset += start as usize * l.strides[dim];
+        l.offset = l.offset_at(dim, start as usize);
         l.shape[dim] = len as usize;
-        l.strides[dim] *= step as usize;
+        // With fewer than two elements the stride is never used, and a huge step may not fit.
+        if len > 1 {
+            l.strides[dim] = l.strides[dim]
+                .checked_mul(step as usize)
+                .expect("slice stride overflows usize");
+        }
         self.with_layout(l)
     }
 
@@ -265,29 +275,16 @@ impl Tensor {
         stride: impl IntoShape,
         storage_offset: usize,
     ) -> Tensor {
-        let data = self.data();
         let (shape, stride) = (size.into_shape(), stride.into_shape());
         if shape.len() != stride.len() {
             panic!("mismatch in length of strides and shape");
         }
-        let layout = Layout {
+        // `with_layout` checks that the view lies inside the storage.
+        self.with_layout(Layout {
             shape,
             strides: Strides::new(&stride),
             offset: storage_offset,
-        };
-        let item = data.dtype.size_in_bytes();
-        let needed = layout.span().map_or(0, |(_, end)| end * item);
-        if needed > data.storage.nbytes() {
-            panic!(
-                "setStorage: sizes {:?}, strides {:?}, storage offset {storage_offset}, and \
-                 itemsize {item} requiring a storage size of {needed} are out of bounds for \
-                 storage of size {}",
-                layout.shape,
-                layout.strides,
-                data.storage.nbytes()
-            );
-        }
-        self.with_layout(layout)
+        })
     }
 
     /// `self` if it is already contiguous, otherwise a contiguous copy.

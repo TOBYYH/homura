@@ -193,9 +193,26 @@ impl Shape {
     }
 
     /// Total number of elements (1 for a zero-dimensional shape).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shape is not representable (see [`checked_num_elements`]).
     pub fn num_elements(&self) -> usize {
-        self.iter().product()
+        checked_num_elements(self).unwrap_or_else(|| panic!("shape {self:?} has too many elements"))
     }
+}
+
+/// The number of elements of `shape`, or `None` if the shape is not representable.
+///
+/// A shape is representable when the product of its sizes, with zeros counted as ones, is at most
+/// `isize::MAX`. Counting zeros as ones means the contiguous strides of an empty shape are
+/// representable too, and the check doesn't depend on the order of the dimensions.
+pub(crate) fn checked_num_elements(shape: &[usize]) -> Option<usize> {
+    let product = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d.max(1)))
+        .filter(|&n| n <= isize::MAX as usize)?;
+    Some(if shape.contains(&0) { 0 } else { product })
 }
 
 /// Types that can be used as a tensor shape: `[usize; N]`, `&[usize]`, `Vec<usize>`, [`Shape`]
@@ -371,10 +388,12 @@ pub(crate) fn dims_mask(dims: &[i64], num_dims: usize) -> Vec<bool> {
 /// Row-major strides for a contiguous tensor of the given shape.
 pub(crate) fn contiguous_strides(shape: &[usize]) -> Strides {
     let mut strides = vec![0; shape.len()];
-    let mut acc = 1;
+    let mut acc: usize = 1;
     for i in (0..shape.len()).rev() {
         strides[i] = acc;
-        acc *= shape[i].max(1);
+        acc = acc
+            .checked_mul(shape[i].max(1))
+            .unwrap_or_else(|| panic!("shape {shape:?} has too many elements"));
     }
     Strides::new(&strides)
 }
@@ -429,6 +448,9 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Shape {
 
 /// Resolves a shape spec with at most one `-1` against a number of elements.
 pub(crate) fn infer_size(spec: &[i64], num_elements: usize) -> Shape {
+    let invalid = || -> ! {
+        panic!("shape '{spec:?}' is invalid for input of size {num_elements}");
+    };
     let mut infer = None;
     let mut known: usize = 1;
     for (i, &d) in spec.iter().enumerate() {
@@ -440,12 +462,9 @@ pub(crate) fn infer_size(spec: &[i64], num_elements: usize) -> Shape {
         } else if d < 0 {
             panic!("invalid shape dimension {d}");
         } else {
-            known *= d as usize;
+            known = known.checked_mul(d as usize).unwrap_or_else(|| invalid());
         }
     }
-    let invalid = || -> ! {
-        panic!("shape '{spec:?}' is invalid for input of size {num_elements}");
-    };
     let mut out: Vec<usize> = spec.iter().map(|&d| d.max(0) as usize).collect();
     match infer {
         Some(i) => {
@@ -483,7 +502,7 @@ pub(crate) fn compute_view_strides(
             new_strides[d] = if d == new_shape.len() - 1 {
                 1
             } else {
-                new_shape[d + 1].max(1) * new_strides[d + 1]
+                new_shape[d + 1].max(1).checked_mul(new_strides[d + 1])?
             };
         }
         return Some(Strides::new(&new_strides));
@@ -497,10 +516,10 @@ pub(crate) fn compute_view_strides(
         tensor_numel *= old_shape[tensor_d];
         let chunk_ends = tensor_d == 0
             || old_shape[tensor_d - 1] != 1
-                && old_strides[tensor_d - 1] != tensor_numel * chunk_base_stride;
+                && Some(old_strides[tensor_d - 1]) != tensor_numel.checked_mul(chunk_base_stride);
         if chunk_ends {
             while view_d >= 0 && (view_numel < tensor_numel || new_shape[view_d as usize] == 1) {
-                new_strides[view_d as usize] = view_numel * chunk_base_stride;
+                new_strides[view_d as usize] = view_numel.checked_mul(chunk_base_stride)?;
                 view_numel *= new_shape[view_d as usize];
                 view_d -= 1;
             }
@@ -571,5 +590,16 @@ mod tests {
         assert!(is_contiguous(&[2, 1, 3], &[3, 100, 1]));
         assert!(!is_contiguous(&[2, 3], &[1, 2]));
         assert_eq!(contiguous_strides(&[2, 0, 3]), [3, 3, 1]);
+    }
+
+    #[test]
+    fn representable_shapes() {
+        assert_eq!(checked_num_elements(&[]), Some(1));
+        assert_eq!(checked_num_elements(&[2, 0, 3]), Some(0));
+        assert_eq!(checked_num_elements(&[0, isize::MAX as usize]), Some(0));
+        assert_eq!(checked_num_elements(&[isize::MAX as usize + 1]), None);
+        // Zeros count as ones, so the result doesn't depend on the order of the dimensions.
+        assert_eq!(checked_num_elements(&[usize::MAX, 2, 0]), None);
+        assert_eq!(checked_num_elements(&[0, usize::MAX, 2]), None);
     }
 }

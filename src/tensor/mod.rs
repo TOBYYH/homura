@@ -105,18 +105,62 @@ impl Layout {
         }
     }
 
-    /// The range of element offsets this layout can touch, or `None` if it has no elements.
-    pub fn span(&self) -> Option<(usize, usize)> {
-        if self.num_elements() == 0 {
-            return None;
+    /// One past the largest element offset this layout touches (0 for an empty layout, which
+    /// touches no memory), or `None` if that doesn't fit in `usize`.
+    fn checked_end(&self) -> Option<usize> {
+        if crate::shape::checked_num_elements(&self.shape)? == 0 {
+            return Some(0);
         }
-        let last: usize = self
-            .shape
+        self.shape
             .iter()
             .zip(self.strides.iter())
-            .map(|(&n, &s)| (n - 1) * s)
-            .sum();
-        Some((self.offset, self.offset + last + 1))
+            .try_fold(self.offset, |acc, (&n, &s)| {
+                acc.checked_add((n - 1).checked_mul(s)?)
+            })?
+            .checked_add(1)
+    }
+
+    /// The range of element offsets this layout can touch, or `None` if it has no elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range doesn't fit in `usize`; layouts of existing tensors always fit.
+    pub fn span(&self) -> Option<(usize, usize)> {
+        let end = self
+            .checked_end()
+            .expect("layout reaches beyond the addressable range");
+        (end > 0).then_some((self.offset, end))
+    }
+
+    /// Panics unless every element of this layout, with elements of `item_size` bytes, lies
+    /// inside a storage of `nbytes` bytes and the number of elements is representable.
+    pub fn check_bounds(&self, item_size: usize, nbytes: usize) {
+        let needed = self
+            .checked_end()
+            .and_then(|end| end.checked_mul(item_size));
+        if needed.is_none_or(|n| n > nbytes) {
+            panic!(
+                "setStorage: sizes {:?}, strides {:?}, storage offset {}, and itemsize \
+                 {item_size} requiring a storage size of {} are out of bounds for storage of size \
+                 {nbytes}",
+                self.shape,
+                self.strides,
+                self.offset,
+                needed.map_or("more than usize::MAX".to_string(), |n| n.to_string()),
+            );
+        }
+    }
+
+    /// The storage offset of index `i` along dimension `dim`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the offset doesn't fit in `usize`, which only happens for an index one past
+    /// the end of a dimension with an unusually large stride.
+    pub fn offset_at(&self, dim: usize, i: usize) -> usize {
+        i.checked_mul(self.strides[dim])
+            .and_then(|o| o.checked_add(self.offset))
+            .expect("storage offset overflows usize")
     }
 
     /// Whether some element is reachable through more than one index.
@@ -178,8 +222,18 @@ impl Tensor {
     }
 
     /// A new contiguous, zero-filled tensor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size in bytes exceeds `isize::MAX`, on every device.
     pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
-        let nbytes = shape.num_elements() * dtype.size_in_bytes();
+        let nbytes = shape
+            .num_elements()
+            .checked_mul(dtype.size_in_bytes())
+            .filter(|&n| n <= isize::MAX as usize)
+            .unwrap_or_else(|| {
+                panic!("a tensor of shape {shape:?} and dtype {dtype} would be too large")
+            });
         let storage = Arc::new(Storage::new(nbytes, device));
         Tensor::from_data(TensorData {
             storage,
@@ -189,8 +243,14 @@ impl Tensor {
     }
 
     /// A new tensor that shares this tensor's storage with a different layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout reaches outside the storage. Every view is created here, so the CPU
+    /// kernels can rely on all layouts lying inside their storage.
     pub(crate) fn with_layout(&self, layout: Layout) -> Tensor {
         let data = self.data();
+        layout.check_bounds(data.dtype.size_in_bytes(), data.storage.nbytes());
         Tensor::from_data(TensorData {
             storage: data.storage,
             layout,

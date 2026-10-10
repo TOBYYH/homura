@@ -10,11 +10,11 @@ fn select_layout(l: &Layout, dim: usize, i: usize) -> Layout {
     let mut shape = l.shape.clone();
     let mut strides = l.strides.clone();
     shape.remove(dim);
-    let stride = strides.remove(dim);
+    strides.remove(dim);
     Layout {
         shape,
         strides,
-        offset: l.offset + i * stride,
+        offset: l.offset_at(dim, i),
     }
 }
 

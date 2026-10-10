@@ -157,7 +157,8 @@ pub(crate) fn var(
                     let d = unsafe { *ps.add(j) }.to_f64() - mean;
                     sq += d * d;
                 });
-                let v = sq / divisor;
+                // An empty reduction has no mean, whatever the correction.
+                let v = if count == 0 { f64::NAN } else { sq / divisor };
                 // SAFETY: `out` is contiguous with one element per kept position.
                 unsafe { *po.add(o) = T::from_f64(if take_sqrt { v.sqrt() } else { v }) };
             })

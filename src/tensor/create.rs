@@ -223,7 +223,13 @@ impl Tensor {
 /// A tensor filled with `value`.
 fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
     let t = Tensor::empty_on(shape, dtype, device);
-    if device == Device::Cpu && value.to_f64() != 0.0 {
+    // New memory is zeroed; `-0.0` still needs filling to keep its sign bit.
+    let zero_bits = match value {
+        Scalar::Bool(v) => !v,
+        Scalar::Int(v) => v == 0,
+        Scalar::Float(v) => v.to_bits() == 0,
+    };
+    if device == Device::Cpu && !zero_bits {
         cpu::fill(&t.data(), value);
     }
     t

@@ -325,7 +325,12 @@ impl Tensor {
                 if dst.partially_overlaps(&s) {
                     s = src.deep_clone().data();
                 }
-                cpu::copy(&dst, &s);
+                // The version changes in the same critical section as the data.
+                cpu::exec(|| {
+                    cpu::copy(&dst, &s);
+                    dst.storage.bump_version();
+                });
+                return self;
             }
             (_, Device::Meta) => panic!("Cannot copy out of meta tensor; no data!"),
             (d, sd) => panic!("copy from {sd} to {d} is not supported"),
@@ -339,9 +344,13 @@ impl Tensor {
         let dst = self.data();
         check_writable(&dst);
         if dst.device() == Device::Cpu {
-            cpu::fill(&dst, value.into());
+            cpu::exec(|| {
+                cpu::fill(&dst, value.into());
+                dst.storage.bump_version();
+            });
+        } else {
+            dst.storage.bump_version();
         }
-        dst.storage.bump_version();
         self
     }
 

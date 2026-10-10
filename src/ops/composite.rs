@@ -1,6 +1,6 @@
 //! Operations defined in terms of other operations, plus softmax.
 
-use super::Operand;
+use super::{Operand, common_device};
 use crate::backend::cpu;
 use crate::shape::normalize_dim;
 use crate::{Device, Scalar, Tensor};
@@ -22,17 +22,25 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     out
 }
 
-/// `beta * input + alpha * product`, where `input` is ignored entirely when `beta` is zero (so
-/// NaN in it does not propagate), as PyTorch's `add*` operations do.
+/// `beta * input + alpha * product`, where the values of `input` are ignored when `beta` is zero
+/// (so NaN in it does not propagate), as PyTorch's `add*` operations do. `input` must still have
+/// the dtype and device of `product` and broadcast to its shape, whatever `beta` is.
 fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
+    let (i, p) = (input.data(), product.data());
+    common_device([&i, &p]);
+    if i.dtype != p.dtype {
+        panic!(
+            "self and mat2 must have the same dtype, but got {} and {}",
+            i.dtype, p.dtype
+        );
+    }
+    i.layout.expand_to(&p.layout.shape);
     let product = if alpha.to_f64() == 1.0 {
         product
     } else {
         product.mul(alpha)
     };
     if beta.to_f64() == 0.0 {
-        // Still check that `input` broadcasts to the result.
-        input.layout().expand_to(&product.shape());
         return product;
     }
     let scaled = if beta.to_f64() == 1.0 {
@@ -134,7 +142,16 @@ impl Tensor {
     ) -> Tensor {
         check_dims(batch1, 3, "batch1");
         check_dims(batch2, 3, "batch2");
-        let product = batch1.matmul(batch2).sum_dim(0, false);
+        if batch1.size(0) != batch2.size(0) {
+            panic!(
+                "batch1 and batch2 must have same number of batches, got {} and {}",
+                batch1.size(0),
+                batch2.size(0)
+            );
+        }
+        // Integer sums are computed in `I64`; casting back wraps exactly like accumulating in the
+        // input dtype would.
+        let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
         scaled_sum(self, product, beta.into(), alpha.into())
     }
 

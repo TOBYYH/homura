@@ -196,7 +196,8 @@ impl Shape {
     ///
     /// # Panics
     ///
-    /// Panics if the shape is not representable (see [`checked_num_elements`]).
+    /// Panics if the shape is not representable: the product of its sizes, with zeros counted as
+    /// ones, must be at most `isize::MAX`.
     pub fn num_elements(&self) -> usize {
         checked_num_elements(self).unwrap_or_else(|| panic!("shape {self:?} has too many elements"))
     }

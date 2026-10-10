@@ -140,12 +140,17 @@ impl Tensor {
     }
 
     /// Splits into `chunks` views of (almost) equal size along `dim`. Like PyTorch, fewer chunks
-    /// may be returned when the size is not divisible.
+    /// may be returned when the size is not divisible, and an empty dimension gives `chunks`
+    /// empty views.
     pub fn chunk(&self, chunks: usize, dim: i64) -> Vec<Tensor> {
         if chunks == 0 {
             panic!("chunk expects `chunks` to be greater than 0, got: 0");
         }
         let size = self.size(dim);
+        if size == 0 {
+            // Like PyTorch: `chunks` empty views rather than a single one.
+            return vec![self.narrow(dim, 0, 0); chunks];
+        }
         self.split(size.div_ceil(chunks), dim)
     }
 

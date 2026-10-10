@@ -140,9 +140,13 @@ pub trait Element:
     /// The dtype of this element type.
     const DTYPE: DType;
 
-    /// Converts to another element type with C++ `static_cast` semantics (what PyTorch does):
-    /// floats are truncated toward zero when cast to integers, integers wrap, and any nonzero
-    /// value becomes `true`.
+    /// Converts to another element type.
+    ///
+    /// Integers wrap (two's complement truncation) and any nonzero value becomes `true`. Floats
+    /// cast to an integer type are first truncated toward zero to `i64`, saturating at its limits
+    /// (NaN becomes 0), and then wrapped to the target type. For values inside the `i64` range
+    /// this matches PyTorch on x86-64 (`300.0` becomes `44u8`, `-1.0` becomes `255u8`), but
+    /// unlike C++ `static_cast` the result is defined for every input.
     #[doc(hidden)]
     fn cast<D: Element>(self) -> D {
         match Self::DTYPE.kind() {
@@ -159,7 +163,8 @@ macro_rules! impl_int_element {
             fn to_f64(self) -> f64 { self as f64 }
             fn to_i64(self) -> i64 { self as i64 }
             fn to_bool(self) -> bool { self != 0 }
-            fn from_f64(v: f64) -> Self { v as $t }
+            // Saturate to `i64`, then wrap: see `Element::cast`.
+            fn from_f64(v: f64) -> Self { v as i64 as $t }
             fn from_i64(v: i64) -> Self { v as $t }
             fn from_bool(v: bool) -> Self { v as $t }
         }
@@ -522,6 +527,14 @@ mod tests {
     fn element_cast() {
         assert_eq!((-1.7f32).cast::<i32>(), -1);
         assert_eq!(300i64.cast::<u8>(), 44);
+        assert_eq!(300.0f32.cast::<u8>(), 44);
+        assert_eq!((-1.0f64).cast::<u8>(), 255);
+        assert_eq!((-129.9f32).cast::<i8>(), 127);
+        assert_eq!(f16::from_f32(-2.5).cast::<u8>(), 254);
+        assert_eq!(f64::NAN.cast::<i32>(), 0);
+        assert_eq!(f64::INFINITY.cast::<i64>(), i64::MAX);
+        assert_eq!(f64::INFINITY.cast::<i32>(), -1);
+        assert_eq!(1e30f32.cast::<i16>(), -1);
         assert!(0.1f64.cast::<bool>());
         assert_eq!(true.cast::<f16>(), f16::ONE);
         assert_eq!(f16::from_f32(2.5).cast::<f32>(), 2.5);

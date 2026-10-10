@@ -5,7 +5,12 @@
 //! and output of an operation (`x.add_(&x)`) without deadlocks or data races. Callers are
 //! responsible for passing layouts that lie inside their storage and, for in-place writes, for
 //! removing partial overlap between inputs and the output.
+//!
+//! The lock makes each kernel atomic, not each operation: an in-place operation computes its
+//! result and writes it back in separate kernels, so concurrent in-place operations on shared
+//! storage can lose updates. Like PyTorch, homura leaves synchronizing those to the caller.
 
+use std::cell::Cell;
 use std::sync::Mutex;
 
 use crate::dtype::sealed::Sealed;
@@ -27,9 +32,26 @@ pub(crate) use reduce::{arg_reduce, reduce, var};
 
 static EXEC: Mutex<()> = Mutex::new(());
 
-/// Runs `f` while holding the CPU execution lock.
+thread_local! {
+    /// Whether this thread holds [`EXEC`].
+    static HOLDS_EXEC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` while holding the CPU execution lock. Reentrant: kernels called from `f` run inside
+/// the same critical section, which lets a write and its version bump happen atomically.
 pub(crate) fn exec<R>(f: impl FnOnce() -> R) -> R {
+    if HOLDS_EXEC.get() {
+        return f();
+    }
     let _guard = EXEC.lock().unwrap_or_else(|e| e.into_inner());
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            HOLDS_EXEC.set(false);
+        }
+    }
+    HOLDS_EXEC.set(true);
+    let _release = Release;
     f()
 }
 

@@ -24,6 +24,14 @@ pub use index::{Ellipsis, IndexItem, IndexSpec, NewAxis, TensorIndex};
 /// [`Tensor::deep_clone`] for PyTorch's `x.clone()`.
 ///
 /// Programming errors (mismatched shapes, dtypes or devices) panic with PyTorch's error messages.
+///
+/// # Threads
+///
+/// `Tensor` is `Send + Sync`. Reading tensors from several threads and operating on distinct
+/// tensors in parallel need no synchronization. In-place operations are not atomic, though: if
+/// several threads mutate tensors that share storage, or one mutates while another reads, the
+/// results are unspecified (updates can be lost) but memory-safe. As in PyTorch, synchronize such
+/// accesses yourself, for example with a `Mutex`.
 #[derive(Clone)]
 pub struct Tensor(Arc<TensorImpl>);
 

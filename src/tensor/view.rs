@@ -249,6 +249,8 @@ impl Tensor {
     pub fn flatten(&self, start_dim: i64, end_dim: i64) -> Tensor {
         let shape = self.shape();
         if shape.is_empty() {
+            normalize_dim(start_dim, 0);
+            normalize_dim(end_dim, 0);
             return self.reshape([1]);
         }
         let (s, e) = (

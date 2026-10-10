@@ -1,0 +1,12 @@
+[package]
+name = "homura"
+version = "0.1.0"
+edition = "2024"
+description = "A deep learning framework for AMD ROCm, written in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TOBYYH/homura"
+readme = "README.md"
+keywords = ["deep-learning", "rocm", "amd", "gpu", "tensor"]
+categories = ["science", "mathematics"]
+
+[dependencies]

@@ -299,14 +299,15 @@ pub fn full_like(t: &Tensor, value: impl Into<Scalar>) -> Tensor {
 
 /// A tensor from values computed in `f64` (floats) or `i64` (integers).
 fn from_values(n: usize, dtype: DType, device: Device, f: impl Fn(usize) -> Scalar) -> Tensor {
-    let shape = Shape::new(&[n]);
-    if device == Device::Meta {
-        return Tensor::empty_on(shape, dtype, device);
+    // Allocating first rejects sizes that are too large before computing any values.
+    let t = Tensor::empty_on(Shape::new(&[n]), dtype, device);
+    if device == Device::Cpu {
+        dispatch_all!(dtype, T => {
+            let values: Vec<T> = (0..n).map(|i| T::from_scalar(f(i))).collect();
+            cpu::write_host(&t.data(), &values);
+        });
     }
-    dispatch_all!(dtype, T => {
-        let values: Vec<T> = (0..n).map(|i| T::from_scalar(f(i))).collect();
-        Tensor::from_host(&values, shape, device)
-    })
+    t
 }
 
 /// `[0, 1, ..., end)` on the default device; `I64` for an integer `end`, otherwise the default
@@ -345,20 +346,41 @@ pub fn arange_step_with(
     let dtype = o
         .dtype
         .unwrap_or(if all_int { DType::I64 } else { default_dtype() });
+    if all_int {
+        // Integer bounds stay integral: `f64` can't represent every `i64`.
+        let (s, e, st) = (start.to_i64(), end.to_i64(), step.to_i64());
+        if st == 0 {
+            panic!("step must be nonzero");
+        }
+        if (st > 0 && e < s) || (st < 0 && e > s) {
+            panic!("upper bound and larger bound inconsistent with step sign");
+        }
+        // The number of values is ceil((e - s) / st), which is nonnegative.
+        let (span, st_abs) = ((e as i128 - s as i128).abs(), (st as i128).abs());
+        let n = (span + st_abs - 1) / st_abs;
+        let n = usize::try_from(n).expect("arange: too many elements");
+        // Every value lies between `s` and `e`, so it fits in `i64`.
+        return from_values(n, dtype, o.device(), |i| {
+            Scalar::Int((s as i128 + st as i128 * i as i128) as i64)
+        });
+    }
     let (s, e, st) = (start.to_f64(), end.to_f64(), step.to_f64());
     if st == 0.0 {
         panic!("step must be nonzero");
     }
+    if !(s.is_finite() && e.is_finite() && st.is_finite()) {
+        panic!("unsupported range: {s} -> {e} with step {st}");
+    }
     if (st > 0.0 && e < s) || (st < 0.0 && e > s) {
         panic!("upper bound and larger bound inconsistent with step sign");
     }
-    let n = ((e - s) / st).ceil().max(0.0) as usize;
-    if all_int {
-        let (s, st) = (start.to_i64(), step.to_i64());
-        from_values(n, dtype, o.device(), |i| Scalar::Int(s + st * i as i64))
-    } else {
-        from_values(n, dtype, o.device(), |i| Scalar::Float(s + st * i as f64))
+    let n = ((e - s) / st).ceil().max(0.0);
+    if n >= isize::MAX as f64 {
+        panic!("arange: too many elements");
     }
+    from_values(n as usize, dtype, o.device(), |i| {
+        Scalar::Float(s + st * i as f64)
+    })
 }
 
 /// `steps` evenly spaced values from `start` to `end` inclusive, with the default dtype.

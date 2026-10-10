@@ -163,12 +163,35 @@ impl Layout {
             .expect("storage offset overflows usize")
     }
 
-    /// Whether some element is reachable through more than one index.
-    pub fn has_internal_overlap(&self) -> bool {
-        self.shape
+    /// Whether distinct indices of this layout might refer to the same storage element.
+    ///
+    /// Conservative: `false` means the elements are proven distinct. Dimensions of size greater
+    /// than 1 are sorted by stride; the layout is distinct if each stride exceeds the largest
+    /// offset reachable through the dimensions with smaller strides. This accepts contiguous and
+    /// permuted tensors, stepped slices and empty layouts, but rejects some exotic `as_strided`
+    /// layouts that happen to be distinct, such as sizes `[3, 2]` with strides `[2, 3]`.
+    pub fn may_overlap_internally(&self) -> bool {
+        if self.shape.contains(&0) {
+            return false;
+        }
+        let mut dims: Vec<(usize, usize)> = self
+            .shape
             .iter()
             .zip(self.strides.iter())
-            .any(|(&n, &s)| n > 1 && s == 0)
+            .filter(|&(&n, _)| n > 1)
+            .map(|(&n, &s)| (s, n))
+            .collect();
+        dims.sort_unstable();
+        // The largest offset (relative to the first element) reachable so far.
+        let mut reach: usize = 0;
+        for (stride, n) in dims {
+            if stride <= reach {
+                return true;
+            }
+            // Fits: the layout of an existing tensor spans less than `usize::MAX`.
+            reach += (n - 1) * stride;
+        }
+        false
     }
 }
 

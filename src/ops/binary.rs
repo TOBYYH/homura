@@ -310,8 +310,9 @@ impl Tensor {
     ///
     /// # Panics
     ///
-    /// Panics if `src` can't be broadcast to the shape of `self`, if several elements of `self`
-    /// share memory (an expanded tensor), or if `src` is a meta tensor and `self` is not.
+    /// Panics if `src` can't be broadcast to the shape of `self`, if the elements of `self` can't
+    /// be proven to occupy distinct memory (an expanded tensor, for example), or if `src` is a
+    /// meta tensor and `self` is not.
     pub fn copy_(&self, src: &Tensor) -> &Self {
         let dst = self.data();
         let mut s = src.data();
@@ -350,12 +351,13 @@ impl Tensor {
     }
 }
 
-/// Panics if writing to `dst` would write some memory location more than once.
+/// Panics unless the elements of `dst` are proven to be distinct memory locations (see
+/// `Layout::may_overlap_internally`), so that no location is written more than once.
 pub(crate) fn check_writable(dst: &TensorData) {
-    if dst.layout.has_internal_overlap() {
+    if dst.layout.may_overlap_internally() {
         panic!(
-            "unsupported operation: more than one element of the written-to tensor refers to a \
-             single memory location. Please deep_clone() the tensor before performing the \
+            "unsupported operation: more than one element of the written-to tensor may refer to \
+             a single memory location. Please deep_clone() the tensor before performing the \
              operation."
         );
     }

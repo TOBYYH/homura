@@ -176,8 +176,8 @@ impl Tensor {
         self.triangle(diagonal, false)
     }
 
-    /// Tiles the tensor `repeats[i]` times along each dimension. `repeats` may have more entries
-    /// than `self` has dimensions; leading dimensions are added.
+    /// Tiles the tensor `repeats[i]` times along each dimension, returning a copy. `repeats` may
+    /// have more entries than `self` has dimensions; leading dimensions are added.
     pub fn repeat(&self, repeats: impl IntoShape) -> Tensor {
         let repeats = repeats.into_shape();
         let shape = self.shape();
@@ -202,7 +202,11 @@ impl Tensor {
                 .expect("repeat(): the result has too many elements");
             result.push(n as i64);
         }
-        self.reshape(interleaved).expand(expanded).reshape(result)
+        // Always copy: even when nothing is repeated, the result must not share storage.
+        self.reshape(interleaved)
+            .expand(expanded)
+            .deep_clone()
+            .view(result)
     }
 
     /// Reverses the order of elements along `dims`, returning a copy.

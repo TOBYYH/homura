@@ -51,7 +51,6 @@ fn allocation_rejects_overflowing_byte_count() {
 }
 
 #[test]
-#[ignore = "M0: writable check detects stride zero but misses nonzero overlapping strides"]
 fn as_strided_nonzero_internal_overlap_is_rejected() {
     let x = homura::zeros_with([3], DType::I64);
     let overlapping = x.as_strided([2, 2], [1, 1], 0);
@@ -61,7 +60,6 @@ fn as_strided_nonzero_internal_overlap_is_rejected() {
 }
 
 #[test]
-#[ignore = "M0: repeat with all repetitions equal to one returns a view"]
 fn repeat_always_copies_storage() {
     let x = homura::arange(6).view([2, 3]);
     x.repeat([1, 1]).fill_(99);
@@ -77,7 +75,6 @@ fn chunk_empty_dimension_returns_requested_chunks() {
 }
 
 #[test]
-#[ignore = "M0: arange converts integer bounds to f64 before computing the length"]
 fn arange_preserves_i64_bounds_above_two_to_the_53() {
     let start = 1i64 << 53;
     assert_eq!(
@@ -87,21 +84,18 @@ fn arange_preserves_i64_bounds_above_two_to_the_53() {
 }
 
 #[test]
-#[ignore = "M0: randint routes i64 samples through f64 and loses integer precision"]
 fn randint_single_value_interval_preserves_large_integer() {
     let low = (1i64 << 53) + 1;
     assert_eq!(homura::randint(low, low + 1, [8]).to_vec::<i64>(), [low; 8]);
 }
 
 #[test]
-#[ignore = "M0: high-low overflows i64 for valid wide randint intervals"]
 fn randint_accepts_wide_i64_interval() {
     let values = homura::randint(i64::MIN, i64::MAX, [16]).to_vec::<i64>();
     assert!(values.iter().all(|&v| v < i64::MAX));
 }
 
 #[test]
-#[ignore = "M0: half uniform samples can round up to the excluded upper endpoint"]
 fn half_rand_keeps_the_upper_bound_exclusive() {
     homura::manual_seed(42);
     for dtype in [DType::F16, DType::BF16] {
@@ -114,7 +108,6 @@ fn half_rand_keeps_the_upper_bound_exclusive() {
 }
 
 #[test]
-#[ignore = "M0: normal_ accepts a negative standard deviation"]
 fn normal_rejects_negative_standard_deviation() {
     rejects(|| {
         homura::zeros([2]).normal_(0.0, -1.0);
@@ -122,7 +115,6 @@ fn normal_rejects_negative_standard_deviation() {
 }
 
 #[test]
-#[ignore = "M0: uniform_ accepts a reversed interval"]
 fn uniform_rejects_reversed_bounds() {
     rejects(|| {
         homura::zeros([2]).uniform_(2.0, 1.0);
@@ -130,7 +122,6 @@ fn uniform_rejects_reversed_bounds() {
 }
 
 #[test]
-#[ignore = "M0: Meta random_tensor returns before dtype and interval validation"]
 fn meta_random_validates_parameters() {
     rejects(|| {
         homura::rand_with([2], (DType::I64, Device::Meta));
@@ -203,7 +194,6 @@ fn full_preserves_negative_zero() {
 }
 
 #[test]
-#[ignore = "M0: safetensors does not validate global data coverage, duplicate names or metadata"]
 fn safetensors_rejects_invalid_global_structure() {
     let invalid = [
         (
@@ -246,14 +236,12 @@ fn safetensors_rejects_invalid_global_structure() {
 }
 
 #[test]
-#[ignore = "M0: JSON numbers are parsed with f64::from_str, accepting leading zeros"]
 fn safetensors_json_numbers_follow_json_grammar() {
     let header = r#"{"a":{"dtype":"U8","shape":[01],"data_offsets":[0,1]}}"#;
     assert!(homura::load_safetensors_from_bytes(&file(header, &[0])).is_err());
 }
 
 #[test]
-#[ignore = "M0: save accepts reserved __metadata__ as a tensor name, then load discards it"]
 fn safetensors_save_rejects_reserved_metadata_name() {
     assert!(homura::save_safetensors_to_bytes([("__metadata__", &homura::tensor(1))]).is_err());
 }
@@ -278,7 +266,6 @@ fn concurrent_increments_do_not_lose_updates() {
 }
 
 #[test]
-#[ignore = "M0: golden comparisons cast I64 to F64, masking differences above 2^53"]
 fn golden_comparison_detects_adjacent_large_i64_values() {
     let expected = homura::tensor([1i64 << 53]);
     let actual = homura::tensor([(1i64 << 53) + 1]);
@@ -322,4 +309,70 @@ fn huge_slice_steps_give_one_element() {
     let x = homura::arange(5);
     let y = x.index((0..5).step_by(usize::MAX));
     assert_eq!(y.to_vec::<i64>(), [0]);
+}
+
+#[test]
+fn provably_distinct_layouts_stay_writable() {
+    let x = homura::zeros_with([4, 6], DType::I64);
+    x.transpose(0, 1).fill_(1);
+    x.index((.., (0..6).step_by(2))).fill_(2);
+    x.as_strided([2, 3], [1, 2], 0)
+        .copy_(&homura::tensor([[1, 2, 3], [4, 5, 6]]));
+    assert_eq!(
+        x.view([-1]).narrow(0, 0, 6).to_vec::<i64>(),
+        [1, 4, 2, 5, 3, 6]
+    );
+    homura::zeros([0, 3]).expand([2, 0, 3]).fill_(1);
+    // Distinct, but not provably so by the stride-sorting check.
+    rejects(|| {
+        x.as_strided([3, 2], [2, 3], 0).fill_(0);
+    });
+}
+
+#[test]
+fn integer_arange_handles_negative_steps_and_extreme_bounds() {
+    assert_eq!(
+        homura::arange_step(5, -6, -3).to_vec::<i64>(),
+        [5, 2, -1, -4]
+    );
+    assert_eq!(
+        homura::arange_step(i64::MAX - 2, i64::MAX, 1).to_vec::<i64>(),
+        [i64::MAX - 2, i64::MAX - 1]
+    );
+    assert_eq!(
+        homura::arange_step(i64::MIN, i64::MAX, i64::MAX).to_vec::<i64>(),
+        [i64::MIN, -1, i64::MAX - 1]
+    );
+    rejects(|| {
+        homura::arange_step(0.0, f64::INFINITY, 1.0);
+    });
+}
+
+#[test]
+fn randint_checks_the_dtype_range() {
+    let x = homura::randint_with(0, 256, [64], DType::U8);
+    assert_eq!(x.dtype(), DType::U8);
+    rejects(|| {
+        homura::randint_with(0, 257, [2], DType::U8);
+    });
+    rejects(|| {
+        homura::randint_with(-1, 1, [2], (DType::Bool, Device::Meta));
+    });
+}
+
+#[test]
+fn uniform_keeps_the_upper_bound_exclusive_after_rounding() {
+    // Every f16 value in [1, 1 + 2^-10) is 1, so all samples round to the lower bound.
+    let x = homura::zeros_with([1000], DType::F16);
+    x.uniform_(1.0, 1.0 + 2f64.powi(-10));
+    assert!(x.to_vec::<f32>().iter().all(|&v| v == 1.0));
+}
+
+#[test]
+fn safetensors_accepts_empty_tensors_and_string_metadata() {
+    let header = r#"{"__metadata__":{"format":"pt"},"e":{"dtype":"F32","shape":[0],"data_offsets":[2,2]},"b":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"z":{"dtype":"I64","shape":[0,4],"data_offsets":[0,0]}}"#;
+    let loaded = homura::load_safetensors_from_bytes(&file(header, &[1, 2])).unwrap();
+    let names: Vec<_> = loaded.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["e", "b", "z"]);
+    assert_eq!(loaded[1].1.to_vec::<u8>(), [1, 2]);
 }

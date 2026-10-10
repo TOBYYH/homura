@@ -76,9 +76,19 @@ fn unit_f64(hi: u32, lo: u32) -> f64 {
     bits as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
-/// A uniform `f32` in `[0, 1)` from 24 random bits.
-fn unit_f32(x: u32) -> f64 {
-    (x >> 8) as f64 * (1.0 / (1u32 << 24) as f64)
+/// A uniform value in `[0, 1)` from the top `bits` bits of `x`.
+fn unit_bits(x: u32, bits: u32) -> f64 {
+    (x >> (32 - bits)) as f64 / (1u64 << bits) as f64
+}
+
+/// The number of random bits in a uniform `[0, 1)` sample of a dtype narrower than `f64`: its
+/// significand precision, so every sample is exactly representable and can't round up to 1.
+fn uniform_bits(dtype: DType) -> u32 {
+    match dtype {
+        DType::F16 => 11,
+        DType::BF16 => 8,
+        _ => 24,
+    }
 }
 
 enum Dist {
@@ -87,13 +97,66 @@ enum Dist {
     Int(i64, i64),
 }
 
-/// Samples `n` values; floats are computed in `f64` and returned as such.
-fn sample(n: usize, dist: &Dist, dtype: DType) -> Vec<f64> {
+impl Dist {
+    /// Panics if the parameters or the dtype are invalid. Runs before anything else, so rejected
+    /// calls neither advance the generator nor behave differently on the meta device.
+    fn validate(&self, dtype: DType) {
+        match *self {
+            Dist::Uniform(..) | Dist::Normal(..) if !dtype.is_floating_point() => {
+                panic!("random floating point sampling is not implemented for {dtype} tensors")
+            }
+            Dist::Uniform(from, to) => {
+                if !(from.is_finite() && to.is_finite()) {
+                    panic!("uniform_ expects finite bounds, but got from={from} and to={to}");
+                }
+                if from > to {
+                    panic!(
+                        "uniform_ expects to return a [from, to) range, but found from={from} > \
+                         to={to}"
+                    );
+                }
+            }
+            Dist::Normal(_, std) => {
+                if std.is_nan() || std < 0.0 {
+                    panic!("normal expects std >= 0.0, but found std {std}");
+                }
+            }
+            Dist::Int(low, high) => {
+                if low >= high {
+                    panic!(
+                        "random_ expects 'from' to be less than 'to', but got from={low} >= \
+                         to={high}"
+                    );
+                }
+                let range = match dtype {
+                    DType::Bool => Some((0, 1)),
+                    DType::U8 => Some((0, u8::MAX as i64)),
+                    DType::I8 => Some((i8::MIN as i64, i8::MAX as i64)),
+                    DType::I16 => Some((i16::MIN as i64, i16::MAX as i64)),
+                    DType::I32 => Some((i32::MIN as i64, i32::MAX as i64)),
+                    _ => None,
+                };
+                if let Some((min, max)) = range
+                    && (low < min || high - 1 > max)
+                {
+                    panic!(
+                        "random_ expects [from, to) to lie inside the range of {dtype}, but got \
+                         from={low} and to={high}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Samples `n` floating point values for a `dtype` tensor, computed in `f64`.
+fn sample_float(n: usize, dist: &Dist, dtype: DType) -> Vec<f64> {
     let mut out = Vec::with_capacity(n);
     match *dist {
         Dist::Uniform(from, to) => {
             // f64 uses two words per value, narrower types one.
             let per_block = if dtype == DType::F64 { 2 } else { 4 };
+            let bits = uniform_bits(dtype);
             let block = reserve(n.div_ceil(per_block) as u64);
             for i in 0..n.div_ceil(per_block) {
                 let b = block(i as u64);
@@ -101,7 +164,7 @@ fn sample(n: usize, dist: &Dist, dtype: DType) -> Vec<f64> {
                     let u = if per_block == 2 {
                         unit_f64(b[2 * j], b[2 * j + 1])
                     } else {
-                        unit_f32(b[j])
+                        unit_bits(b[j], bits)
                     };
                     out.push(from + u * (to - from));
                 }
@@ -120,48 +183,69 @@ fn sample(n: usize, dist: &Dist, dtype: DType) -> Vec<f64> {
                 out.push(mean + std * r * theta.sin());
             }
         }
-        Dist::Int(low, high) => {
-            let range = (high - low) as u64;
-            let block = reserve(n.div_ceil(2) as u64);
-            for i in 0..n.div_ceil(2) {
-                let b = block(i as u64);
-                for j in 0..2 {
-                    let r = ((b[2 * j] as u64) << 32) | b[2 * j + 1] as u64;
-                    out.push((low + (r % range) as i64) as f64);
-                }
-            }
-        }
+        Dist::Int(..) => unreachable!("integer distributions use sample_int"),
     }
     out.truncate(n);
     out
 }
 
+/// Samples `n` integers uniformly from `[low, high)`, which must be nonempty.
+///
+/// Uses rejection sampling on 64-bit words, so every value is equally likely even for ranges
+/// that don't divide `2^64`.
+fn sample_int(n: usize, low: i64, high: i64) -> Vec<i64> {
+    // `high - low` is in `1..=u64::MAX`, which may not fit in `i64`.
+    let range = (high as i128 - low as i128) as u64;
+    // Words below `2^64 mod range` would make small results more likely.
+    let threshold = range.wrapping_neg() % range;
+    let mut out = Vec::with_capacity(n);
+    let mut words: Vec<u64> = vec![];
+    while out.len() < n {
+        if words.is_empty() {
+            // Each block holds two words; usually no word is rejected, so reserve one block per
+            // two values still needed.
+            let blocks = (n - out.len()).div_ceil(2) as u64;
+            let block = reserve(blocks);
+            for i in (0..blocks).rev() {
+                let b = block(i);
+                words.push(((b[2] as u64) << 32) | b[3] as u64);
+                words.push(((b[0] as u64) << 32) | b[1] as u64);
+            }
+        }
+        let r = words.pop().unwrap();
+        if r >= threshold {
+            out.push((low as i128 + (r % range) as i128) as i64);
+        }
+    }
+    out
+}
+
 /// Fills a new tensor with samples from `dist`.
 fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tensor {
+    dist.validate(dtype);
     if device == Device::Meta {
         return Tensor::empty_on(shape, dtype, device);
     }
     let n = shape.num_elements();
     match dist {
         Dist::Int(low, high) => {
-            if low >= high {
-                panic!(
-                    "random_ expects 'from' to be less than 'to', but got from={low} >= to={high}"
-                );
-            }
-            let values: Vec<i64> = sample(n, &dist, dtype)
-                .into_iter()
-                .map(|v| v as i64)
-                .collect();
+            let values = sample_int(n, low, high);
             Tensor::from_host(&values, shape, device).to(dtype)
         }
         _ => {
-            if !dtype.is_floating_point() {
-                panic!("random floating point sampling is not implemented for {dtype} tensors");
-            }
-            let values = sample(n, &dist, dtype);
+            let values = sample_float(n, &dist, dtype);
             dispatch_float!(dtype, T => {
-                let v: Vec<T> = values.iter().map(|&x| T::from_f64(x)).collect();
+                let v: Vec<T> = values
+                    .iter()
+                    .map(|&x| match dist {
+                        // Rounding to `T` can reach the excluded upper bound; PyTorch maps it to
+                        // the lower bound in that case too.
+                        Dist::Uniform(from, to) if from < to && T::from_f64(x).to_f64() >= to => {
+                            T::from_f64(from)
+                        }
+                        _ => T::from_f64(x),
+                    })
+                    .collect();
                 Tensor::from_host(&v, shape, device)
             })
         }
@@ -253,6 +337,8 @@ impl Tensor {
 
 #[cfg(test)]
 mod tests {
+    use half::{bf16, f16};
+
     use super::*;
 
     #[test]
@@ -279,6 +365,29 @@ mod tests {
     fn unit_ranges() {
         assert_eq!(unit_f64(0, 0), 0.0);
         assert!(unit_f64(u32::MAX, u32::MAX) < 1.0);
-        assert!(unit_f32(u32::MAX) < 1.0);
+        for bits in [8, 11, 24] {
+            assert!(unit_bits(u32::MAX, bits) < 1.0);
+        }
+        assert_eq!(
+            f16::from_f64(unit_bits(u32::MAX, 11)).to_f64(),
+            1.0 - 2f64.powi(-11)
+        );
+        assert_eq!(
+            bf16::from_f64(unit_bits(u32::MAX, 8)).to_f64(),
+            1.0 - 2f64.powi(-8)
+        );
+    }
+
+    #[test]
+    fn int_sampling_covers_extreme_ranges() {
+        assert!(
+            sample_int(64, i64::MIN, i64::MAX)
+                .iter()
+                .all(|&v| v < i64::MAX)
+        );
+        assert_eq!(sample_int(4, i64::MAX - 1, i64::MAX), [i64::MAX - 1; 4]);
+        let v = sample_int(1000, -2, 1);
+        assert!(v.iter().all(|x| (-2..1).contains(x)));
+        assert!((-2..1).all(|k| v.contains(&k)));
     }
 }

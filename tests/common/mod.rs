@@ -109,10 +109,24 @@ pub fn assert_close(actual: &Tensor, expected: &Tensor, what: &str) {
     assert_close_tol(actual, expected, rtol, atol, what);
 }
 
-/// Asserts equal shape and dtype, NaN in the same places and `|a - e| <= atol + rtol * |e|`.
+/// Asserts equal shape and dtype, and then for floating point tensors NaN in the same places and
+/// `|a - e| <= atol + rtol * |e|`. Integer and bool tensors must be exactly equal; they are
+/// compared as `i64`, never through floats, which can't represent every `i64`.
 pub fn assert_close_tol(actual: &Tensor, expected: &Tensor, rtol: f64, atol: f64, what: &str) {
     assert_eq!(actual.shape(), expected.shape(), "{what}: shape");
     assert_eq!(actual.dtype(), expected.dtype(), "{what}: dtype");
+    if !expected.dtype().is_floating_point() {
+        let exact = |t: &Tensor| t.to(DType::I64).to_vec::<i64>();
+        let (a, e) = (exact(actual), exact(expected));
+        if let Some(i) = (0..a.len()).find(|&i| a[i] != e[i]) {
+            panic!(
+                "{what}: element {i} differs: got {}, expected {}\n  actual: {actual:?}\n  \
+                 expected: {expected:?}",
+                a[i], e[i]
+            );
+        }
+        return;
+    }
     let a = actual.to(DType::F64).to_vec::<f64>();
     let e = expected.to(DType::F64).to_vec::<f64>();
     for (i, (&x, &y)) in a.iter().zip(&e).enumerate() {

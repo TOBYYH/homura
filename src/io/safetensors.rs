@@ -40,79 +40,133 @@ fn to_from_le(bytes: &mut [u8], elem_size: usize) {
     }
 }
 
+/// Upper limit on the header size, as in the reference implementation.
+const MAX_HEADER_LEN: u64 = 100_000_000;
+
+/// A validated tensor entry of a safetensors header.
+struct Entry<'a> {
+    name: &'a str,
+    dtype: DType,
+    shape: Shape,
+    begin: usize,
+    end: usize,
+}
+
+fn bad(msg: &str) -> Error {
+    Error::Format(format!("invalid safetensors data: {msg}"))
+}
+
+/// Parses one tensor entry, checking that its byte range matches its shape and dtype.
+fn parse_entry<'a>(name: &'a str, info: &Json) -> Result<Entry<'a>> {
+    let field = |key: &str| {
+        info.get(key)
+            .ok_or_else(|| bad(&format!("{name}: missing {key}")))
+    };
+    let dtype = parse_dtype(
+        field("dtype")?
+            .as_str()
+            .ok_or_else(|| bad(&format!("{name}: dtype is not a string")))?,
+    )?;
+    let ints = |key: &str| -> Result<Vec<usize>> {
+        field(key)?
+            .as_array()
+            .ok_or_else(|| bad(&format!("{name}: {key} is not an array")))?
+            .iter()
+            .map(|x| {
+                x.as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| bad(&format!("{name}: {key} must hold unsigned integers")))
+            })
+            .collect()
+    };
+    let shape = ints("shape")?;
+    let [begin, end] = ints("data_offsets")?[..] else {
+        return Err(bad(&format!("{name}: data_offsets must have two entries")));
+    };
+    let nbytes = crate::shape::checked_num_elements(&shape)
+        .and_then(|n| n.checked_mul(dtype.size_in_bytes()))
+        .ok_or_else(|| bad(&format!("{name}: shape too large")))?;
+    if begin > end || end - begin != nbytes {
+        return Err(bad(&format!(
+            "{name}: data_offsets don't match the shape and dtype"
+        )));
+    }
+    Ok(Entry {
+        name,
+        dtype,
+        shape: Shape::new(&shape),
+        begin,
+        end,
+    })
+}
+
 /// Parses safetensors data held in memory. Tensors are created on the CPU, in header order.
+///
+/// The whole header is validated before any tensor is created: names must be unique,
+/// `__metadata__` must map strings to strings, and the tensors' byte ranges must exactly tile
+/// the data section without overlaps, holes or trailing bytes.
 pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>> {
-    let bad = |msg: &str| Error::Format(format!("invalid safetensors data: {msg}"));
     let len_bytes: [u8; 8] = bytes
         .get(..8)
         .ok_or_else(|| bad("missing header length"))?
         .try_into()
         .unwrap();
     let header_len = u64::from_le_bytes(len_bytes);
-    let data_start = 8u64
-        .checked_add(header_len)
-        .filter(|&n| n <= bytes.len() as u64);
-    let data_start = data_start.ok_or_else(|| bad("header length exceeds file size"))? as usize;
+    if header_len > MAX_HEADER_LEN {
+        return Err(bad("header is too large"));
+    }
+    let data_start = 8 + header_len as usize;
+    if data_start > bytes.len() {
+        return Err(bad("header length exceeds file size"));
+    }
     let header =
         std::str::from_utf8(&bytes[8..data_start]).map_err(|_| bad("header is not UTF-8"))?;
+    // The JSON parser rejects duplicate keys, so tensor names are unique.
     let header = json::parse(header)?;
     let members = header
         .as_object()
         .ok_or_else(|| bad("header is not an object"))?;
     let data = &bytes[data_start..];
 
-    let mut out = vec![];
+    let mut entries = vec![];
     for (name, info) in members {
         if name == "__metadata__" {
-            continue;
+            let valid = info
+                .as_object()
+                .is_some_and(|m| m.iter().all(|(_, v)| v.as_str().is_some()));
+            if !valid {
+                return Err(bad("__metadata__ must map strings to strings"));
+            }
+        } else {
+            entries.push(parse_entry(name, info)?);
         }
-        let field = |key: &str| {
-            info.get(key)
-                .ok_or_else(|| bad(&format!("{name}: missing {key}")))
-        };
-        let dtype = parse_dtype(
-            field("dtype")?
-                .as_str()
-                .ok_or_else(|| bad("dtype is not a string"))?,
-        )?;
-        let ints = |v: &Json| -> Result<Vec<u64>> {
-            v.as_array()
-                .ok_or_else(|| bad("expected an array"))?
-                .iter()
-                .map(|x| {
-                    x.as_u64()
-                        .ok_or_else(|| bad("expected an unsigned integer"))
-                })
-                .collect()
-        };
-        let shape: Vec<usize> = ints(field("shape")?)?
-            .into_iter()
-            .map(|d| d as usize)
-            .collect();
-        let offsets = ints(field("data_offsets")?)?;
-        let [begin, end] = offsets[..] else {
-            return Err(bad(&format!("{name}: data_offsets must have two entries")));
-        };
-        let shape = Shape::new(&shape);
-        let nbytes = shape
-            .iter()
-            .try_fold(dtype.size_in_bytes(), |acc, &d| acc.checked_mul(d))
-            .ok_or_else(|| bad(&format!("{name}: shape too large")))?;
-        if begin > end || end > data.len() as u64 || end - begin != nbytes as u64 {
+    }
+    let mut ranges: Vec<(usize, usize)> = entries.iter().map(|e| (e.begin, e.end)).collect();
+    ranges.sort_unstable();
+    let mut covered = 0;
+    for (begin, end) in ranges {
+        if begin != covered {
+            return Err(bad("tensor data overlaps or leaves a gap"));
+        }
+        covered = end;
+    }
+    if covered != data.len() {
+        return Err(bad("data section doesn't match the tensors in the header"));
+    }
+
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let mut raw = data[e.begin..e.end].to_vec();
+        if e.dtype == DType::Bool && raw.iter().any(|&b| b > 1) {
             return Err(bad(&format!(
-                "{name}: data_offsets don't match the shape and dtype"
+                "{}: BOOL data must consist of the bytes 0 and 1",
+                e.name
             )));
         }
-        let mut raw = data[begin as usize..end as usize].to_vec();
-        if dtype == DType::Bool && raw.iter().any(|&b| b > 1) {
-            return Err(bad(&format!(
-                "{name}: BOOL data must consist of the bytes 0 and 1"
-            )));
-        }
-        to_from_le(&mut raw, dtype.size_in_bytes());
-        let t = Tensor::empty_on(shape, dtype, Device::Cpu);
+        to_from_le(&mut raw, e.dtype.size_in_bytes());
+        let t = Tensor::empty_on(e.shape, e.dtype, Device::Cpu);
         cpu::write_bytes(&t.data(), &raw);
-        out.push((name.clone(), t));
+        out.push((e.name.to_string(), t));
     }
     Ok(out)
 }
@@ -128,7 +182,8 @@ pub fn load_safetensors(path: impl AsRef<Path>) -> Result<Vec<(String, Tensor)>>
 ///
 /// # Errors
 ///
-/// Returns an error for meta tensors (they have no data) and duplicate names.
+/// Returns an error for meta tensors (they have no data), duplicate names and the name
+/// `__metadata__`, which the format reserves.
 pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
     tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
 ) -> Result<Vec<u8>> {
@@ -137,6 +192,11 @@ pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
     let mut names = std::collections::HashSet::new();
     for (i, (name, t)) in tensors.into_iter().enumerate() {
         let name = name.as_ref();
+        if name == "__metadata__" {
+            return Err(Error::Format(
+                "the tensor name \"__metadata__\" is reserved by the safetensors format".into(),
+            ));
+        }
         if !names.insert(name.to_string()) {
             return Err(Error::Format(format!("duplicate tensor name {name:?}")));
         }

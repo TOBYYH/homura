@@ -1,5 +1,6 @@
 //! A minimal JSON parser and writer, enough for safetensors headers.
 
+use std::collections::HashSet;
 use std::fmt::Write;
 
 use crate::{Error, Result};
@@ -116,6 +117,7 @@ impl Parser<'_> {
             Some(b'{') => {
                 self.i += 1;
                 let mut members = vec![];
+                let mut seen = HashSet::new();
                 self.ws();
                 if self.peek() == Some(b'}') {
                     self.i += 1;
@@ -123,7 +125,12 @@ impl Parser<'_> {
                 }
                 loop {
                     self.ws();
+                    let key_start = self.i;
                     let key = self.string()?;
+                    if !seen.insert(key.clone()) {
+                        self.i = key_start;
+                        return Err(self.err(&format!("duplicate key {key:?}")));
+                    }
                     self.ws();
                     self.expect(b':')?;
                     let v = self.value(depth + 1)?;
@@ -164,24 +171,50 @@ impl Parser<'_> {
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
             Some(b'n') => self.literal("null", Json::Null),
-            Some(c) if c == b'-' || c.is_ascii_digit() => {
-                let start = self.i;
-                while self.i < self.s.len()
-                    && matches!(
-                        self.s[self.i],
-                        b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
-                    )
-                {
-                    self.i += 1;
-                }
-                let text = std::str::from_utf8(&self.s[start..self.i]).unwrap();
-                if text.parse::<f64>().is_err() {
-                    return Err(self.err("invalid number"));
-                }
-                Ok(Json::Number(text.to_string()))
-            }
+            Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
             _ => Err(self.err("unexpected character")),
         }
+    }
+
+    /// Skips ASCII digits and returns how many there were.
+    fn digits(&mut self) -> usize {
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        self.i - start
+    }
+
+    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`, as in RFC 8259.
+    fn number(&mut self) -> Result<Json> {
+        let start = self.i;
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        match self.peek() {
+            Some(b'0') => self.i += 1,
+            Some(b'1'..=b'9') => {
+                self.digits();
+            }
+            _ => return Err(self.err("invalid number")),
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if self.digits() == 0 {
+                return Err(self.err("invalid number"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if self.digits() == 0 {
+                return Err(self.err("invalid number"));
+            }
+        }
+        let text = std::str::from_utf8(&self.s[start..self.i]).unwrap();
+        Ok(Json::Number(text.to_string()))
     }
 
     fn hex4(&mut self) -> Result<u32> {
@@ -281,6 +314,9 @@ mod tests {
             parse("18446744073709551615").unwrap().as_u64(),
             Some(u64::MAX)
         );
+        for ok in ["0", "-0", "0.5", "-1.25e-3", "1E+9", "10"] {
+            assert_eq!(parse(ok).unwrap(), Json::Number(ok.into()));
+        }
     }
 
     #[test]
@@ -294,6 +330,18 @@ mod tests {
             "tru",
             "1 2",
             "\"\\ud800\"",
+            "01",
+            "-",
+            "-01",
+            "1.",
+            ".5",
+            "1e",
+            "1e+",
+            "+1",
+            "1.5.2",
+            "--1",
+            "{\"a\":1,\"a\":2}",
+            "[{\"b\":{\"c\":1,\"c\":1}}]",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} should fail");
         }

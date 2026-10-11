@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        run: cargo +stable fmt --all --check
+      - name: Clippy
+        run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - name: Debug tests
+        run: cargo +stable test --workspace --locked
+      - name: Release tests
+        run: cargo +stable test --workspace --release --locked
+      - name: Documentation
+        run: cargo +stable doc --workspace --no-deps --locked

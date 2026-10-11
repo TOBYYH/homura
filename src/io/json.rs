@@ -222,8 +222,12 @@ impl Parser<'_> {
             .s
             .get(self.i..self.i + 4)
             .ok_or_else(|| self.err("truncated escape"))?;
-        let text = std::str::from_utf8(digits).map_err(|_| self.err("invalid escape"))?;
-        let v = u32::from_str_radix(text, 16).map_err(|_| self.err("invalid escape"))?;
+        // `from_str_radix` alone would also accept a leading `+`.
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(self.err("invalid escape"));
+        }
+        let text = std::str::from_utf8(digits).unwrap();
+        let v = u32::from_str_radix(text, 16).unwrap();
         self.i += 4;
         Ok(v)
     }
@@ -330,6 +334,11 @@ mod tests {
             "tru",
             "1 2",
             "\"\\ud800\"",
+            "\"\\u+001\"",
+            "\"\\u-001\"",
+            "\"\\u00g1\"",
+            "\"\\u00e\"",
+            "\"\\ud83d\\u+e00\"",
             "01",
             "-",
             "-01",

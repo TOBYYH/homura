@@ -15,6 +15,13 @@ impl<const N: usize> Plan<N> {
         for s in &strides {
             debug_assert_eq!(s.len(), shape.len());
         }
+        // Empty layouts touch no memory, so their strides may be arbitrary: don't look at them.
+        if shape.contains(&0) {
+            return Plan {
+                dims: vec![],
+                empty: true,
+            };
+        }
         let mut dims: Vec<(usize, [usize; N])> = Vec::with_capacity(shape.len());
         for (i, &size) in shape.iter().enumerate() {
             if size == 1 {
@@ -22,7 +29,7 @@ impl<const N: usize> Plan<N> {
             }
             let st: [usize; N] = std::array::from_fn(|k| strides[k][i]);
             if let Some(outer) = dims.last_mut()
-                && (0..N).all(|k| outer.1[k] == st[k] * size)
+                && (0..N).all(|k| st[k].checked_mul(size) == Some(outer.1[k]))
             {
                 outer.0 *= size;
                 outer.1 = st;
@@ -30,10 +37,7 @@ impl<const N: usize> Plan<N> {
             }
             dims.push((size, st));
         }
-        Plan {
-            dims,
-            empty: shape.contains(&0),
-        }
+        Plan { dims, empty: false }
     }
 
     /// Calls `f` with the offsets of every element, in row-major order, starting from `base`.
@@ -94,5 +98,13 @@ mod tests {
         assert_eq!(collect::<1>(&[2, 0], [&[1, 1]]).len(), 0);
         assert_eq!(collect::<1>(&[], [&[]]), vec![[0]]);
         assert_eq!(collect(&[3], [&[0]]), vec![[0], [0], [0]]);
+    }
+
+    #[test]
+    fn extreme_strides_do_not_overflow() {
+        assert!(collect::<1>(&[0, 2], [&[0, usize::MAX]]).is_empty());
+        // `stride * size` doesn't fit in `usize`, so the dimensions can't be merged.
+        let half = usize::MAX / 2 + 1;
+        assert_eq!(Plan::new(&[2, 2], [&[0, half]]).dims.len(), 2);
     }
 }

@@ -2,8 +2,9 @@
 
 use super::{Operand, common_device};
 use crate::backend::cpu;
+use crate::dtype::Kind;
 use crate::shape::normalize_dim;
-use crate::{Device, Scalar, Tensor};
+use crate::{DType, Device, Scalar, Tensor};
 
 fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     let src = x.data();
@@ -22,10 +23,82 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     out
 }
 
-/// `beta * input + alpha * product`, where the values of `input` are ignored when `beta` is zero
-/// (so NaN in it does not propagate), as PyTorch's `add*` operations do. `input` must still have
-/// the dtype and device of `product` and broadcast to its shape, whatever `beta` is.
-fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
+/// How an `add*` operation treats floating point coefficients for integer or bool inputs, following
+/// the PyTorch kernels.
+#[derive(Clone, Copy, PartialEq)]
+enum Coefficients {
+    /// `addmm`, `addmv`, `baddbmm` and `addbmm` truncate them toward zero.
+    Truncate,
+    /// `addr` rejects them, as well as bool coefficients for non-bool inputs.
+    Strict,
+}
+
+/// Converts the coefficient `name` to a scalar of `dtype`, so that unlike a scalar passed to
+/// `mul` it never changes the result dtype.
+///
+/// # Panics
+///
+/// Panics if the value doesn't fit in `dtype`. For floating point dtypes only `addr` checks this,
+/// and lets infinities and NaN through.
+fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scalar {
+    if rule == Coefficients::Strict {
+        if matches!(s, Scalar::Bool(_)) && dtype != DType::Bool {
+            panic!("Boolean {name} only supported for Boolean results");
+        }
+        if matches!(s, Scalar::Float(_)) && !dtype.is_floating_point() {
+            panic!(
+                "For integral input tensors, argument {name} must not be a floating point number"
+            );
+        }
+    }
+    let overflow = || -> ! { panic!("{name}={s} cannot be converted to {dtype} without overflow") };
+    match dtype.kind() {
+        Kind::Bool => Scalar::Bool(s.to_bool()),
+        Kind::Float => {
+            let v = s.to_f64();
+            if rule == Coefficients::Strict && v.is_finite() && v.abs() > dtype.float_max() {
+                overflow();
+            }
+            s
+        }
+        Kind::Int => {
+            let (min, max) = dtype.int_range();
+            Scalar::Int(match s {
+                Scalar::Bool(v) => v as i64,
+                Scalar::Int(v) => {
+                    // Like PyTorch, negative integers down to `-255` wrap around for `U8`.
+                    let min = if dtype == DType::U8 { -max } else { min };
+                    if !(min..=max).contains(&v) {
+                        overflow();
+                    }
+                    v
+                }
+                Scalar::Float(v) => {
+                    // Check before truncating to preserve the lower-bound rule. Fractional
+                    // values above MAX still truncate to MAX; MAX + 1 is the exclusive upper
+                    // bound. Compute it in i128 so I64 uses exactly 2^63, not a rounded MAX.
+                    let upper = (max as i128 + 1) as f64;
+                    if !(min as f64..upper).contains(&v) {
+                        overflow();
+                    }
+                    v as i64
+                }
+            })
+        }
+    }
+}
+
+/// `beta * input + alpha * product` with the dtype of `product`, where the values of `input` are
+/// ignored when `beta` is zero (so NaN in it does not propagate), as PyTorch's `add*` operations
+/// do. `input` must still have the dtype and device of `product` and broadcast to its shape,
+/// whatever `beta` is. The coefficients are converted to the dtype first, see [`coefficient`].
+fn scaled_sum(
+    input: &Tensor,
+    product: Tensor,
+    beta: Scalar,
+    alpha: Scalar,
+    rule: Coefficients,
+) -> Tensor {
     let (i, p) = (input.data(), product.data());
     common_device([&i, &p]);
     if i.dtype != p.dtype {
@@ -35,6 +108,8 @@ fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> T
         );
     }
     i.layout.expand_to(&p.layout.shape);
+    let beta = coefficient(beta, p.dtype, "beta", rule);
+    let alpha = coefficient(alpha, p.dtype, "alpha", rule);
     let product = if alpha.to_f64() == 1.0 {
         product
     } else {
@@ -73,6 +148,14 @@ impl Tensor {
 
     /// `beta * self + alpha * (mat1 @ mat2)` for 2-D `mat1` and `mat2`; `self` is broadcast to the
     /// result.
+    ///
+    /// The result keeps the input dtype: for integer inputs, floating point coefficients are
+    /// truncated toward zero, as in PyTorch. This also holds for [`addmv`](Tensor::addmv),
+    /// [`baddbmm`](Tensor::baddbmm) and [`addbmm`](Tensor::addbmm).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a coefficient doesn't fit in an integer input dtype.
     pub fn addmm(
         &self,
         mat1: &Tensor,
@@ -82,7 +165,13 @@ impl Tensor {
     ) -> Tensor {
         check_dims(mat1, 2, "mat1");
         check_dims(mat2, 2, "mat2");
-        scaled_sum(self, mat1.matmul(mat2), beta.into(), alpha.into())
+        scaled_sum(
+            self,
+            mat1.matmul(mat2),
+            beta.into(),
+            alpha.into(),
+            Coefficients::Truncate,
+        )
     }
 
     /// `beta * self + alpha * (mat @ vec)` for a 2-D `mat` and a 1-D `vec`.
@@ -95,10 +184,22 @@ impl Tensor {
     ) -> Tensor {
         check_dims(mat, 2, "mat");
         check_dims(vec, 1, "vec");
-        scaled_sum(self, mat.matmul(vec), beta.into(), alpha.into())
+        scaled_sum(
+            self,
+            mat.matmul(vec),
+            beta.into(),
+            alpha.into(),
+            Coefficients::Truncate,
+        )
     }
 
     /// `beta * self + alpha * outer(vec1, vec2)` for 1-D `vec1` and `vec2`.
+    /// The three tensor inputs are promoted to a common dtype before computation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a coefficient doesn't fit in the result dtype, is a floating point number for
+    /// integer or bool inputs, or is a bool for non-bool inputs, as PyTorch does.
     pub fn addr(
         &self,
         vec1: &Tensor,
@@ -108,8 +209,25 @@ impl Tensor {
     ) -> Tensor {
         check_dims(vec1, 1, "vec1");
         check_dims(vec2, 1, "vec2");
-        let outer = vec1.unsqueeze(1).matmul(&vec2.unsqueeze(0));
-        scaled_sum(self, outer, beta.into(), alpha.into())
+        let inputs = [self.data(), vec1.data(), vec2.data()];
+        common_device(&inputs);
+        // `self` participates fully in promotion even when it is zero-dimensional, since addr
+        // broadcasts it to the matrix shape before computing the result type.
+        let dtype = crate::promote_types(
+            crate::promote_types(inputs[0].dtype, inputs[1].dtype),
+            inputs[2].dtype,
+        );
+        let input = self.to(dtype);
+        // A broadcast product rather than a matmul, which doesn't support bool.
+        // Cast before multiplication so a wider self also widens the product computation.
+        let outer = vec1.to(dtype).unsqueeze(1).mul(vec2.to(dtype).unsqueeze(0));
+        scaled_sum(
+            &input,
+            outer,
+            beta.into(),
+            alpha.into(),
+            Coefficients::Strict,
+        )
     }
 
     /// `beta * self + alpha * (batch1 @ batch2)` for 3-D `batch1` and `batch2`.
@@ -129,7 +247,13 @@ impl Tensor {
                 batch2.size(0)
             );
         }
-        scaled_sum(self, batch1.matmul(batch2), beta.into(), alpha.into())
+        scaled_sum(
+            self,
+            batch1.matmul(batch2),
+            beta.into(),
+            alpha.into(),
+            Coefficients::Truncate,
+        )
     }
 
     /// `beta * self + alpha * sum_i (batch1[i] @ batch2[i])` for 3-D `batch1` and `batch2`.
@@ -152,7 +276,13 @@ impl Tensor {
         // Integer sums are computed in `I64`; casting back wraps exactly like accumulating in the
         // input dtype would.
         let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
-        scaled_sum(self, product, beta.into(), alpha.into())
+        scaled_sum(
+            self,
+            product,
+            beta.into(),
+            alpha.into(),
+            Coefficients::Truncate,
+        )
     }
 
     /// `self + value * tensor1 * tensor2`.

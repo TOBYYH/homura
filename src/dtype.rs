@@ -93,6 +93,30 @@ impl DType {
         }
     }
 
+    /// The smallest and largest values of an integer or bool dtype.
+    pub(crate) fn int_range(self) -> (i64, i64) {
+        match self {
+            DType::Bool => (0, 1),
+            DType::U8 => (0, u8::MAX as i64),
+            DType::I8 => (i8::MIN as i64, i8::MAX as i64),
+            DType::I16 => (i16::MIN as i64, i16::MAX as i64),
+            DType::I32 => (i32::MIN as i64, i32::MAX as i64),
+            DType::I64 => (i64::MIN, i64::MAX),
+            _ => unreachable!("{self} is not an integer dtype"),
+        }
+    }
+
+    /// The largest finite value of a floating point dtype.
+    pub(crate) fn float_max(self) -> f64 {
+        match self {
+            DType::F16 => f16::MAX.to_f64(),
+            DType::BF16 => bf16::MAX.to_f64(),
+            DType::F32 => f32::MAX as f64,
+            DType::F64 => f64::MAX,
+            _ => unreachable!("{self} is not a floating point dtype"),
+        }
+    }
+
     pub(crate) fn kind(self) -> Kind {
         match self {
             DType::Bool => Kind::Bool,
@@ -144,9 +168,13 @@ pub trait Element:
     ///
     /// Integers wrap (two's complement truncation) and any nonzero value becomes `true`. Floats
     /// cast to an integer type are first truncated toward zero to `i64`, saturating at its limits
-    /// (NaN becomes 0), and then wrapped to the target type. For values inside the `i64` range
-    /// this matches PyTorch on x86-64 (`300.0` becomes `44u8`, `-1.0` becomes `255u8`), but
-    /// unlike C++ `static_cast` the result is defined for every input.
+    /// (NaN becomes 0), and then wrapped to the target type, so unlike C++ `static_cast` the
+    /// result is defined for every input.
+    ///
+    /// This matches PyTorch on x86-64 when the truncated value fits in the target type, and for
+    /// `u8`, `i8` and `i16` also when it fits in `i32` (`300.0` becomes `44u8`, `-1.0` becomes
+    /// `255u8`). Other conversions deliberately differ: there PyTorch's result is platform
+    /// dependent, for example `-2147483649.0` becomes `i32::MIN` on x86-64 but `i32::MAX` here.
     #[doc(hidden)]
     fn cast<D: Element>(self) -> D {
         match Self::DTYPE.kind() {

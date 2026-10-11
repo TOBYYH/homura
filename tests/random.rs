@@ -43,4 +43,20 @@ fn seeded_sampling() {
     x.normal_(5.0, 0.1);
     assert!((x.mean().item::<f32>() - 5.0).abs() < 0.02);
     assert_eq!(homura::rand_like(&h).dtype(), DType::BF16);
+
+    // Rejected calls don't advance the generator.
+    homura::manual_seed(7);
+    let expected = homura::rand([4]);
+    homura::manual_seed(7);
+    for invalid in [
+        (|| {
+            homura::zeros_with([4], DType::F64).uniform_(-1e308, 1e308);
+        }) as fn(),
+        || {
+            homura::randint_with(70000, 70001, [4], DType::F16);
+        },
+    ] {
+        assert!(std::panic::catch_unwind(invalid).is_err());
+    }
+    assert!(homura::rand([4]).equal(&expected).all().item::<bool>());
 }

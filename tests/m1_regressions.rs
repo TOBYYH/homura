@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
-use homura::{DType, Device, Tensor};
+use homura::{DType, Device, GeluApproximate, Tensor};
 
 const DEVICES: [Device; 2] = [Device::Cpu, Device::Meta];
 
@@ -71,6 +71,18 @@ fn panic_message(f: impl FnOnce()) -> String {
 
 fn vals(t: &Tensor) -> Vec<f64> {
     t.to(DType::F64).to_vec()
+}
+
+/// Asserts that the values of `t` are within `rtol` of `expected`, relative to each expected
+/// value, so that zeros and infinities must match exactly, and NaN only NaN.
+fn assert_values(t: &Tensor, expected: &[f64], rtol: f64, what: &str) {
+    let actual = vals(t);
+    let close = |a: f64, e: f64| {
+        a == e || (a.is_nan() && e.is_nan()) || (e.is_finite() && (a - e).abs() <= rtol * e.abs())
+    };
+    let ok =
+        actual.len() == expected.len() && actual.iter().zip(expected).all(|(&a, &e)| close(a, e));
+    assert!(ok, "{what}: {actual:?} vs {expected:?}");
 }
 
 /// The gradients of `out` with respect to `inputs` for the upstream gradient `g`.
@@ -534,4 +546,150 @@ fn gradient_checks_never_count_a_finite_derivative_close_to_an_infinite_one() {
         message.contains("is 0 analytically but inf numerically"),
         "{message}"
     );
+}
+
+#[test]
+fn relu_gradients_have_zero_derivatives_with_respect_to_the_result() {
+    // The gradient of relu selects the upstream gradient where the result is positive or NaN.
+    // As a function of the result it is constant, so its derivatives with respect to the result
+    // and to `x` are zeros, also for infinite or NaN gradients in the second pass; with respect to
+    // the upstream gradient it selects again. PyTorch gives the same values in every dtype.
+    let (inf, nan) = (f64::INFINITY, f64::NAN);
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let tensor = |values: &[f64]| {
+            let t = Tensor::from_slice(values, [values.len()]).to(dtype);
+            t.requires_grad_(true);
+            t
+        };
+        let x = tensor(&[-1., 0., 1., nan, inf, -inf]);
+        let y = x.relu();
+        let u = tensor(&[1., 2., 3., 4., 5., 6.]);
+        let dx = grads(&y, &[&x], &u, true).remove(0);
+        assert!(dx.requires_grad(), "{dtype}");
+        assert_values(&dx, &[0., 0., 3., 4., 5., 0.], 0., &format!("{dtype} dx"));
+        let gg = Tensor::from_slice(&[inf, nan, 2., inf, nan, -inf], [6]).to(dtype);
+        let [gx, gy, gu] = <[Tensor; 3]>::try_from(grads(&dx, &[&x, &y, &u], &gg, false)).unwrap();
+        assert_values(&gx, &[0.; 6], 0., &format!("{dtype} d(dx)/dx"));
+        assert_values(&gy, &[0.; 6], 0., &format!("{dtype} d(dx)/dy"));
+        let selected = [0., 0., 2., inf, nan, 0.];
+        assert_values(&gu, &selected, 0., &format!("{dtype} d(dx)/du"));
+    }
+    // The review's example, whose derivative with respect to the result was [1, 1, 0].
+    let x = Tensor::from_slice(&[-1f32, 0., 1.], [3]);
+    x.requires_grad_(true);
+    let y = x.relu();
+    let dx = grads(&y, &[&x], &homura::ones_like(&y), true).remove(0);
+    let one = homura::ones_with((), DType::F32);
+    assert_values(
+        &grads(&dx.sum(), &[&y], &one, false)[0],
+        &[0.; 3],
+        0.,
+        "d(dx)/dy",
+    );
+}
+
+#[test]
+fn half_gelu_gradients_are_computed_in_f32() {
+    // PyTorch computes half precision gelu gradients in f32 and rounds them once. Computed step by
+    // step in f16, x² overflowed for |x| > 256, where the tanh is saturated, and the gradient of
+    // the tanh approximation became 0 * inf = NaN for finite inputs. Infinite and NaN inputs keep
+    // their NaN gradients. The reference values come from PyTorch's native kernels; half precision
+    // values must be within one rounding step, f32 and f64 ones within 1e-6.
+    use GeluApproximate::{None as Exact, Tanh};
+    let (inf, nan) = (f64::INFINITY, f64::NAN);
+    // Large finite inputs on both sides, zero and non-finite inputs give the same gradients in
+    // every dtype.
+    let special = [-300., 0., 10., 300., inf, -inf, nan];
+    let special_grads = [0., 0.5, 1., 1., nan, nan, nan];
+    // Ordinary inputs: f16 and bf16 gradients within one rounding step of PyTorch's, f32 and f64
+    // ones within 1e-6 of its f64 values.
+    let ordinary = [-10., -1.25, 0.5, 2.];
+    let f16_tanh = [0., -0.12249755859375, 0.8671875, 1.0859375];
+    let f16_exact = [-0., -0.1226806640625, 0.86767578125, 1.0849609375];
+    let bf16_tanh = [0., -0.12255859375, 0.8671875, 1.0859375];
+    let bf16_exact = [-7.7093e-22, -0.12255859375, 0.8671875, 1.0859375];
+    let f64_tanh = [0., -0.12249263, 0.8673699, 1.0860993];
+    let f64_exact = [-7.6945986e-22, -0.12266158, 0.8674951, 1.0852318];
+    let cases = [
+        (DType::F16, Tanh, f16_tanh),
+        (DType::F16, Exact, f16_exact),
+        (DType::BF16, Tanh, bf16_tanh),
+        (DType::BF16, Exact, bf16_exact),
+        (DType::F32, Tanh, f64_tanh),
+        (DType::F32, Exact, f64_exact),
+        (DType::F64, Tanh, f64_tanh),
+        (DType::F64, Exact, f64_exact),
+    ];
+    let rtol = |dtype| match dtype {
+        DType::F16 => 2f64.powi(-10),
+        DType::BF16 => 2f64.powi(-7),
+        _ => 1e-6,
+    };
+    let tensor = |values: &[f64], dtype| {
+        let t = Tensor::from_slice(values, [values.len()]).to(dtype);
+        t.requires_grad_(true);
+        t
+    };
+    for (dtype, approximate, ordinary_grads) in cases {
+        for (x, expected) in [
+            (&special[..], &special_grads[..]),
+            (&ordinary, &ordinary_grads),
+        ] {
+            let what = format!("{dtype} {approximate:?} at {x:?}");
+            let x = tensor(x, dtype);
+            let y = x.gelu(approximate);
+            let g = grads(&y, &[&x], &homura::ones_like(&y), false).remove(0);
+            assert_eq!(g.dtype(), dtype, "{what}");
+            assert_values(&g, expected, rtol(dtype), &what);
+        }
+    }
+    // The second derivatives differentiate the f32 computation, so they stay finite at ±300, where
+    // PyTorch's own half precision second derivative, computed step by step, is NaN. They are
+    // within one rounding step of PyTorch's f32 values, and the derivative with respect to the
+    // upstream gradient is the first derivative.
+    let second = [
+        (Tanh, [0., 0.081181064, 0.61550695, -0.10787512, 0.]),
+        (Exact, [0., 0.079908967, 0.61611432, -0.10798194, 0.]),
+    ];
+    for dtype in [DType::F16, DType::BF16] {
+        for (approximate, expected) in second {
+            let what = format!("{dtype} {approximate:?}");
+            let x = tensor(&[-300., -1.25, 0.5, 2., 300.], dtype);
+            let u = tensor(&[1.; 5], dtype);
+            let d1 = grads(&x.gelu(approximate), &[&x], &u, true).remove(0);
+            assert!(d1.requires_grad(), "{what}");
+            let ones = homura::ones_with([5], dtype);
+            let [d2x, d2u] = <[Tensor; 2]>::try_from(grads(&d1, &[&x, &u], &ones, false)).unwrap();
+            assert_eq!((d2x.dtype(), d2u.dtype()), (dtype, dtype), "{what}");
+            assert_values(&d2x, &expected, rtol(dtype), &what);
+            assert_eq!(vals(&d2u), vals(&d1), "{what}");
+        }
+    }
+    // The saved input is checked and released like any other, before the conversion to f32.
+    let x = tensor(&[0.5, -1.25], DType::F16);
+    let y = x.gelu(Tanh).sum();
+    {
+        let _no_grad = homura::no_grad();
+        x.mul_(1);
+    }
+    assert_eq!(
+        panic_message(|| y.backward()),
+        "one of the variables needed for gradient computation has been modified by an inplace \
+         operation: [f16 [2]] is at version 1; expected version 0 instead."
+    );
+    let x = tensor(&[0.5, -1.25], DType::BF16);
+    let y = x.gelu(Exact).sum();
+    y.backward();
+    assert!(panic_message(|| y.backward()).starts_with("Trying to backward through the graph"));
+    // On the meta device, only the dtype and shape.
+    for approximate in [Tanh, Exact] {
+        let x = homura::zeros_with([2, 3], (DType::F16, Device::Meta));
+        x.requires_grad_(true);
+        let y = x.gelu(approximate);
+        let g = grads(&y, &[&x], &homura::ones_like(&y), true).remove(0);
+        assert_eq!(
+            (g.shape().to_vec(), g.dtype(), g.device()),
+            (vec![2, 3], DType::F16, Device::Meta)
+        );
+    }
 }

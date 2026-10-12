@@ -165,8 +165,7 @@ case(
 # Half precision: PyTorch computes the tanh, sigmoid and silu gradients in one kernel that rounds
 # once, while homura rounds after each operation. tanh and sigmoid still agree within a rounding
 # step; silu is left out because near x = -1.28, where `1 + x * (1 - sigmoid(x))` cancels, the
-# small results differ by several steps. PyTorch can't compute half precision gelu gradients on
-# CPUs where it uses oneDNN for them.
+# small results differ by several steps. gelu follows below.
 for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
     case(f"grad_{tag}.relu", lambda x: x.relu(), x=randn(3, 4, dtype=dtype))
     case(f"grad_{tag}.sqrt", lambda x: x.sqrt(), x=positive(3, 4, dtype=dtype))
@@ -183,6 +182,17 @@ for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
         x=randn(4, dtype=dtype),
         y=randn(3, 4, dtype=dtype),
     )
+
+# Half precision gelu (review round 14): like PyTorch's kernel, homura computes these gradients in
+# f32 and rounds them once; the inputs include +-300, where x² overflows f16. The cases use
+# PyTorch's native kernels: on CPUs like this one, the default dispatch sends the exact form to
+# oneDNN, which rejects half precision backward passes. oneDNN is disabled for these cases only;
+# for the tanh approximation both paths give the same results.
+with torch.backends.mkldnn.flags(enabled=False):
+    for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
+        x = torch.cat([randn(10, dtype=dtype), torch.tensor([-300.0, 300.0], dtype=dtype)]).view(3, 4)
+        case(f"grad_{tag}.gelu", lambda x: F.gelu(x), x=x)
+        case(f"grad_{tag}.gelu_tanh", lambda x: F.gelu(x, approximate="tanh"), x=x)
 
 # ---------------------------------------------------------------- special values (exact)
 f = torch.tensor

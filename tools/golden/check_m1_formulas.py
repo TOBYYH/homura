@@ -915,4 +915,66 @@ assert torch.autograd.gradcheck(lambda x: x * x, (x,))
 assert torch.autograd.gradgradcheck(lambda x: x * x, (x,))
 assert not torch.autograd.gradgradcheck(lambda x: x * x.detach(), (x,), raise_exception=False)
 
+# relu's gradient has zero derivatives with respect to the result and to x, also for non-finite
+# gradients in the second pass, and selects again with respect to the upstream gradient (R32).
+for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.float64]:
+    x = torch.tensor([-1.0, 0, 1, nan, inf, -inf], dtype=dtype, requires_grad=True)
+    y = x.relu()
+    u = torch.tensor([1.0, 2, 3, 4, 5, 6], dtype=dtype, requires_grad=True)
+    (dx,) = torch.autograd.grad(y, x, u, create_graph=True)
+    assert dx.requires_grad
+    same(dx, [0, 0, 3, 4, 5, 0])
+    gx, gy, gu = torch.autograd.grad(dx, [x, y, u], torch.tensor([inf, nan, 2, inf, nan, -inf], dtype=dtype))
+    same(gx + 0, [0] * 6)  # `+ 0` materializes PyTorch's zero tensors
+    same(gy + 0, [0] * 6)
+    same(gu, [0, 0, 2, inf, nan, 0])
+x = leaf([-1.0, 0, 1])
+y = x.relu()
+(dx,) = torch.autograd.grad(y, x, torch.ones_like(y), create_graph=True)
+same(torch.autograd.grad(dx.sum(), y)[0] + 0, [0, 0, 0])
+
+# Half precision gelu gradients are computed in f32 and rounded once, so they stay finite for
+# large finite inputs (R33). Native kernels: on this CPU the default dispatch sends the exact form
+# to oneDNN, which rejects half precision backward passes (its f32 results differ slightly too).
+X = [-300.0, -10, -1.25, 0, 0.5, 2, 10, 300, inf, -inf, nan]
+TAIL = [1, 1, nan, nan, nan]
+with torch.backends.mkldnn.flags(enabled=False):
+    for dtype, approximate, head in [
+        (torch.float16, "tanh", [0, 0, -0.12249755859375, 0.5, 0.8671875, 1.0859375]),
+        (torch.float16, "none", [0, -0.0, -0.1226806640625, 0.5, 0.86767578125, 1.0849609375]),
+        (torch.bfloat16, "tanh", [0, 0, -0.12255859375, 0.5, 0.8671875, 1.0859375]),
+        (torch.bfloat16, "none", [0, -7.709323308994218e-22, -0.12255859375, 0.5, 0.8671875, 1.0859375]),
+        (torch.float32, "tanh", [0, 0, -0.12249262630939484, 0.5, 0.8673698902130127, 1.0860992670059204]),
+        (torch.float32, "none", [0, -7.694599251752704e-22, -0.12266159057617188, 0.5, 0.8674951195716858, 1.0852317810058594]),
+        (torch.float64, "tanh", [0, 0, -0.12249263224964863, 0.5, 0.8673699035346424, 1.0860992566236183]),
+        (torch.float64, "none", [0, -7.694598626706419e-22, -0.12266158306942215, 0.5, 0.8674951246561629, 1.085231801078197]),
+    ]:
+        x = leaf(X, dtype=dtype)
+        y = F.gelu(x, approximate=approximate)
+        (g,) = torch.autograd.grad(y, x, torch.ones_like(y))
+        assert g.dtype == dtype
+        same(g, head + TAIL)
+    for approximate, second in [
+        ("tanh", [0, 0.08118106424808502, 0.6155069470405579, -0.10787512362003326, 0]),
+        ("none", [0, 0.07990896701812744, 0.6161143183708191, -0.10798193514347076, 0]),
+    ]:
+        for dtype in [torch.float32, torch.float16]:
+            x = leaf([-300.0, -1.25, 0.5, 2, 300], dtype=dtype)
+            u = torch.ones(5, dtype=dtype, requires_grad=True)
+            (d1,) = torch.autograd.grad(F.gelu(x, approximate=approximate), x, u, create_graph=True)
+            d2x, d2u = torch.autograd.grad(d1, [x, u], torch.ones(5, dtype=dtype))
+            same(d2u, d1.tolist())
+            if dtype == torch.float32:
+                same(d2x, second)
+            else:
+                # PyTorch's own half precision second derivative, computed step by step, overflows
+                # at +-300; homura differentiates the f32 computation and gets 0 there.
+                assert math.isnan(d2x[0]) and math.isnan(d2x[4]), d2x
+    x = leaf([0.5, -1.25], dtype=torch.float16)
+    y = F.gelu(x, approximate="tanh").sum()
+    with torch.no_grad():
+        x.mul_(1)
+    version_error(y.backward, "[torch.HalfTensor [2]]")  # homura: [f16 [2]]
+    assert second_pass_fails(lambda: F.gelu(leaf([0.5, -1.25], dtype=torch.bfloat16)).sum())
+
 print("check_m1_formulas: all reference checks passed")

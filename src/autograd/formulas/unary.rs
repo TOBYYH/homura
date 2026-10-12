@@ -7,7 +7,7 @@ use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
 use crate::ops::{GeluApproximate, UnaryOp};
-use crate::{Tensor, where_};
+use crate::{DType, Tensor, where_};
 
 /// Records the backward node of `out = op(x)`. As in PyTorch, each node saves what its formula
 /// needs: the input, or the result where the derivative is a function of it.
@@ -123,9 +123,10 @@ unary_nodes! {
 
     /// `relu(x)`: `g` where the result is positive or NaN, zero where it is zero, even for an
     /// infinite or NaN `g`, like PyTorch's `threshold_backward(g, result, 0)`. The zeros are
-    /// taken from the result, which is exactly zero there, so that as in PyTorch the gradient
-    /// depends on the result and its own derivative with respect to `x` is zero, not missing.
-    ReluBackward0(result) => |g| where_(&result.less_equal(0.0), &result, &g);
+    /// `sign(result)`, zero there with a zero derivative, so that as in PyTorch the gradient
+    /// depends on the result with a zero derivative rather than not at all, and its own
+    /// derivatives with respect to the result and `x` are zeros instead of missing.
+    ReluBackward0(result) => |g| where_(&result.less_equal(0.0), result.sign(), &g);
 
     /// `ln(x)`: `g / x`, infinite at zero.
     LogBackward0(x) => |g| g.div(&x);
@@ -168,6 +169,10 @@ unary_nodes! {
 /// `0.5 * x * (1 + tanh(inner))`, `inner = √(2/π) * (x + 0.044715 * x³)`: `g` times the
 /// derivative of the two factors, `0.5 * (1 + tanh(inner))` and
 /// `0.5 * x * (1 - tanh²(inner)) * inner'`.
+///
+/// Like PyTorch's kernel, half precision gradients are computed in `f32` and rounded once. Step by
+/// step in `f16`, `x²` overflows for `|x| > 256`, where the tanh is saturated, and the gradient of
+/// the tanh approximation would become `0 * inf = NaN`.
 struct GeluBackward0 {
     x: SavedId,
     approximate: GeluApproximate,
@@ -181,6 +186,12 @@ impl Node for GeluBackward0 {
     fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
         let g = only(grads);
         let x = ctx.unpack(self.x);
+        let dtype = x.dtype();
+        let (x, g) = if matches!(dtype, DType::F16 | DType::BF16) {
+            (x.to(DType::F32), g.to(DType::F32))
+        } else {
+            (x, g)
+        };
         let derivative = match self.approximate {
             GeluApproximate::None => {
                 // φ(x) = e^(-x²/2) / √(2π).
@@ -205,6 +216,6 @@ impl Node for GeluBackward0 {
                 left_derivative.add(&right_derivative)
             }
         };
-        vec![Some(g.mul(derivative))]
+        vec![Some(g.mul(derivative).to(dtype))]
     }
 }

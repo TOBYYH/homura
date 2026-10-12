@@ -6,6 +6,7 @@
 //! result, and they decide what to save. Operations whose formula isn't written yet record
 //! [`NotImplemented`] through `record_unimplemented`.
 
+mod addc;
 mod binary;
 mod clamp;
 mod index;
@@ -16,6 +17,7 @@ mod reduce;
 mod unary;
 mod view;
 
+pub(crate) use addc::{addcdiv, addcmul};
 pub(crate) use binary::{binary, where_};
 pub(crate) use clamp::clamp;
 pub(crate) use index::{

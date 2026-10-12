@@ -1053,4 +1053,55 @@ with torch.no_grad():
     w.add_(1)
 assert "modified by an inplace operation" in message(lambda: torch.autograd.grad(out.sum(), w))
 
+# Scaled addc derivatives must preserve evaluation order even when all values are finite.
+for dtype, b, value, upstream, divide, expected in [
+    (torch.float32, 3e38, 0.0, 10.0, False, 0.0),
+    (torch.float32, 1e20, 1e-10, 1e20, False, 1.0000000150474662e30),
+    (torch.float16, 300.0, 0.001, 300.0, False, 90.0),
+    (torch.float16, 0.001, 0.001, 1000.0, True, 1000.0),
+    (torch.float32, 1e-30, 1e20, 1e-20, False, 1.0000000031710769e-30),
+]:
+    x, a, b = leaf([0.0], dtype), leaf([1.0], dtype), leaf([b], dtype)
+    out = x.addcdiv(a, b, value=value) if divide else x.addcmul(a, b, value=value)
+    ds = grad(out, [x, a, b], [upstream])
+    same(ds[0], [upstream])
+    same(ds[1], [expected])
+
+a, b = leaf([300.0], torch.float16), leaf([300.0], torch.float16)
+same(grad(torch.zeros_like(a).addcdiv(a, b, value=0.001), [b], [300.0])[0], [0.0])
+# Native C++ Scalar / Tensor rounds the scalar to the floating divisor dtype first. This is
+# distinct from Python's reciprocal * scalar and homura's public half scalar / tensor opmath.
+for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.float64]:
+    for value in [0.001, 0.1, 0.3, 1.7]:
+        a = leaf([300.0, 1.0, 2.0], dtype)
+        b = leaf([300.0, 0.001, 3.0], dtype)
+        out = torch.zeros_like(a).addcdiv(a, b, value=value)
+        da, db = torch.autograd.grad(out, [a, b], torch.ones_like(out))
+        assert torch.allclose(da, torch.full_like(b, value) / b, equal_nan=True, rtol=0, atol=0)
+        assert torch.allclose(db, -(a * value / (b * b)), equal_nan=True, rtol=0, atol=0)
+
+# All seven edge masks: conditional cross-saving for addcmul, unconditional divisor saving
+# for addcdiv, and no saving of self. Unsaved inputs may change, and a node with no saved
+# tensors permits another backward pass.
+for divide in [False, True]:
+    for mask in range(1, 8):
+        for modified in range(3):
+            tensors = [torch.tensor(v, dtype=torch.float64, requires_grad=bool(mask & (1 << i)))
+                       for i, v in enumerate([[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]])]
+            x, a, b = tensors
+            out = x.addcdiv(a, b, value=0.3) if divide else x.addcmul(a, b, value=0.3)
+            assert out.grad_fn.name() == ("AddcdivBackward0" if divide else "AddcmulBackward0")
+            assert len(out.grad_fn.next_functions) == 3
+            saved = [False, bool(mask & 4), divide or bool(mask & 2)]
+            with torch.no_grad():
+                tensors[modified].add_(1)
+            if saved[modified]:
+                assert "modified by an inplace operation" in message(lambda: out.sum().backward())
+            else:
+                out.sum().backward()
+                if any(saved):
+                    assert message(lambda: out.sum().backward()).startswith("Trying to backward through the graph a second time")
+                else:
+                    out.sum().backward()
+
 print("check_m1_formulas: all reference checks passed")

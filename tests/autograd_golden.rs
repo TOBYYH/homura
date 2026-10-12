@@ -93,6 +93,14 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "masked_fill_scalar" => x().masked_fill(&t["cond"], 0.5),
         "addcmul" => x().addcmul(y(), &t["z"], 1.7),
         "addcdiv" => x().addcdiv(y(), &t["z"], -0.3),
+        "addcmul_zero_large" => x().addcmul(y(), &t["z"], 0.0),
+        "addcmul_scaled" => x().addcmul(y(), &t["z"], 1e-10),
+        "addcmul_underflow" => x().addcmul(y(), &t["z"], 1e20),
+        "addcmul_small" => x().addcmul(y(), &t["z"], 0.001),
+        "addcdiv_small" => x().addcdiv(y(), &t["z"], 0.001),
+        "addcdiv_tenth" => x().addcdiv(y(), &t["z"], 0.1),
+        "addcdiv_three_tenths" => x().addcdiv(y(), &t["z"], 0.3),
+        "addcdiv_factor" => x().addcdiv(y(), &t["z"], 1.7),
         "lerp" => x().lerp(y(), &t["z"]),
         "lerp_low" => x().lerp(y(), 0.2),
         "lerp_high" => x().lerp(y(), 0.8),
@@ -151,7 +159,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 160, "only {} cases", cases.len());
+    assert!(cases.len() >= 179, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

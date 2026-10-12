@@ -304,7 +304,13 @@ impl Tensor {
 
     /// `self + value * tensor1 * tensor2`.
     pub fn addcmul(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> Tensor {
-        self.add(tensor1.mul(value.into()).mul(tensor2))
+        let value = value.into();
+        let out = {
+            let _guard = crate::no_grad();
+            self.add(tensor1.mul(value).mul(tensor2))
+        };
+        crate::autograd::formulas::addcmul(self, tensor1, tensor2, value, &out);
+        out
     }
 
     /// `self + value * tensor1 / tensor2`.
@@ -319,7 +325,13 @@ impl Tensor {
                  self.add(tensor1.div(tensor2).mul(value)) instead."
             );
         }
-        self.add(tensor1.mul(value.into()).div(tensor2))
+        let value = value.into();
+        let out = {
+            let _guard = crate::no_grad();
+            self.add(tensor1.mul(value).div(tensor2))
+        };
+        crate::autograd::formulas::addcdiv(self, tensor1, tensor2, value, &out);
+        out
     }
 
     /// Linear interpolation `self + weight * (end - self)`, with `weight` a tensor or a scalar.

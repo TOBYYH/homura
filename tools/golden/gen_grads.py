@@ -464,6 +464,51 @@ case(
     g=f([inf, 4., -2., nan, 5., -inf, 3.]),
 )
 
+# Review fix: scale derivative factors before multiplying the upstream gradient. Append after
+# every earlier case so their inputs and gradients stay byte-for-byte unchanged.
+case(
+    "special.addcmul_zero_large",
+    lambda x, y, z: x.addcmul(y, z, value=0.0),
+    x=f([0.0]), y=f([1.0]), z=f([3e38]), g=f([10.0]),
+)
+case(
+    "special.addcmul_scaled",
+    lambda x, y, z: x.addcmul(y, z, value=1e-10),
+    x=f([0.0]), y=f([1.0]), z=f([1e20]), g=f([1e20]),
+)
+case(
+    "special.addcmul_underflow",
+    lambda x, y, z: x.addcmul(y, z, value=1e20),
+    x=f([0.0]), y=f([1.0]), z=f([1e-30]), g=f([1e-20]),
+)
+for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
+    case(
+        f"grad_{tag}.addcmul_small",
+        lambda x, y, z: x.addcmul(y, z, value=0.001),
+        x=f([0.0, 0.5, -1.0, 2.0], dtype=dtype),
+        y=f([1.0, 2.0, -3.0, 300.0], dtype=dtype),
+        z=f([300.0, -300.0, 150.0, 1.0], dtype=dtype),
+        g=f([300.0, 300.0, -400.0, 200.0], dtype=dtype),
+    )
+    case(
+        f"grad_{tag}.addcdiv_small",
+        lambda x, y, z: x.addcdiv(y, z, value=0.001),
+        x=f([0.0, 0.5, -1.0, 2.0], dtype=dtype),
+        y=f([1.0, 2.0, -3.0, 300.0], dtype=dtype),
+        z=f([0.001, -0.001, 0.002, 300.0], dtype=dtype),
+        g=f([1000.0, -1000.0, 300.0, 300.0], dtype=dtype),
+    )
+    for value, suffix in [(0.1, "tenth"), (0.3, "three_tenths"), (1.7, "factor")]:
+        # Random half samples also distinguish C++ Scalar/Tensor coefficient rounding from
+        # Python's reciprocal-times-scalar path, which uses different rounding points.
+        case(
+            f"grad_{tag}.addcdiv_{suffix}",
+            lambda x, y, z, value=value: x.addcdiv(y, z, value=value),
+            x=randn(3, 4, dtype=dtype),
+            y=randn(4, dtype=dtype),
+            z=positive(3, 1, dtype=dtype),
+        )
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

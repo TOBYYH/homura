@@ -223,6 +223,16 @@ fn binary_and_ternary_formulas_pass_both_gradient_checks() {
                 t[0].addcdiv(&t[1], &t[2], -0.3),
             ]
         }),
+        ("addc coefficients and integer constants", |t| {
+            let integers = homura::tensor([1i64, 2, 3]);
+            vec![
+                t[0].addcmul(&t[1], &t[2], 0.0),
+                t[0].addcdiv(&t[1], &t[2], 0.0),
+                t[0].addcmul(&t[1], &integers, 2i64),
+                t[0].addcdiv(&t[1], &integers, 0.3),
+                t[0].addcdiv(&integers, &t[2], 2i64),
+            ]
+        }),
         ("lerp", |t| {
             vec![
                 t[0].lerp(&t[1], &t[2]),
@@ -484,8 +494,130 @@ fn clamp_edges_and_zero_combination_gradients_remain_observable() {
         x.maximum(&y),
         x.clamp(&y, 5.),
         x.lerp(&y, &value),
+        x.addcmul(&y, &value, 0.3),
+        x.addcdiv(&y, &value, 0.3),
     ] {
         assert!(!out.requires_grad());
         assert!(out.grad_fn().is_none());
+    }
+}
+
+#[test]
+fn scaled_combination_gradients_avoid_spurious_overflow_and_underflow() {
+    // All inputs, coefficients and upstream gradients are finite. The expected values are
+    // from the pinned reference, whose gradients scale the factors before multiplying g.
+    for (dtype, denominator, value, upstream, divide, expected) in [
+        (DType::F32, 3e38, 0., 10., false, 0.),
+        (DType::F32, 1e20, 1e-10, 1e20, false, 1.0000000150474662e30),
+        (DType::F16, 300., 0.001, 300., false, 90.),
+        (DType::F16, 0.001, 0.001, 1000., true, 1000.),
+        (
+            DType::F32,
+            1e-30,
+            1e20,
+            1e-20,
+            false,
+            1.0000000031710769e-30,
+        ),
+    ] {
+        let variable = |v| {
+            let t = Tensor::from_slice(&[v], [1]).to(dtype);
+            t.requires_grad_(true);
+            t
+        };
+        let (x, a, b) = (variable(0f64), variable(1.), variable(denominator));
+        let out = if divide {
+            x.addcdiv(&a, &b, value)
+        } else {
+            x.addcmul(&a, &b, value)
+        };
+        let g = Tensor::from_slice(&[upstream], [1]).to(dtype);
+        let ds = gradients(&out, &[&x, &a, &b], &g, false);
+        same(&ds[0], &g.to(DType::F64).to_vec::<f64>());
+        same(&ds[1], &[expected]);
+    }
+    // The divisor's derivative follows the reference's square-before-division order too.
+    // In f16 the square of 300 is Inf, so this derivative is zero, not about -0.001.
+    let a = Tensor::from_slice(&[300f64], [1]).to(DType::F16);
+    let b = a.deep_clone();
+    for t in [&a, &b] {
+        t.requires_grad_(true);
+    }
+    let x = homura::zeros_with([1], DType::F16);
+    let g = Tensor::from_slice(&[300f64], [1]).to(DType::F16);
+    same(
+        &gradients(&x.addcdiv(&a, &b, 0.001), &[&b], &g, false)[0],
+        &[0.],
+    );
+}
+
+#[test]
+fn scaled_combination_nodes_preserve_saved_value_semantics() {
+    for divide in [false, true] {
+        for mask in 1usize..8 {
+            for modified in 0..3 {
+                let vars = [
+                    Tensor::from_slice(&[0f64, 1.], [2]),
+                    Tensor::from_slice(&[1f64, 2.], [2]),
+                    Tensor::from_slice(&[2f64, 3.], [2]),
+                ];
+                for (i, t) in vars.iter().enumerate() {
+                    t.requires_grad_(mask & (1 << i) != 0);
+                }
+                let [x, a, b] = &vars;
+                let out = if divide {
+                    x.addcdiv(a, b, 0.3)
+                } else {
+                    x.addcmul(a, b, 0.3)
+                };
+                assert_eq!(
+                    out.grad_fn().unwrap().name(),
+                    if divide {
+                        "AddcdivBackward0"
+                    } else {
+                        "AddcmulBackward0"
+                    }
+                );
+                assert_eq!(out.grad_fn().unwrap().next_functions().len(), 3);
+                let saved = [false, mask & 4 != 0, divide || mask & 2 != 0];
+                {
+                    let _guard = homura::no_grad();
+                    vars[modified].add_(1.);
+                }
+                let outcome = catch_unwind(AssertUnwindSafe(|| out.sum().backward()));
+                assert_eq!(
+                    outcome.is_err(),
+                    saved[modified],
+                    "divide={divide}, mask={mask}, modified={modified}"
+                );
+                if outcome.is_ok() {
+                    let second = catch_unwind(AssertUnwindSafe(|| out.sum().backward()));
+                    assert_eq!(
+                        second.is_err(),
+                        saved.iter().any(|&s| s),
+                        "divide={divide}, mask={mask}, second backward"
+                    );
+                }
+            }
+        }
+    }
+    // Runtime pruning does not bypass validation of a factor saved for another edge.
+    let (x, a, b) = (leaf(&[0.], [1]), leaf(&[1.], [1]), leaf(&[2.], [1]));
+    for divide in [false, true] {
+        let out = if divide {
+            x.addcdiv(&a, &b, 0.3)
+        } else {
+            x.addcmul(&a, &b, 0.3)
+        };
+        {
+            let _guard = homura::no_grad();
+            a.add_(1.);
+        }
+        assert!(
+            panic_message(|| {
+                drop(gradients(&out, &[&x], &homura::ones_like(&out), false));
+            })
+            .contains("modified by an inplace operation")
+        );
     }
 }

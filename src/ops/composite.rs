@@ -325,22 +325,28 @@ impl Tensor {
     /// Linear interpolation `self + weight * (end - self)`, with `weight` a tensor or a scalar.
     /// Uses PyTorch's formula, which is exact at both ends.
     pub fn lerp(&self, end: &Tensor, weight: impl Into<Operand>) -> Tensor {
-        let diff = end.sub(self);
-        match weight.into() {
-            Operand::Scalar(w) => {
-                let wf = w.to_f64();
-                if wf.abs() < 0.5 {
-                    self.add(diff.mul(w))
-                } else {
-                    end.sub(diff.mul(1.0 - wf))
+        let weight = weight.into();
+        let out = {
+            let _guard = crate::no_grad();
+            let diff = end.sub(self);
+            match &weight {
+                Operand::Scalar(w) => {
+                    let wf = w.to_f64();
+                    if wf.abs() < 0.5 {
+                        self.add(diff.mul(*w))
+                    } else {
+                        end.sub(diff.mul(1.0 - wf))
+                    }
+                }
+                Operand::Tensor(w) => {
+                    let low = self.add(w.mul(&diff));
+                    let high = end.sub(diff.mul(w.neg().add(1.0)));
+                    crate::where_(&w.abs().less(0.5), &low, &high)
                 }
             }
-            Operand::Tensor(w) => {
-                let low = self.add(w.mul(&diff));
-                let high = end.sub(diff.mul(w.neg().add(1.0)));
-                crate::where_(&w.abs().less(0.5), &low, &high)
-            }
-        }
+        };
+        crate::autograd::formulas::lerp(self, end, &weight, &out);
+        out
     }
 
     /// In-place [`addcmul`](Tensor::addcmul).

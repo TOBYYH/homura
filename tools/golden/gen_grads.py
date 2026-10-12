@@ -12,6 +12,7 @@ dtype's precision), and "special" (non-finite inputs and upstream gradients, com
 Usage: python tools/golden/gen_grads.py (needs torch and safetensors).
 """
 
+import itertools
 import math
 from pathlib import Path
 
@@ -286,6 +287,181 @@ case(
     x=f([1.0, 2.0, 3.0, 4.0]),
     y=f([5.0, 6.0, 7.0, 8.0]),
     g=f([nan, inf, -inf, nan]),
+)
+
+# Step 6b is appended after all earlier cases to preserve their random inputs and gradients.
+case("grad.pow", lambda x, y: x.pow(y), x=positive(3, 4), y=randn(4))
+case("grad.pow_scalar", lambda x: x.pow(2.5), x=positive(3, 4))
+case("grad.pow_zero", lambda x: x.pow(0), x=randn(3, 4))
+case("grad.pow_int", lambda x, y: x.pow(y), x=randn(3, 4), y=ints(0, 1, 2, 3))
+case("grad.int_pow", lambda x, y: x.pow(y), x=ints(1, 2, 3, 4), y=randn(3, 4))
+for name, op in [("maximum", torch.maximum), ("minimum", torch.minimum)]:
+    case(f"grad.{name}", lambda x, y, op=op: op(x, y), x=randn(3, 1), y=randn(4))
+    case(f"grad.{name}_scalar", lambda x, op=op: op(x, torch.tensor(0.5)), x=randn(3, 4))
+case("grad.clamp", lambda x, lo, hi: x.clamp(lo, hi), x=randn(3, 4), lo=randn(4), hi=randn(3, 1))
+case("grad.clamp_scalar", lambda x: x.clamp(-0.5, 0.5), x=randn(3, 4))
+case("grad.clamp_min", lambda x, y: x.clamp_min(y), x=randn(3, 1), y=randn(4))
+case("grad.clamp_max", lambda x, y: x.clamp_max(y), x=randn(3, 4), y=randn())
+case("grad.clamp_min_scalar", lambda x: x.clamp_min(-0.5), x=randn(3, 4))
+case("grad.clamp_max_scalar", lambda x: x.clamp_max(0.5), x=randn(3, 4))
+case(
+    "grad.clamp_mixed_min",
+    lambda x, hi: x.clamp(torch.tensor(-0.5, dtype=x.dtype), hi),
+    x=randn(3, 4),
+    hi=randn(4, dtype=torch.float64),
+)
+case(
+    "grad.clamp_mixed_max",
+    lambda x, lo: x.clamp(lo, torch.tensor(0.5, dtype=lo.dtype)),
+    x=randn(3, 4),
+    lo=randn(3, 1, dtype=torch.float64),
+)
+case(
+    "grad.masked_fill",
+    lambda x, value, cond: x.masked_fill(cond, value),
+    x=randn(3, 4),
+    value=randn(dtype=torch.float64),
+    cond=torch.rand(4) > 0.5,
+)
+case(
+    "grad.masked_fill_scalar",
+    lambda x, cond: x.masked_fill(cond, 0.5),
+    x=randn(3, 4),
+    cond=torch.rand(3, 1) > 0.5,
+)
+case(
+    "grad.addcmul",
+    lambda x, y, z: x.addcmul(y, z, value=1.7),
+    x=randn(3, 4),
+    y=randn(4),
+    z=randn(3, 1),
+)
+case(
+    "grad.addcdiv",
+    lambda x, y, z: x.addcdiv(y, z, value=-0.3),
+    x=randn(3, 4),
+    y=randn(4),
+    z=positive(3, 1),
+)
+case("grad.lerp", lambda x, y, z: x.lerp(y, z), x=randn(3, 4), y=randn(4), z=randn(3, 1))
+for w, suffix in [(0.2, "low"), (0.8, "high")]:
+    case(f"grad.lerp_{suffix}", lambda x, y, w=w: x.lerp(y, w), x=randn(3, 4), y=randn(4))
+
+for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
+    case(
+        f"grad_{tag}.pow",
+        lambda x, y: x.pow(y),
+        x=positive(3, 4, dtype=dtype),
+        y=randn(4, dtype=dtype),
+    )
+    case(f"grad_{tag}.pow_scalar", lambda x: x.pow(2.5), x=positive(3, 4, dtype=dtype))
+    case(
+        f"grad_{tag}.maximum",
+        lambda x, y: torch.maximum(x, y),
+        x=randn(3, 1, dtype=dtype),
+        y=randn(4, dtype=dtype),
+    )
+    case(
+        f"grad_{tag}.minimum",
+        lambda x, y: torch.minimum(x, y),
+        x=randn(3, 1, dtype=dtype),
+        y=randn(4, dtype=dtype),
+    )
+    case(
+        f"grad_{tag}.clamp",
+        lambda x, lo, hi: x.clamp(lo, hi),
+        x=randn(3, 4, dtype=dtype),
+        lo=randn(4, dtype=dtype),
+        hi=randn(3, 1, dtype=dtype),
+    )
+
+# Full elementwise boundary grids prevent broadcasting reductions from hiding tie allocation
+# mistakes. Every triple is tested with zero, negative, infinite and NaN upstream gradients.
+values = [-inf, -1.0, -0.0, 0.0, 1.0, inf, nan]
+triples = [(*t, g) for t in itertools.product(values, repeat=3) for g in [0.0, -2.0, inf, nan]]
+x, lo, hi, g = (f(v) for v in zip(*triples))
+case("special.clamp", lambda x, lo, hi: x.clamp(lo, hi), x=x, lo=lo, hi=hi, g=g)
+pairs = [(*t, g) for t in itertools.product(values, repeat=2) for g in [0.0, -2.0, inf, nan]]
+x, y, g = (f(v) for v in zip(*pairs))
+for name, op in [
+    ("maximum", torch.maximum),
+    ("minimum", torch.minimum),
+    ("clamp_min", torch.clamp_min),
+    ("clamp_max", torch.clamp_max),
+]:
+    case(f"special.{name}", lambda x, y, op=op: op(x, y), x=x, y=y, g=g)
+for name, op in [
+    ("clamp_scalar", lambda x: x.clamp(-0.5, 0.5)),
+    ("clamp_min_scalar", lambda x: x.clamp_min(-0.5)),
+    ("clamp_max_scalar", lambda x: x.clamp_max(0.5)),
+    ("clamp_equal", lambda x: x.clamp(0.5, 0.5)),
+    ("clamp_reversed", lambda x: x.clamp(0.5, -0.5)),
+    ("clamp_nan_min", lambda x: x.clamp(nan, 0.5)),
+    ("clamp_nan_max", lambda x: x.clamp(-0.5, nan)),
+]:
+    case(
+        f"special.{name}",
+        op,
+        x=f([-1., -0.5, 0., 0.5, 1., nan, inf, -inf]),
+        g=f([inf, nan, -2., inf, nan, 3., 4., 5.]),
+    )
+case(
+    "special.pow",
+    lambda x, y: x.pow(y),
+    x=f([0., 0., 0., 0., -2., nan, inf]),
+    y=f([0., 1., 2., -1., 2., 0., 0.]),
+    g=f([inf, 2., 3., 1., 1., nan, inf]),
+)
+case("special.pow_zero", lambda x: x.pow(0), x=f([0., -2., nan, inf]), g=f([inf, nan, inf, nan]))
+case(
+    "special.pow_scalar",
+    lambda x: x.pow(2.5),
+    x=f([0., -0., -2., nan, inf, -inf]),
+    g=f([1., inf, 1., 1., 0., 1.]),
+)
+for name, op in [
+    ("addcmul", lambda x, y, z: x.addcmul(y, z, value=1.7)),
+    ("addcdiv", lambda x, y, z: x.addcdiv(y, z, value=-0.3)),
+    ("lerp", lambda x, y, z: x.lerp(y, z)),
+]:
+    case(
+        f"special.{name}",
+        op,
+        x=f([0., inf, nan, 1., -inf]),
+        y=f([inf, 0., 1., nan, 2.]),
+        z=f([0., 1., inf, -inf, nan]),
+        g=f([1., inf, nan, -inf, 0.]),
+    )
+case(
+    "special.masked_fill",
+    lambda x, value, cond: x.masked_fill(cond, value),
+    x=f([nan, inf, -inf, 1.]),
+    value=f(nan),
+    cond=torch.tensor([True, False, True, False]),
+    g=f([inf, -inf, nan, 2.]),
+)
+# Mixed bounds use equivalent explicit tensor constants in PyTorch. The minimum scalar was
+# rounded in the first forward step; the maximum scalar in the second step's result dtype.
+case(
+    "special.clamp_mixed_round",
+    lambda x, hi: x.clamp(torch.tensor(1.0002, dtype=x.dtype), hi),
+    x=f([0.5, 1., 2., nan], dtype=torch.float16),
+    hi=f([3., 3., 3., 3.], dtype=torch.float64),
+    g=f([inf, 4., -2., 5.], dtype=torch.float64),
+)
+case(
+    "special.clamp_mixed_min",
+    lambda x, hi: x.clamp(torch.tensor(-0.5, dtype=x.dtype), hi),
+    x=f([-1., -0.5, 0., 1., nan, inf, -inf]),
+    hi=f([1., 1., -0.5, -1., -1., inf, nan]),
+    g=f([inf, 4., -2., nan, 5., -inf, 3.]),
+)
+case(
+    "special.clamp_mixed_max",
+    lambda x, lo: x.clamp(lo, torch.tensor(0.5, dtype=lo.dtype)),
+    x=f([-1., -0.5, 0., 1., nan, inf, -inf]),
+    lo=f([-0.5, -0.5, 0.5, 1., 1., inf, nan]),
+    g=f([inf, 4., -2., nan, 5., -inf, 3.]),
 )
 
 OUT.parent.mkdir(parents=True, exist_ok=True)

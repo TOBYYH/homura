@@ -284,15 +284,19 @@ impl Tensor {
 
     /// Clamps every element into `[min, max]`; the bounds may be tensors or scalars. Equivalent
     /// to `self.maximum(min).minimum(max)`, so NaN propagates and `min > max` gives `max`.
+    /// Scalar bounds have zero gradients at equality; tensor bounds split ordinary ties.
+    /// Unlike PyTorch, one bound may be a scalar and the other a tensor; its gradient follows
+    /// the tensor-bound rule with the scalar rounded as in the corresponding forward step.
     pub fn clamp(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> Tensor {
         let (min, max) = (min.into(), max.into());
         // Computed without recording the two steps: clamp gets a node of its own.
-        let out = {
+        let (out, min_dtype) = {
             let _no_grad = crate::no_grad();
-            self.maximum(min.clone()).minimum(max.clone())
+            let lower = self.maximum(min.clone());
+            let dtype = lower.dtype();
+            (lower.minimum(max.clone()), dtype)
         };
-        let inputs = [Some(self), tensor_of(&min), tensor_of(&max)];
-        crate::autograd::record_unimplemented("clamp", &inputs, &out);
+        crate::autograd::formulas::clamp(self, Some(&min), Some(&max), min_dtype, &out);
         out
     }
 
@@ -303,7 +307,7 @@ impl Tensor {
             let _no_grad = crate::no_grad();
             self.maximum(min.clone())
         };
-        crate::autograd::record_unimplemented("clamp_min", &[Some(self), tensor_of(&min)], &out);
+        crate::autograd::formulas::clamp(self, Some(&min), None, out.dtype(), &out);
         out
     }
 
@@ -314,7 +318,7 @@ impl Tensor {
             let _no_grad = crate::no_grad();
             self.minimum(max.clone())
         };
-        crate::autograd::record_unimplemented("clamp_max", &[Some(self), tensor_of(&max)], &out);
+        crate::autograd::formulas::clamp(self, None, Some(&max), out.dtype(), &out);
         out
     }
 

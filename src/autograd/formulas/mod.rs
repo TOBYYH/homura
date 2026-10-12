@@ -7,16 +7,21 @@
 //! [`NotImplemented`] through `record_unimplemented`.
 
 mod binary;
+mod clamp;
 mod index;
+mod lerp;
 mod misc;
+mod pow;
 mod reduce;
 mod unary;
 mod view;
 
 pub(crate) use binary::{binary, where_};
+pub(crate) use clamp::clamp;
 pub(crate) use index::{
     gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
 };
+pub(crate) use lerp::lerp;
 pub(crate) use misc::{deep_clone, to_copy};
 pub(crate) use reduce::{sum, sum_to_size};
 pub(crate) use unary::unary;

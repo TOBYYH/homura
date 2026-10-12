@@ -1,5 +1,5 @@
 """Check the reference behavior that tests/autograd_formulas.rs and tests/m1_ops.rs encode (M1
-steps 4 and 6a), and the review fixes that tests/m1_regressions.rs encodes; does not write
+steps 4, 6a and 6b), and the review fixes that tests/m1_regressions.rs encodes; does not write
 fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
@@ -976,5 +976,81 @@ with torch.backends.mkldnn.flags(enabled=False):
         x.mul_(1)
     version_error(y.backward, "[torch.HalfTensor [2]]")  # homura: [f16 [2]]
     assert second_pass_fails(lambda: F.gelu(leaf([0.5, -1.25], dtype=torch.bfloat16)).sum())
+
+# Step 6b: powers and clamp boundaries match the pinned build, including observable saved
+# values and lerp's direct derivative at non-finite weights.
+x = leaf([0, 0, 0, 0, -2, nan, inf], dtype=torch.float64)
+e = leaf([0, 1, 2, -1, 2, 0, 0], dtype=torch.float64)
+dx, de = grad(x.pow(e), [x, e], [inf, 2, 3, 1, 1, nan, inf])
+same(dx, [0, 2, 0, -inf, -4, 0, 0])
+same(de, [nan, 0, 0, -inf, nan, nan, inf])
+x = leaf([0, -2, nan, inf])
+(dx,) = torch.autograd.grad(x.pow(0), x, torch.tensor([inf, nan, inf, nan]), create_graph=True)
+same(dx, [0] * 4)
+assert not dx.requires_grad
+
+x = leaf([-2, -1, 0, 1, 2, nan, inf, -inf])
+for op, expected in [
+    (lambda x: x.clamp(-1, 1), [0, 0, 3, 0, 0, 0, 0, 0]),
+    (lambda x: x.clamp_min(-1), [0, 0, 3, inf, nan, 0, 7, 0]),
+    (lambda x: x.clamp_max(1), [inf, nan, 3, 0, 0, 0, 0, 8]),
+]:
+    same(grad(op(x), [x], [inf, nan, 3, inf, nan, 6, 7, 8])[0], expected)
+for lo, hi in [(1, 1), (2, -1), (nan, 1), (-1, nan)]:
+    same(grad(x.clamp(lo, hi), [x], [inf, nan, 3, inf, nan, 6, 7, 8])[0], [0] * 8)
+x = leaf([-2, -1, 0, 1, 2, 0, -1, 1, 0, nan, 0, 0])
+lo = leaf([-1, -1, -1, -1, -1, 0, 0, 0, 2, 2, nan, -1])
+hi = leaf([1, 1, 1, 1, 1, 0, 0, 0, -2, -2, 1, nan])
+dx, dl, dh = grad(x.clamp(lo, hi), [x, lo, hi], [inf, 4, 3, 6, nan, 5, 7, 8, 9, 10, 11, 12])
+same(dx, [0, 2, 3, 3, 0, 5, 0, 0, 0, 10, 11, 12])
+same(dl, [inf, 2, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0])
+same(dh, [0, 0, 0, 3, nan, 0, 0, 8, 9, 10, 0, 0])
+# Homura's mixed-bound extension is equivalent to this tensor call after rounding the scalar
+# minimum to its first-stage dtype. PyTorch rejects the original mixed call.
+x = leaf([0.5, 1, 2], dtype=torch.float16)
+hi = leaf([3, 3, 3], dtype=torch.float64)
+assert message(lambda: x.clamp(1.0002, hi))
+out = x.clamp(torch.tensor(1.0002, dtype=torch.float16), hi)
+dx, dh = torch.autograd.grad(out, [x, hi], torch.ones_like(out))
+same(out, [1, 1, 2])
+same(dx, [0, 0.5, 1])
+same(dh, [0, 0, 0])
+
+x, e = leaf([1, 2]), leaf([2, 3])
+out = x.pow(e)
+with torch.no_grad():
+    out.add_(1)
+assert "modified by an inplace operation" in message(lambda: torch.autograd.grad(out.sum(), x))
+x, e = leaf([1, 2]), torch.tensor([2.0, 3])
+out = x.pow(e)
+with torch.no_grad():
+    out.add_(1)
+assert "modified by an inplace operation" in message(lambda: torch.autograd.grad(out.sum(), x))
+
+x, y, w = leaf([0, inf, nan, 1, -inf]), leaf([inf, 0, 1, nan, 2]), leaf([0, 1, inf, -inf, nan])
+dx, dy, dw = grad(x.lerp(y, w), [x, y, w], [1, inf, nan, -inf, 0])
+same(dx, [1, nan, nan, -inf, nan])
+same(dy, [0, inf, nan, inf, nan])
+same(dw, [inf, -inf, nan, nan, nan])
+x, y = leaf([1, 2]), leaf([3, 4])
+out = x.lerp(y, 0.2)
+assert out.grad_fn.name() == "LerpBackward0"
+with torch.no_grad():
+    x.add_(1)
+    y.add_(1)
+out.sum().backward()
+out.sum().backward()
+w = leaf([0.2, 0.8])
+out = x.lerp(y, w)
+assert out.grad_fn.name() == "LerpBackward1"
+with torch.no_grad():
+    y.add_(1)
+assert "modified by an inplace operation" in message(lambda: out.sum().backward())
+x, y = torch.tensor([1.0, 2]), torch.tensor([3.0, 5])
+w = leaf([0.2, 0.8])
+out = x.lerp(y, w)
+with torch.no_grad():
+    w.add_(1)
+assert "modified by an inplace operation" in message(lambda: torch.autograd.grad(out.sum(), w))
 
 print("check_m1_formulas: all reference checks passed")

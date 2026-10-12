@@ -2,7 +2,7 @@
 
 use super::only;
 use crate::autograd::node::{ApplyContext, Node, NodeBuilder};
-use crate::autograd::record::{record, record_unimplemented};
+use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
 use crate::ops::{BinaryOp, Operand, binary_op};
 use crate::{DType, Device, Scalar, Shape, Tensor};
@@ -30,18 +30,13 @@ fn shape(o: &Operand) -> Shape {
 /// single edge.
 pub(crate) fn binary(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
     use BinaryOp::*;
-    let unimplemented = match op {
-        Add | Sub | Mul => None,
+    match op {
+        Add | Sub | Mul => {}
         Div => return div(lhs, rhs, out),
-        Pow => Some("pow"),
-        Maximum => Some("maximum"),
-        Minimum => Some("minimum"),
+        Pow => return super::pow::pow(lhs, rhs, out),
+        Maximum | Minimum => return extrema(op, lhs, rhs, out),
         // Comparisons and logical operations have bool results.
         _ => return,
-    };
-    if let Some(name) = unimplemented {
-        let (a, b) = (tensor(lhs), tensor(rhs));
-        return record_unimplemented(name, &[a.as_ref(), b.as_ref()], out);
     }
     let (first, second) = match (lhs, rhs) {
         (Operand::Scalar(s), Operand::Tensor(t)) => {
@@ -91,6 +86,72 @@ fn div(lhs: &Operand, rhs: &Operand, out: &Tensor) {
             shapes,
         }
     });
+}
+
+fn extrema(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
+    let (a, b) = (tensor(lhs), tensor(rhs));
+    let shapes = [shape(lhs), shape(rhs)];
+    let scalars = [lhs, rhs].map(|o| matches!(o, Operand::Scalar(_)));
+    let inputs = [a.as_ref(), b.as_ref()];
+    macro_rules! record_extrema {
+        ($node:ident) => {
+            record(&inputs, &[out], |b| $node {
+                operands: [save_operand(b, lhs), save_operand(b, rhs)],
+                scalars,
+                shapes,
+            })
+        };
+    }
+    match op {
+        BinaryOp::Maximum => record_extrema!(MaximumBackward0),
+        BinaryOp::Minimum => record_extrema!(MinimumBackward0),
+        _ => unreachable!(),
+    }
+}
+
+/// Strict losing-side masks select zero even for non-finite upstream gradients. Equality
+/// splits the gradient, while NaN makes both comparisons false and sends `g` to both inputs.
+macro_rules! extrema_nodes {
+    ($($node:ident => [$losing_first:ident, $losing_second:ident]);* $(;)?) => {$(
+        struct $node {
+            operands: [SavedId; 2],
+            scalars: [bool; 2],
+            shapes: [Shape; 2],
+        }
+
+        impl Node for $node {
+            fn name(&self) -> &'static str {
+                stringify!($node)
+            }
+
+            fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+                let g = only(grads);
+                let [a, b] = self.operands.map(|id| ctx.unpack(id));
+                // Keep scalar comparison semantics: wrapped scalars round to the tensor's dtype.
+                let compare = |op| binary_op(
+                    op,
+                    operand_of(&a, self.scalars[0]),
+                    operand_of(&b, self.scalars[1]),
+                );
+                let split = crate::where_(&compare(BinaryOp::Equal), g.div(2.0), &g);
+                vec![
+                    ctx.needs_input_grad(0).then(|| {
+                        split.masked_fill(&compare(BinaryOp::$losing_first), 0.0)
+                            .sum_to_size(&self.shapes[0])
+                    }),
+                    ctx.needs_input_grad(1).then(|| {
+                        split.masked_fill(&compare(BinaryOp::$losing_second), 0.0)
+                            .sum_to_size(&self.shapes[1])
+                    }),
+                ]
+            }
+        }
+    )*};
+}
+
+extrema_nodes! {
+    MaximumBackward0 => [Less, Greater];
+    MinimumBackward0 => [Greater, Less];
 }
 
 /// Records the backward node of `out = where_(condition, x, y)`. The condition has no edge, and

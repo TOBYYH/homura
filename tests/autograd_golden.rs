@@ -69,6 +69,33 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "rdiv_zero" => 0.0 / x(),
         "where" => where_(&t["cond"], x(), y()),
         "where_scalar" => where_(&t["cond"], 0.5, x()),
+        "pow" | "pow_int" | "int_pow" => x().pow(y()),
+        "pow_scalar" => x().pow(2.5),
+        "pow_zero" => x().pow(0),
+        "maximum" => x().maximum(y()),
+        "minimum" => x().minimum(y()),
+        "maximum_scalar" => x().maximum(0.5),
+        "minimum_scalar" => x().minimum(0.5),
+        "clamp" => x().clamp(&t["lo"], &t["hi"]),
+        "clamp_scalar" => x().clamp(-0.5, 0.5),
+        "clamp_min" => x().clamp_min(y()),
+        "clamp_max" => x().clamp_max(y()),
+        "clamp_min_scalar" => x().clamp_min(-0.5),
+        "clamp_max_scalar" => x().clamp_max(0.5),
+        "clamp_equal" => x().clamp(0.5, 0.5),
+        "clamp_reversed" => x().clamp(0.5, -0.5),
+        "clamp_nan_min" => x().clamp(f64::NAN, 0.5),
+        "clamp_nan_max" => x().clamp(-0.5, f64::NAN),
+        "clamp_mixed_min" => x().clamp(-0.5, &t["hi"]),
+        "clamp_mixed_max" => x().clamp(&t["lo"], 0.5),
+        "clamp_mixed_round" => x().clamp(1.0002, &t["hi"]),
+        "masked_fill" => x().masked_fill(&t["cond"], &t["value"]),
+        "masked_fill_scalar" => x().masked_fill(&t["cond"], 0.5),
+        "addcmul" => x().addcmul(y(), &t["z"], 1.7),
+        "addcdiv" => x().addcdiv(y(), &t["z"], -0.3),
+        "lerp" => x().lerp(y(), &t["z"]),
+        "lerp_low" => x().lerp(y(), 0.2),
+        "lerp_high" => x().lerp(y(), 0.8),
         _ => return None,
     })
 }
@@ -124,7 +151,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 100, "only {} cases", cases.len());
+    assert!(cases.len() >= 160, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

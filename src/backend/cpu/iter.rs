@@ -1,5 +1,19 @@
 //! Strided iteration over several tensors of the same shape.
 
+use crate::Strides;
+use crate::tensor::Layout;
+
+/// The strides to walk `l` with: its own, or zeros if it has no elements. An empty layout touches
+/// no memory, so its strides may be arbitrary (see `as_strided`); kernels that walk only part of
+/// its shape, such as the kept dimensions of a reduction, mustn't do offset arithmetic with them.
+pub(crate) fn walk_strides(l: &Layout) -> Strides {
+    if l.num_elements() == 0 {
+        Strides::new(&vec![0; l.strides.len()])
+    } else {
+        l.strides.clone()
+    }
+}
+
 /// A precomputed loop nest over a shape, tracking one element offset per operand.
 ///
 /// Size-1 dimensions are dropped and neighbouring dimensions that are contiguous with each other

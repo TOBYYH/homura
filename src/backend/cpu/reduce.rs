@@ -1,6 +1,6 @@
 //! Reduction kernels.
 
-use super::{Plan, base, dispatch_all, dispatch_float, exec};
+use super::{Plan, base, dispatch_all, dispatch_float, exec, walk_strides};
 use crate::dtype::sealed::Sealed;
 use crate::ops::ReduceOp;
 use crate::shape::contiguous_strides;
@@ -23,7 +23,10 @@ impl Split {
             red_shape: vec![],
             red_strides: vec![],
         };
-        for ((&size, &stride), &reduced) in l.shape.iter().zip(l.strides.iter()).zip(mask) {
+        // The kept dimensions of an empty source may be nonempty and are walked even though no
+        // element is read.
+        let strides = walk_strides(l);
+        for ((&size, &stride), &reduced) in l.shape.iter().zip(strides.iter()).zip(mask) {
             if reduced {
                 s.red_shape.push(size);
                 s.red_strides.push(stride);

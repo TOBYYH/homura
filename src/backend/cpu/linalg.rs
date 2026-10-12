@@ -1,6 +1,6 @@
 //! Matrix multiplication.
 
-use super::{base, dispatch_float, dispatch_int, exec};
+use super::{base, dispatch_float, dispatch_int, exec, walk_strides};
 use crate::Element;
 use crate::dtype::sealed::Sealed;
 use crate::tensor::TensorData;
@@ -43,8 +43,13 @@ fn mm<T: Element, A: Copy>(
     let n = lb.shape[2];
     assert_eq!(lb.shape[..2], [batch, k]);
     assert_eq!(lo.shape, [batch, m, n]);
+    if lo.num_elements() == 0 {
+        // Nothing to compute: don't allocate a row of `n` accumulators, which may be huge.
+        return;
+    }
     let (pa, pb, po) = (base::<T>(a), base::<T>(b), base::<T>(out));
-    let (sa, sb, so) = (&la.strides, &lb.strides, &lo.strides);
+    // With `k == 0` the operands have no elements and any strides; the result is all zeros.
+    let (sa, sb, so) = (walk_strides(la), walk_strides(lb), &lo.strides);
     let mut row = vec![zero; n];
     exec(|| {
         for bi in 0..batch {

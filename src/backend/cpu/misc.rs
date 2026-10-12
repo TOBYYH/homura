@@ -23,6 +23,10 @@ fn select_layout(l: &Layout, dim: usize, i: usize) -> Layout {
 pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool) {
     let (ls, lo) = (&src.layout, &out.layout);
     assert_eq!(ls.shape, lo.shape);
+    if ls.num_elements() == 0 {
+        // The other dimensions may be nonempty, with arbitrary strides.
+        return;
+    }
     let scalar = ls.shape.is_empty();
     let (n, si, so) = if scalar {
         (1, 0, 0)
@@ -65,10 +69,16 @@ pub(crate) fn index_select(
 ) {
     let indices: Vec<i64> = read_host(index);
     let size = src.layout.shape[dim] as i64;
+    // When the slices have no elements, their strides may be arbitrary and their offsets may not
+    // even fit in `usize`: check the indices but don't build the slices.
+    let copies = out.layout.num_elements() > 0;
     for (j, &i) in indices.iter().enumerate() {
         let wrapped = if i < 0 && allow_negative { i + size } else { i };
         if wrapped < 0 || wrapped >= size {
             panic!("index {i} is out of bounds for dimension {dim} with size {size}");
+        }
+        if !copies {
+            continue;
         }
         let dst = TensorData {
             storage: out.storage.clone(),
@@ -91,6 +101,10 @@ pub(crate) fn triangle(out: &TensorData, src: &TensorData, diagonal: i64, upper:
     let (ls, lo) = (&src.layout, &out.layout);
     let nd = ls.shape.len();
     assert!(nd >= 2 && ls.shape == lo.shape);
+    if ls.num_elements() == 0 {
+        // The batch dimensions may be nonempty, with arbitrary strides.
+        return;
+    }
     let (rows, cols) = (ls.shape[nd - 2], ls.shape[nd - 1]);
     let batch = Shape::new(&ls.shape[..nd - 2]);
     let (bs, bo) = (

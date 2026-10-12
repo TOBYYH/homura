@@ -359,6 +359,41 @@ mod tests {
     }
 
     #[test]
+    fn empty_splits_and_chunks_are_separate_views_of_the_root() {
+        let x = crate::zeros([0, 3]);
+        let parent = x.narrow(1, 1, 2);
+        let pieces = |t: &Tensor| {
+            let mut all = t.chunk(3, 0);
+            all.extend(t.split(0, 0));
+            all
+        };
+        for t in [&x, &parent] {
+            let all = pieces(t);
+            {
+                let _guard = crate::no_grad();
+                let more = pieces(t);
+                assert!(more.iter().all(|p| is_view_of(p, &x)));
+            }
+            for (i, p) in all.iter().enumerate() {
+                assert!(is_view_of(p, &x));
+                assert!(all[i + 1..].iter().all(|q| !q.is_same(p)));
+            }
+        }
+        // Pieces of a stale view are stale too: they keep the generation their parent recorded.
+        x.autograd_meta()
+            .get_or_insert_with(Default::default)
+            .history_gen = 1;
+        for p in pieces(&parent) {
+            assert_eq!(p.view_info().unwrap().base_history_gen, 0);
+        }
+        assert!(
+            pieces(&x)
+                .iter()
+                .all(|p| p.view_info().unwrap().base_history_gen == 1)
+        );
+    }
+
+    #[test]
     fn fresh_results_are_not_views() {
         let x = crate::rand([2, 3, 4]);
         let t = x.transpose(0, 1);
@@ -371,6 +406,12 @@ mod tests {
             ("repeat once", x.repeat([1, 1, 1])),
             ("tensor index", x.index((.., crate::tensor([[2i64, 0]])))),
             ("index_select", x.index_select(1, &crate::tensor([0i64]))),
+            (
+                "tensor index of an empty layout",
+                crate::zeros([0])
+                    .as_strided([4, 0], [isize::MAX as usize, 0], 0)
+                    .index((crate::tensor([3i64]), ..)),
+            ),
             ("matmul", x.matmul(&crate::ones([4, 5]))),
             ("matmul with a vector", x.matmul(&crate::ones([4]))),
             ("dot", crate::ones([4]).matmul(&crate::ones([4]))),

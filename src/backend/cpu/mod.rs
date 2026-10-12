@@ -24,7 +24,7 @@ mod misc;
 mod num;
 mod reduce;
 
-pub(crate) use iter::Plan;
+pub(crate) use iter::{Plan, walk_strides};
 pub(crate) use linalg::matmul;
 pub(crate) use misc::{flip, index_select, softmax, triangle};
 pub(crate) use num::{Float, FloatElement, IntElement};

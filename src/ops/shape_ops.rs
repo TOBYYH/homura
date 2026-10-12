@@ -103,7 +103,8 @@ impl Tensor {
         let size = self.shape()[d];
         if split_size == 0 {
             if size == 0 {
-                return vec![self.clone()];
+                // A new view, like the other pieces, not a handle to `self`.
+                return vec![self.narrow(dim, 0, 0)];
             }
             panic!(
                 "split_size can only be 0 if dimension size is 0, but got dimension size of {size}"
@@ -152,8 +153,8 @@ impl Tensor {
         }
         let size = self.size(dim);
         if size == 0 {
-            // Like PyTorch: `chunks` empty views rather than a single one.
-            return vec![self.narrow(dim, 0, 0); chunks];
+            // Like PyTorch: `chunks` distinct empty views rather than a single one.
+            return (0..chunks).map(|_| self.narrow(dim, 0, 0)).collect();
         }
         self.split(size.div_ceil(chunks), dim)
     }

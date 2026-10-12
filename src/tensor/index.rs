@@ -112,9 +112,10 @@ impl IndexItem for RangeTo<i64> {
     }
 }
 
-/// An inclusive end of `-1` means "through the last element".
+/// An inclusive end of `-1` means "through the last element", and so does `i64::MAX`, which
+/// lies past the end of every dimension.
 fn inclusive_end(end: i64) -> Option<i64> {
-    if end == -1 { None } else { Some(end + 1) }
+    if end == -1 { None } else { end.checked_add(1) }
 }
 
 impl IndexItem for RangeInclusive<i64> {

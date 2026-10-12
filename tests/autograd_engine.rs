@@ -496,6 +496,68 @@ fn nodes_that_saved_nothing_can_run_again() {
     y.backward();
     y.backward();
     assert_eq!(grad_of(&x), [2., 2.]);
+    let x = leaf(&[1., 2.]);
+    let y = (1.0 - &x).sum();
+    y.backward();
+    y.backward();
+    assert_eq!(grad_of(&x), [-2., -2.]);
+}
+
+#[test]
+fn scalar_factors_are_saved_and_released_like_tensors() {
+    // As in PyTorch, which saves the scalar of `x * 2` as a tensor: whatever its value or type,
+    // and on either side.
+    type Op = Box<dyn Fn(&Tensor) -> Tensor>;
+    let products: [Op; 6] = [
+        Box::new(|x| x * 2.5),
+        Box::new(|x| 2.5 * x),
+        Box::new(|x| x * 0.0),
+        Box::new(|x| x.mul(1i64)),
+        Box::new(|x| x.mul(-3i64)),
+        Box::new(|x| x.mul(true)),
+    ];
+    let devices = [DType::F16, DType::BF16, DType::F32, DType::F64]
+        .map(|dtype| (dtype, Device::Cpu))
+        .into_iter()
+        .chain([(DType::F32, Device::Meta)]);
+    for (dtype, device) in devices {
+        for (i, product) in products.iter().enumerate() {
+            let input = || {
+                let x = homura::zeros_with([2], (dtype, device));
+                x.requires_grad_(true);
+                x
+            };
+            let x = input();
+            let y = product(&x).sum();
+            y.backward();
+            let message = panic_message(|| y.backward());
+            assert!(
+                message.starts_with("Trying to backward through the graph a second time"),
+                "{dtype} {device:?} {i}: {message}"
+            );
+            // Retained, explicitly or by `create_graph`, it runs again.
+            let x = input();
+            let y = product(&x).sum();
+            let retain = BackwardOptions {
+                retain_graph: Some(true),
+                ..Default::default()
+            };
+            autograd::backward(&[&y], &[], retain);
+            y.backward();
+            let options = BackwardOptions {
+                create_graph: true,
+                ..Default::default()
+            };
+            let x = input();
+            let y = product(&x).sum();
+            autograd::backward(&[&y], &[], options.clone());
+            autograd::backward(&[&y], &[], options);
+            assert_eq!(x.grad().unwrap().dtype(), dtype);
+        }
+    }
+    let x = leaf(&[1., 2.]);
+    (&x * 2.5).sum().backward();
+    assert_eq!(grad_of(&x), [2.5, 2.5]);
 }
 
 // ---------------------------------------------------------------- tensor API
@@ -1017,6 +1079,60 @@ fn a_saved_leaf_that_starts_requiring_grad_is_differentiated() {
     assert_eq!(
         vals(&grad(&[&g.sum()], &[&x], GradOptions::default())[0]),
         [1.]
+    );
+}
+
+#[test]
+fn saved_factors_are_checked_even_when_their_gradient_is_not_needed() {
+    // R25: `grad` with respect to `x` doesn't need the saved `x`, but a pass through the node
+    // checks every tensor it saved, as in PyTorch.
+    let x = leaf(&[2., 3.]);
+    let w = leaf(&[4., 5.]);
+    let y = (&x * &w).sum();
+    {
+        let _no_grad = homura::no_grad();
+        x.add_(100.0);
+    }
+    assert_eq!(
+        panic_message(|| {
+            autograd::grad(&[&y], &[&x], GradOptions::default());
+        }),
+        "one of the variables needed for gradient computation has been modified by an inplace \
+         operation: [f32 [2]] is at version 1; expected version 0 instead."
+    );
+    let x = leaf(&[2., 3.]);
+    let a = &x * 2.0;
+    let w = leaf(&[4., 5.]);
+    let y = (&a * &w).sum();
+    a.detach_();
+    assert!(
+        panic_message(|| {
+            autograd::grad(&[&y], &[&x], GradOptions::default());
+        })
+        .starts_with("Trying to use a saved tensor that has been detached in-place")
+    );
+    // Unmodified, or only dropped, the saved factors are fine.
+    let x = leaf(&[2., 3.]);
+    let a = &x * 2.0;
+    let w = leaf(&[4., 5.]);
+    let y = (&a * &w).sum();
+    drop(a);
+    assert_eq!(
+        vals(&grad(&[&y], &[&x], GradOptions::default())[0]),
+        [8., 10.]
+    );
+    // A node that only has its input captured doesn't run, so it checks nothing.
+    let x = leaf(&[2., 3.]);
+    let w = leaf(&[4., 5.]);
+    let a = &x * &w;
+    let y = (&a * 1.0).sum();
+    {
+        let _no_grad = homura::no_grad();
+        x.add_(1.0);
+    }
+    assert_eq!(
+        vals(&grad(&[&y], &[&a], GradOptions::default())[0]),
+        [1., 1.]
     );
 }
 

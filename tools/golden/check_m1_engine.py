@@ -226,6 +226,41 @@ y = (x + 1.0).sum()
 y.backward()
 y.backward()
 assert x.grad.tolist() == [2, 2]
+x = leaf(1.0, 2.0)
+y = (1.0 - x).sum()
+y.backward()
+y.backward()
+assert x.grad.tolist() == [-2, -2]
+# The scalar of a product is saved as a tensor and released like one.
+products = [
+    lambda x: x * 2.5,
+    lambda x: 2.5 * x,
+    lambda x: x * 0.0,
+    lambda x: x * 1,
+    lambda x: x * -3,
+    lambda x: x * True,
+]
+devices = [(dtype, "cpu") for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.float64]]
+for dtype, device in devices + [(torch.float32, "meta")]:
+    for product in products:
+        x = torch.zeros(2, dtype=dtype, device=device, requires_grad=True)
+        y = product(x).sum()
+        y.backward()
+        assert message(y.backward).startswith(
+            "Trying to backward through the graph a second time"
+        )
+        x = torch.zeros(2, dtype=dtype, device=device, requires_grad=True)
+        y = product(x).sum()
+        y.backward(retain_graph=True)
+        y.backward()
+        x = torch.zeros(2, dtype=dtype, device=device, requires_grad=True)
+        y = product(x).sum()
+        y.backward(create_graph=True)
+        y.backward(create_graph=True)
+        assert x.grad.dtype == dtype
+x = leaf(1.0, 2.0)
+(x * 2.5).sum().backward()
+assert x.grad.tolist() == [2.5, 2.5]
 
 # ---------------------------------------------------------------- tensor API
 n = torch.tensor([1, 2])
@@ -514,6 +549,39 @@ for detach in [True, False]:
     else:
         del a
         assert torch.autograd.grad(g, [u])[0].item() == 4
+
+# A pass through a node checks every tensor it saved, also those only the gradients it doesn't
+# compute need.
+x = leaf(2.0, 3.0)
+w = leaf(4.0, 5.0)
+y = (x * w).sum()
+with torch.no_grad():
+    x.add_(100.0)
+# homura writes the tensor as "[f32 [2]]".
+error = message(lambda: torch.autograd.grad(y, [x]))
+assert error.startswith(
+    "one of the variables needed for gradient computation has been modified by an inplace "
+    "operation: [torch.FloatTensor [2]] is at version 1; expected version 0 instead."
+)
+x = leaf(2.0, 3.0)
+a = x * 2.0
+w = leaf(4.0, 5.0)
+y = (a * w).sum()
+a.detach_()
+assert message(lambda: torch.autograd.grad(y, [x])) == detached
+x = leaf(2.0, 3.0)
+a = x * 2.0
+w = leaf(4.0, 5.0)
+y = (a * w).sum()
+del a
+assert torch.autograd.grad(y, [x])[0].tolist() == [8, 10]
+x = leaf(2.0, 3.0)
+w = leaf(4.0, 5.0)
+a = x * w
+y = (a * 1.0).sum()
+with torch.no_grad():
+    x.add_(1.0)
+assert torch.autograd.grad(y, [a])[0].tolist() == [1, 1]
 
 # ---------------------------------------------------------------- errors
 x = leaf(1.0, 2.0)

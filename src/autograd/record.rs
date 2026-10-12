@@ -29,7 +29,7 @@ pub(crate) fn record<N: Node>(
     outputs: &[&Tensor],
     formula: impl FnOnce(&mut NodeBuilder) -> N,
 ) {
-    if !is_grad_enabled() || !outputs.iter().all(|t| t.is_floating_point()) || !needs_grad(inputs) {
+    if !needs_grad(inputs) || !outputs.iter().all(|t| t.is_floating_point()) {
         return;
     }
     let edges = inputs.iter().map(|t| t.and_then(gradient_edge)).collect();

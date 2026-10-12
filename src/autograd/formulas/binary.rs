@@ -5,7 +5,7 @@ use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::{record, record_unimplemented};
 use crate::autograd::saved::SavedId;
 use crate::ops::{BinaryOp, Operand};
-use crate::{Scalar, Shape, Tensor};
+use crate::{Shape, Tensor};
 
 /// Records the backward node of `out = op(lhs, rhs)`.
 ///
@@ -51,12 +51,17 @@ pub(crate) fn binary(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
         Add => record(&inputs, &[out], |_| AddBackward0 { shapes }),
         Sub => record(&inputs, &[out], |_| SubBackward0 { shapes }),
         _ => record(&inputs, &[out], |b| {
-            // The gradient of each input is `g` times the other operand.
+            // The gradient of each input is `g` times the other operand. As in PyTorch, a scalar
+            // is saved as a tensor, so it is released with the graph like any other factor.
             let first_factor = b.needs_grad(0).then(|| match &second {
-                Operand::Tensor(t) => Factor::Saved(b.save(t)),
-                Operand::Scalar(s) => Factor::Scalar(*s),
+                Operand::Tensor(t) => b.save(t),
+                Operand::Scalar(s) => b.save(&Tensor::from_data(crate::ops::scalar_data(
+                    *s,
+                    first.dtype(),
+                    first.device(),
+                ))),
             });
-            let second_factor = b.needs_grad(1).then(|| Factor::Saved(b.save(first)));
+            let second_factor = b.needs_grad(1).then(|| b.save(first));
             MulBackward0 {
                 factors: [first_factor, second_factor],
                 shapes,
@@ -120,16 +125,10 @@ impl Node for RsubBackward1 {
     }
 }
 
-/// What the gradient of one factor of a product is multiplied by: the other factor.
-enum Factor {
-    Saved(SavedId),
-    Scalar(Scalar),
-}
-
 /// `a * b`: `a` gets `g * b` and `b` gets `g * a`, summed to their shapes. Each factor is saved
 /// only when the other one needs a gradient.
 struct MulBackward0 {
-    factors: [Option<Factor>; 2],
+    factors: [Option<SavedId>; 2],
     shapes: [Shape; 2],
 }
 
@@ -140,16 +139,16 @@ impl Node for MulBackward0 {
 
     fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
         let g = only(grads);
+        // As in PyTorch, every saved factor is unpacked, and so checked, even when the gradient
+        // that needs it isn't computed in this pass.
+        let factors = self.factors.map(|id| id.map(|id| ctx.unpack(id)));
         (0..2)
             .map(|i| {
                 if !ctx.needs_input_grad(i) {
                     return None;
                 }
-                let product = match self.factors[i].as_ref().expect("saved for an edge") {
-                    Factor::Saved(id) => g.mul(ctx.unpack(*id)),
-                    Factor::Scalar(s) => g.mul(*s),
-                };
-                Some(product.sum_to_size(&self.shapes[i]))
+                let factor = factors[i].as_ref().expect("saved for an edge");
+                Some(g.mul(factor).sum_to_size(&self.shapes[i]))
             })
             .collect()
     }

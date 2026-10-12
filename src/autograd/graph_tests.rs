@@ -192,7 +192,7 @@ fn in_place_changes_to_saved_tensors_are_reported_like_pytorch() {
     for (saved, described) in [
         (&plain, "[f32 [3]]"),
         (&w, "[f32 [3]]"),
-        (&non_leaf, "[f32 [3]], which is output 0 of ScaleBackward0,"),
+        (&non_leaf, "[f32 [3]], which is output 0 of Scale,"),
     ] {
         let consumer = node(vec![gradient_edge(&w)], Some(saved), &w);
         // In no-grad mode, where in-place operations are allowed on leaves that require grad.

@@ -1,12 +1,14 @@
 """Check the reference behavior that tests/autograd_formulas.rs and tests/m1_ops.rs encode (M1
-step 4), and the review fixes that tests/m1_regressions.rs encodes; does not write fixtures.
+steps 4 and 6a), and the review fixes that tests/m1_regressions.rs encodes; does not write
+fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
 asserted and the difference is noted: messages name homura's dtypes and operations, half and
 single precision sums of repeated positions are rounded once from f64, an out-of-range position
 is reported even when `self` is empty, `index_add` rejects zero-dimensional `self` like homura's
-`index_select`, tensors must share a device, the backward graph keeps one node per slice, and
-`as_strided` can't differentiate an input whose elements overlap.
+`index_select`, tensors must share a device, the backward graph keeps one node per slice,
+`as_strided` can't differentiate an input whose elements overlap, and `scalar / x` is one
+division (Python computes `x.reciprocal() * scalar`).
 """
 
 import math
@@ -35,12 +37,15 @@ def grad(out, inputs, g):
 
 
 def same(actual, expected):
-    """Equal values, NaN equal to NaN, within the tolerance of the Rust tests."""
+    """Equal values, NaN equal to NaN and infinities only to themselves, within the tolerance of
+    the Rust tests."""
     actual = actual.detach().flatten().tolist()
     assert len(actual) == len(expected), (actual, expected)
     for a, e in zip(actual, expected):
         if math.isnan(e):
             assert math.isnan(a), (actual, expected)
+        elif math.isinf(e):
+            assert a == e, (actual, expected)
         else:
             assert abs(a - e) <= 1e-6 * max(abs(e), 1.0), (actual, expected)
 
@@ -257,6 +262,247 @@ for make, saved in [
     (lambda i: x3().scatter_add(0, i, torch.ones(2)), False),
 ]:
     assert index_modified(make) == saved
+
+# ---------------------------------------------------------------- step 6a: nodes
+F = torch.nn.functional
+inf, nan = math.inf, math.nan
+x = leaf([1.0, 2, 3])
+y = leaf([4.0, 5, 6])
+constant = torch.tensor([1.0, 2, 3])
+integers = torch.tensor([1, 2, 3])
+cond = torch.tensor([True, False, True])
+for out, name, edges in [
+    (x.abs(), "AbsBackward0", [ACC]),
+    (x.relu(), "ReluBackward0", [ACC]),
+    (x.log(), "LogBackward0", [ACC]),
+    (x.sqrt(), "SqrtBackward0", [ACC]),
+    (x.rsqrt(), "RsqrtBackward0", [ACC]),
+    (x.reciprocal(), "ReciprocalBackward0", [ACC]),
+    (x.sin(), "SinBackward0", [ACC]),
+    (x.cos(), "CosBackward0", [ACC]),
+    (x.tanh(), "TanhBackward0", [ACC]),
+    (x.sigmoid(), "SigmoidBackward0", [ACC]),
+    (F.silu(x), "SiluBackward0", [ACC]),
+    (F.gelu(x), "GeluBackward0", [ACC]),
+    (F.gelu(x, approximate="tanh"), "GeluBackward0", [ACC]),
+    (x / y, "DivBackward0", [ACC, ACC]),
+    (x / 2.0, "DivBackward0", [ACC, None]),
+    (x / 2, "DivBackward0", [ACC, None]),
+    (x / constant, "DivBackward0", [ACC, None]),
+    (x / integers, "DivBackward0", [ACC, None]),
+    (integers / x, "DivBackward0", [None, ACC]),
+    (torch.div(torch.tensor(2.0), x), "DivBackward0", [None, ACC]),
+    (torch.where(cond, x, y), "WhereBackward0", [ACC, ACC]),
+    (torch.where(cond, x, 0.0), "WhereBackward0", [ACC, None]),
+    (torch.where(cond, 0.0, y), "WhereBackward0", [None, ACC]),
+    (torch.where(cond, x, constant), "WhereBackward0", [ACC, None]),
+]:
+    assert node(out) == (name, edges), (node(out), name, edges)
+# homura divides `2.0 / x` like torch.div above; Python's operator multiplies by the reciprocal.
+assert node(2.0 / x) == ("MulBackward0", ["ReciprocalBackward0", None])
+assert integers.abs().grad_fn is None and integers.relu().grad_fn is None
+
+# ---------------------------------------------------------------- step 6a: values
+X = [0.0, -0.0, -1.0, 2.0, inf, -inf, nan, 0.0, -2.0]
+G = [1.0, 1.0, inf, nan, 1.0, 1.0, 1.0, inf, nan]
+for f, expected in [
+    (torch.abs, [0, 0, -inf, nan, 1, -1, 0, nan, nan]),
+    (torch.relu, [0, 0, 0, nan, 1, 0, 1, 0, 0]),
+    (torch.log, [inf, -inf, -inf, nan, 0, -0.0, nan, inf, nan]),
+    (torch.sqrt, [inf, -inf, nan, nan, 0, nan, nan, inf, nan]),
+    (torch.rsqrt, [-inf, inf, nan, nan, -0.0, nan, nan, -inf, nan]),
+    (torch.reciprocal, [-inf, -inf, -inf, nan, -0.0, -0.0, nan, -inf, nan]),
+    (torch.sin, [1, 1, inf, nan, nan, nan, nan, inf, nan]),
+    (torch.cos, [-0.0, 0, inf, nan, nan, nan, nan, nan, nan]),
+    (torch.tanh, [1, 1, inf, nan, 0, 0, nan, inf, nan]),
+    (torch.sigmoid, [0.25, 0.25, inf, nan, 0, 0, nan, inf, nan]),
+    (F.silu, [0.5, 0.5, inf, nan, nan, nan, nan, inf, nan]),
+    (F.gelu, [0.5, 0.5, -inf, nan, nan, nan, nan, inf, nan]),
+    (lambda x: F.gelu(x, approximate="tanh"), [0.5, 0.5, -inf, nan, nan, nan, nan, inf, nan]),
+]:
+    x = leaf(X)
+    same(grad(f(x), x, G)[0], expected)
+x = leaf([nan, 0.0, -0.0, 1e-30, -1e-30])
+same(grad(x.relu(), x, [inf, inf, nan, inf, inf])[0], [inf, 0, 0, inf, 0])
+for dtype in [torch.float16, torch.bfloat16]:
+    x = leaf([0.25, 1.0, 4.0], dtype=dtype)
+    (gx,) = torch.autograd.grad(x.sqrt(), x, torch.ones(3, dtype=dtype))
+    assert gx.dtype == dtype and gx.tolist() == [1, 0.5, 0.25]
+
+a = leaf([1.0, 0, inf, 1, -1, 2])
+b = leaf([0.0, 0, inf, inf, -0.0, 4])
+ga, gb = grad(a / b, [a, b], [1.0, 1, 1, 1, 1, inf])
+same(ga, [inf, inf, 0, 0, -inf, inf])
+same(gb, [-inf, nan, nan, -0.0, inf, -inf])
+a = leaf([[1.0], [2]])
+b = leaf([1.0, 2, 4])
+ga, gb = grad(a / b, [a, b], [[1.0] * 3] * 2)
+same(ga, [1.75, 1.75])
+same(gb, [-3, -0.75, -0.1875])
+x = leaf([0.0, 1, inf, -2])
+for out in [2.0 / x, 2 / x, torch.div(torch.tensor(2.0), x)]:
+    same(grad(out, x, [1.0] * 4)[0], [-inf, -2, -0.0, -0.5])
+same(grad(x / 2.0, x, [1.0] * 4)[0], [0.5] * 4)
+same(grad(x / 0.0, x, [1.0] * 4)[0], [inf] * 4)
+x = leaf([0.0, 1, inf])
+same(grad(0.0 / x, x, [1.0] * 3)[0], [nan, -0.0, -0.0])
+x = leaf([1.0, 2, -4])
+i = torch.tensor([2, -1, 4])
+same(grad(x / i, x, [1.0] * 3)[0], [0.5, -1, 0.25])
+same(grad(i / x, x, [1.0] * 3)[0], [-2, 0.25, -0.25])
+a = leaf([1.0, 2])
+b = leaf([3.0, 4], dtype=torch.float64)
+ga, gb = grad(a / b, [a, b], [1.0, 1])
+assert ga.dtype == torch.float32 and gb.dtype == torch.float64
+same(ga, [1 / 3, 0.25])
+same(gb, [-1 / 9, -0.125])
+
+cond = torch.tensor([True, False, True, False])
+x = leaf([1.0, 2, 3, 4])
+y = leaf([5.0, 6, 7, 8])
+gx, gy = grad(torch.where(cond, x, y), [x, y], [nan, inf, -inf, nan])
+same(gx, [nan, 0, -inf, 0])
+same(gy, [0, inf, 0, nan])
+x = leaf([1.0, 2])
+y = leaf(3.0)
+gx, gy = grad(torch.where(torch.tensor([[True, False], [False, False]]), x, y), [x, y], [[1.0, 2], [3, 4]])
+same(gx, [1, 0])
+same(gy, [9])
+cond = torch.tensor([[True], [False]])
+x = leaf([1.0, 2])
+same(grad(torch.where(cond, x, -1.0), x, [[1.0, 2], [3, 4]])[0], [1, 2])
+same(grad(torch.where(cond, 0.5, x), x, [[1.0, 2], [3, 4]])[0], [3, 4])
+x = leaf([1.0, 2])
+y = leaf([3.0, 4], dtype=torch.float64)
+gx, gy = grad(torch.where(torch.tensor([True, False]), x, y), [x, y], [1.0, 1])
+assert gx.dtype == torch.float32 and gy.dtype == torch.float64
+same(gx, [1, 0])
+same(gy, [0, 1])
+
+# ---------------------------------------------------------------- step 6a: higher order
+for dtype in [torch.float32, torch.float64]:
+    for name, f, first, second in [
+        ("abs", torch.abs, [1, -1, 1], [0, 0, 0]),
+        ("relu", torch.relu, [1, 0, 1], [0, 0, 0]),
+        ("log", torch.log, [2, 0.8, 0.5], [-4, -0.64, -0.25]),
+        ("sqrt", torch.sqrt, [0.70710677, 0.4472136, 0.35355338], [-0.70710677, -0.17888544, -0.08838835]),
+        ("rsqrt", torch.rsqrt, [-1.4142135, -0.35777088, -0.1767767], [4.2426405, 0.42932505, 0.13258252]),
+        ("reciprocal", torch.reciprocal, [-4, -0.64, -0.25], [16, -1.024, 0.25]),
+        ("sin", torch.sin, [0.87758255, 0.31532237, -0.41614684], [-0.47942555, 0.9489846, -0.9092974]),
+        ("cos", torch.cos, [-0.47942555, 0.9489846, -0.9092974], [-0.87758255, -0.31532237, 0.41614684]),
+        ("tanh", torch.tanh, [0.78644773, 0.28041487, 0.07065082], [-0.72686198, 0.4757427, -0.13621869]),
+        ("sigmoid", torch.sigmoid, [0.23500371, 0.17310479, 0.10499359], [-0.05755679, 0.09600387, -0.0799625]),
+        ("silu", F.silu, [0.7399612, 0.006319155, 1.0907842], [0.441229, 0.22620474, 0.05006217]),
+        ("gelu", F.gelu, [0.8674951, -0.12266158, 1.0852318], [0.6161143, 0.07990897, -0.10798193]),
+        (
+            "gelu with tanh",
+            lambda x: F.gelu(x, approximate="tanh"),
+            [0.8673699, -0.12249263, 1.0860993],
+            [0.6155069, 0.08118098, -0.10787508],
+        ),
+    ]:
+        positive = name in ("log", "sqrt", "rsqrt")
+        x = leaf([0.5, 1.25 if positive else -1.25, 2.0], dtype=dtype)
+        d1 = torch.autograd.grad(f(x).sum(), x, create_graph=True)[0]
+        # Every first derivative depends on `x`, also those of `abs` (through `sgn`) and `relu`
+        # (through `threshold_backward`), whose own derivatives are zero.
+        assert d1.requires_grad, name
+        d2 = torch.autograd.grad(d1.sum(), x)[0] + 0  # `+ 0` materializes PyTorch's zero tensors
+        assert d1.dtype == d2.dtype == dtype
+        same(d1, first)
+        same(d2, second)
+
+a = leaf([1.5, -2.0])
+b = leaf([0.5, 4.0])
+gb = torch.autograd.grad((a / b).sum(), b, create_graph=True)[0]
+same(gb, [-6, 0.125])
+gba, gbb = torch.autograd.grad(gb.sum(), [a, b])
+same(gba, [-4, -0.0625])
+same(gbb, [24, -0.0625])
+ga = torch.autograd.grad((a / b).sum(), a, create_graph=True)[0]
+gaa, gab = torch.autograd.grad(ga.sum(), [a, b], allow_unused=True)
+assert gaa is None
+same(gab, [-4, -0.0625])
+x = leaf([0.5, -1.25, 2.0])
+d1 = torch.autograd.grad((2.0 / x).sum(), x, create_graph=True)[0]
+same(d1, [-8, -1.28, -0.5])
+same(torch.autograd.grad(d1.sum(), x)[0], [32, -2.048, 0.5])
+x = leaf([1.0, 2.0])
+d1 = torch.autograd.grad(torch.where(torch.tensor([True, False]), x, 0.0).sum(), x, create_graph=True)[0]
+assert not d1.requires_grad and d1.tolist() == [1, 0]
+
+# ---------------------------------------------------------------- step 6a: saved tensors
+x3 = lambda: leaf([1.0, 2, 3])  # noqa: E731
+divisor = lambda: torch.tensor([2.0, 4, 8])  # noqa: E731
+for make in [
+    lambda: x3().abs().sum(),
+    lambda: x3().relu().sum(),
+    lambda: x3().log().sum(),
+    lambda: x3().sqrt().sum(),
+    lambda: x3().rsqrt().sum(),
+    lambda: x3().reciprocal().sum(),
+    lambda: x3().sin().sum(),
+    lambda: x3().cos().sum(),
+    lambda: x3().tanh().sum(),
+    lambda: x3().sigmoid().sum(),
+    lambda: F.silu(x3()).sum(),
+    lambda: F.gelu(x3()).sum(),
+    lambda: F.gelu(x3(), approximate="tanh").sum(),
+    lambda: (x3() / x3()).sum(),
+    lambda: (x3() / divisor()).sum(),
+    lambda: (divisor() / x3()).sum(),
+    lambda: (x3() / 2.0).sum(),
+    lambda: (2.0 / x3()).sum(),
+    lambda: torch.where(torch.tensor([True, False, True]), x3(), 0.0).sum(),
+]:
+    assert second_pass_fails(make)
+
+
+def version_error(make, described):
+    try:
+        make()
+    except RuntimeError as e:
+        expected = (
+            "one of the variables needed for gradient computation has been modified by an "
+            f"inplace operation: {described} is at version 1; expected version 0 instead."
+        )
+        assert str(e).startswith(expected), str(e)
+        return
+    raise AssertionError("expected an error")
+
+
+for requested in range(2):
+    a = leaf([1.0, 2])
+    b = leaf([3.0, 4])
+    y = (a / b).sum()
+    with torch.no_grad():
+        a.mul_(1)
+    version_error(lambda: torch.autograd.grad(y, [a, b][requested]), "[torch.FloatTensor [2]]")
+a = leaf([1.0, 2])
+b = torch.tensor([3.0, 4])
+y = (a / b).sum()
+with torch.no_grad():
+    a.mul_(1)
+y.backward()
+y = (a / b).sum()
+with torch.no_grad():
+    b.mul_(1)
+version_error(y.backward, "[torch.FloatTensor [2]]")
+cond = torch.tensor([True, False])
+y = torch.where(cond, leaf([1.0, 2]), 0.0).sum()
+cond.copy_(torch.tensor([False, True]))
+version_error(y.backward, "[CPUBoolType [2]]")  # homura: [bool [2]]
+# Saved tensors with a history name the operation that computed them, not the node.
+x = leaf([1.0, -2])
+y = x.relu()
+with torch.no_grad():
+    y.mul_(1)
+version_error(lambda: y.sum().backward(), "[torch.FloatTensor [2]], which is output 0 of Relu,")
+a = x * 2.0
+y = (a * a).sum()
+with torch.no_grad():
+    a.mul_(1)
+version_error(y.backward, "[torch.FloatTensor [2]], which is output 0 of Mul,")
 
 # ---------------------------------------------------------------- forward: erf and sign
 for dtype, erf_dtype in [

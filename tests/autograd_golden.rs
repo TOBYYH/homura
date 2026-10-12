@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use common::{Case, Golden, assert_close_tol, tolerance};
 use homura::autograd::{self, GradOptions};
-use homura::{DType, Tensor};
+use homura::{DType, GeluApproximate, Tensor, where_};
 
 /// The output of operation `op` of a case, from its inputs by name.
 fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
@@ -50,6 +50,25 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "deep_clone" => x().deep_clone(),
         "to_f64" => x().to(DType::F64),
         "to_f16" => x().to(DType::F16),
+        "abs" => x().abs(),
+        "relu" => x().relu(),
+        "log" => x().log(),
+        "sqrt" => x().sqrt(),
+        "rsqrt" => x().rsqrt(),
+        "reciprocal" => x().reciprocal(),
+        "sin" => x().sin(),
+        "cos" => x().cos(),
+        "tanh" => x().tanh(),
+        "sigmoid" => x().sigmoid(),
+        "silu" => x().silu(),
+        "gelu" => x().gelu(GeluApproximate::None),
+        "gelu_tanh" => x().gelu(GeluApproximate::Tanh),
+        "div" | "div_int" | "int_div" => x() / y(),
+        "div_scalar" => x() / 1.7,
+        "rdiv_scalar" => 1.5 / x(),
+        "rdiv_zero" => 0.0 / x(),
+        "where" => where_(&t["cond"], x(), y()),
+        "where_scalar" => where_(&t["cond"], 0.5, x()),
         _ => return None,
     })
 }
@@ -105,7 +124,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 40, "only {} cases", cases.len());
+    assert!(cases.len() >= 100, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

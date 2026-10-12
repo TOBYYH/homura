@@ -231,12 +231,12 @@ fn grad_returns_gradients_without_writing_them() {
 fn grad_runs_only_the_part_of_the_graph_it_needs() {
     let x = leaf(&[1., 2.]);
     let w = leaf(&[3., 4.]);
-    // `log` has no formula yet, but `w` doesn't need it.
-    let y = (x.log() + &w).sum();
+    // `softmax` has no formula yet, but `w` doesn't need it.
+    let y = (x.softmax(0) + &w).sum();
     let g = grad(&[&y], &[&w], GradOptions::default());
     assert_eq!(vals(&g[0]), [1., 1.]);
     let message = panic_message(|| y.backward());
-    assert_eq!(message, "the derivative for 'log' is not implemented.");
+    assert_eq!(message, "the derivative for 'softmax' is not implemented.");
 }
 
 #[test]
@@ -829,19 +829,10 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
     let w = Tensor::from_slice(&[1f32, 2., 3., 4.], [2, 2]);
     let index = homura::tensor([1i64, 0]);
     let cases: Vec<(&str, Tensor)> = vec![
-        ("log", x.log()),
-        ("sqrt", x.sqrt()),
-        ("relu", x.relu()),
-        ("abs", x.abs()),
-        ("tanh", x.tanh()),
-        ("gelu", x.gelu(homura::GeluApproximate::Tanh)),
-        ("div", &x / &w),
-        ("div", 1.0 / &x),
         ("pow", x.pow(2.0)),
         ("maximum", x.maximum(&w)),
         ("clamp", x.clamp(0.0, 1.0)),
         ("clamp_min", x.clamp_min(&w)),
-        ("where", homura::where_(&w.greater(2.0), &x, 0.0)),
         ("matmul", x.matmul(&w)),
         ("sum_dim", x.sum_dim(0, false)),
         ("mean", x.mean()),
@@ -867,7 +858,7 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
             "{op}"
         );
     }
-    assert_eq!(x.log().grad_fn().unwrap().name(), "NotImplemented");
+    assert_eq!(x.softmax(-1).grad_fn().unwrap().name(), "NotImplemented");
     // The integer-indexed result is reshaped by a recorded `unsafe_view` first.
     assert_eq!(
         x.index((&index,)).grad_fn().unwrap().name(),

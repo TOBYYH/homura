@@ -13,7 +13,7 @@ mod reduce;
 mod unary;
 mod view;
 
-pub(crate) use binary::binary;
+pub(crate) use binary::{binary, where_};
 pub(crate) use index::{
     gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
 };

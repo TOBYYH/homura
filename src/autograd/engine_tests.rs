@@ -146,7 +146,7 @@ fn deep_recorded_graphs_are_destroyed_without_recursion() {
                 let x = leaf(&[1.]);
                 let start = if scenario == "failed backward" {
                     // A node whose derivative isn't implemented, reached last.
-                    x.log()
+                    x.softmax(0)
                 } else {
                     &x * 1.0
                 };
@@ -164,7 +164,7 @@ fn deep_recorded_graphs_are_destroyed_without_recursion() {
                     }
                     "failed backward" => {
                         let message = panic_message(|| y.backward());
-                        assert_eq!(message, "the derivative for 'log' is not implemented.");
+                        assert_eq!(message, "the derivative for 'softmax' is not implemented.");
                     }
                     _ => {}
                 }

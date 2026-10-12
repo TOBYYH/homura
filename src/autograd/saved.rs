@@ -155,12 +155,14 @@ impl SavedTensor {
     }
 }
 
-/// Panics with PyTorch's message unless the storage of `data` is still at `version`.
+/// Panics with PyTorch's message unless the storage of `data` is still at `version`. A tensor
+/// with a history is described as an output of the operation that computed it.
 fn check_version(data: &TensorData, version: u64, history: Option<&(NodeRef, u32)>) {
     let current = data.storage.version();
     if current != version {
         let output = history.map_or(String::new(), |(grad_fn, output_nr)| {
-            format!(", which is output {output_nr} of {},", grad_fn.name())
+            let operation = operation_name(grad_fn.name());
+            format!(", which is output {output_nr} of {operation},")
         });
         panic!(
             "one of the variables needed for gradient computation has been modified by an \
@@ -168,5 +170,30 @@ fn check_version(data: &TensorData, version: u64, history: Option<&(NodeRef, u32
              {version} instead.",
             data.dtype, data.layout.shape
         );
+    }
+}
+
+/// The name PyTorch's messages give the operation that a node belongs to: the node's name
+/// without `Backward` and a version number of 0, such as `Mul` for `MulBackward0` and `Sum1`
+/// for `SumBackward1`.
+fn operation_name(node: &str) -> String {
+    match node.rsplit_once("Backward") {
+        Some((operation, "0")) => operation.to_string(),
+        Some((operation, version)) => format!("{operation}{version}"),
+        None => node.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn operations_are_named_like_pytorch() {
+        for (node, operation) in [
+            ("MulBackward0", "Mul"),
+            ("SumBackward1", "Sum1"),
+            ("NotImplemented", "NotImplemented"),
+        ] {
+            assert_eq!(super::operation_name(node), operation);
+        }
     }
 }

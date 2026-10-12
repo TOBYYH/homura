@@ -164,8 +164,7 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
             &y.materialize(dtype, device, &shape),
         );
     }
-    let inputs = [tensor_of(&x_operand), tensor_of(&y_operand)];
-    crate::autograd::record_unimplemented("where", &inputs, &out);
+    crate::autograd::formulas::where_(condition, &x_operand, &y_operand, &out);
     out
 }
 

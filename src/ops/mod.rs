@@ -19,6 +19,7 @@ mod scatter;
 mod shape_ops;
 mod unary;
 
+pub(crate) use binary::binary_op;
 pub use binary::where_;
 pub use overload::Number;
 pub use random::{

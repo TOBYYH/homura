@@ -7,7 +7,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
-use homura::{DType, Device, Tensor};
+use homura::{DType, Device, GeluApproximate, Tensor, where_};
 
 /// A variable of `shape` with deterministic values of both signs, between 0.3 and 1.3 in
 /// magnitude, so that no element sits at a kink such as `sign`'s.
@@ -34,6 +34,20 @@ fn transposed(rows: usize, cols: usize, seed: usize) -> Tensor {
     let x = base.transpose(0, 1);
     x.requires_grad_(true);
     x
+}
+
+/// `x` with the magnitudes of its values, between 0.3 and 1.3, and the same layout, as a new
+/// variable: for functions defined for positive inputs only.
+fn positive(x: &Tensor) -> Tensor {
+    let magnitudes = x.detach().abs();
+    let p = if x.is_contiguous() {
+        magnitudes
+    } else {
+        // `abs` gives a contiguous result; transposing a transposed copy restores the layout.
+        magnitudes.transpose(0, 1).contiguous().transpose(0, 1)
+    };
+    p.requires_grad_(true);
+    p
 }
 
 fn ints(values: &[i64]) -> Tensor {
@@ -232,6 +246,27 @@ fn elementwise_formulas() {
         check(&format!("exp {name}"), &[x], |x| vec![x[0].exp()]);
         check(&format!("erf {name}"), &[x], |x| vec![x[0].erf()]);
         check(&format!("sign {name}"), &[x], |x| vec![x[0].sign()]);
+        // The inputs keep away from the kinks of `abs` and `relu` at zero.
+        check(&format!("abs {name}"), &[x], |x| vec![x[0].abs()]);
+        check(&format!("relu {name}"), &[x], |x| vec![x[0].relu()]);
+        check(&format!("reciprocal {name}"), &[x], |x| {
+            vec![x[0].reciprocal()]
+        });
+        check(&format!("sin {name}"), &[x], |x| vec![x[0].sin()]);
+        check(&format!("cos {name}"), &[x], |x| vec![x[0].cos()]);
+        check(&format!("tanh {name}"), &[x], |x| vec![x[0].tanh()]);
+        check(&format!("sigmoid {name}"), &[x], |x| vec![x[0].sigmoid()]);
+        check(&format!("silu {name}"), &[x], |x| vec![x[0].silu()]);
+        check(&format!("gelu {name}"), &[x], |x| {
+            vec![
+                x[0].gelu(GeluApproximate::None),
+                x[0].gelu(GeluApproximate::Tanh),
+            ]
+        });
+        let p = positive(x);
+        check(&format!("log {name}"), &[&p], |x| vec![x[0].log()]);
+        check(&format!("sqrt {name}"), &[&p], |x| vec![x[0].sqrt()]);
+        check(&format!("rsqrt {name}"), &[&p], |x| vec![x[0].rsqrt()]);
     }
     let b = var(&[3], 3);
     let c = var(&[2, 1], 4);
@@ -245,6 +280,37 @@ fn elementwise_formulas() {
     check("mul scalar", &[&x], |x| vec![&x[0] * 1.5, -0.5 * &x[0]]);
     check("mul zero-dimensional", &[&s, &b], |x| vec![&x[0] * &x[1]]);
     check("mul integer", &[&x], |x| vec![x[0].mul(ints(&[2, -1, 3]))]);
+    // The inputs keep away from zero, so every quotient is smooth.
+    check("div", &[&x, &b], |x| vec![&x[0] / &x[1], &x[1] / &x[0]]);
+    check("div broadcast both", &[&b, &c], |x| vec![&x[0] / &x[1]]);
+    check("div transposed", &[&t, &x], |x| vec![&x[0] / &x[1]]);
+    check("div self", &[&t], |x| vec![&x[0] / &x[0]]);
+    check("div scalar", &[&t], |x| {
+        vec![&x[0] / 1.5, 2.0 / &x[0], -3 / &x[0]]
+    });
+    check("div zero-dimensional", &[&s, &b], |x| {
+        vec![&x[0] / &x[1], &x[1] / &x[0]]
+    });
+    check("div integer", &[&x], |x| {
+        vec![x[0].div(ints(&[2, -1, 3])), ints(&[2, -1, 3]).div(&x[0])]
+    });
+    let cond = homura::tensor([[true, false, true], [false, false, true]]);
+    check("where", &[&x, &t], |x| {
+        vec![where_(&cond, &x[0], &x[1]), where_(&cond, &x[1], &x[0])]
+    });
+    check("where broadcast", &[&b, &c], |x| {
+        vec![
+            where_(&cond, &x[0], &x[1]),
+            where_(&cond.index(0), &x[1], &x[0]),
+        ]
+    });
+    check("where scalar", &[&t, &s], |x| {
+        vec![
+            where_(&cond, &x[0], 0.5),
+            where_(&cond, -1.0, &x[0]),
+            where_(&cond, &x[1], 2.0),
+        ]
+    });
 }
 
 #[test]
@@ -363,8 +429,13 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
     let x = var(&[2, 3], 1);
     let none = Tensor::from_slice::<i64>(&[], [0]);
     type Op = (&'static str, fn(&Tensor, &Tensor, &Tensor) -> Tensor);
-    let ops: [Op; 10] = [
+    let ops: [Op; 13] = [
         ("exp", |e, _, _| e.exp()),
+        ("relu", |e, _, _| e.relu()),
+        ("div", |e, x, _| e / &x.narrow(0, 0, 1)),
+        ("where", |e, x, _| {
+            where_(&e.greater(0.0), e, x.narrow(0, 1, 1))
+        }),
         ("mul", |e, _, _| e * &e.sign()),
         ("sum", |e, _, _| e.sum()),
         ("sum_to_size", |e, _, _| e.sum_to_size([1, 3])),

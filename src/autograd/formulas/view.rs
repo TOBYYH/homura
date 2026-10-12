@@ -4,7 +4,7 @@ use super::only;
 use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::record;
 use crate::tensor::Layout;
-use crate::{Shape, Tensor};
+use crate::{DType, Device, Shape, Tensor};
 
 /// Records the backward node of `out = x.view(..)`, also used by `reshape` when it can share
 /// the storage.
@@ -188,8 +188,7 @@ impl Node for AsStridedBackward0 {
         };
         let first = in_start.min(out_start);
         let len = in_end.max(out_end) - first;
-        let positions = storage_positions(&self.output, first);
-        let index = Tensor::from_host(&positions, Shape::new(&[positions.len()]), g.device());
+        let index = storage_positions(&self.output, first, g.device());
         let sums = g.new_zeros([len]).index_add(0, &index, &g.reshape([-1]));
         vec![Some(sums.as_strided(
             &self.input.shape[..],
@@ -199,20 +198,17 @@ impl Node for AsStridedBackward0 {
     }
 }
 
-/// The storage offset of every element of `l` in row-major order, relative to `first`.
-fn storage_positions(l: &Layout, first: usize) -> Vec<i64> {
-    let mut positions = Vec::with_capacity(l.num_elements());
-    let mut index = vec![0; l.shape.len()];
-    for _ in 0..l.num_elements() {
-        let offset: usize = index.iter().zip(l.strides.iter()).map(|(i, s)| i * s).sum();
-        positions.push((l.offset + offset - first) as i64);
-        for d in (0..index.len()).rev() {
-            index[d] += 1;
-            if index[d] < l.shape[d] {
-                break;
-            }
-            index[d] = 0;
-        }
-    }
-    positions
+/// The storage offset of every element of the nonempty layout `l` relative to `first`, as an
+/// `I64` vector on `device` in row-major order. Built with tensor operations, so that nothing
+/// is enumerated on the meta device.
+fn storage_positions(l: &Layout, first: usize, device: Device) -> Tensor {
+    let nd = l.shape.len();
+    let start = crate::full_with((), (l.offset - first) as i64, (DType::I64, device));
+    let positions = (0..nd).fold(start, |positions, d| {
+        let mut shape = vec![1i64; nd];
+        shape[d] = l.shape[d] as i64;
+        let steps = crate::arange_with(l.shape[d] as i64, (DType::I64, device));
+        positions + steps.mul(l.strides[d] as i64).reshape(shape)
+    });
+    positions.reshape([-1])
 }

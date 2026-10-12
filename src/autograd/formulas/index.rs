@@ -53,6 +53,7 @@ pub(crate) fn scatter_add(x: &Tensor, dim: usize, index: &Tensor, src: &Tensor, 
     record(&[Some(x), Some(src)], &[out], |b| ScatterAddBackward0 {
         dim,
         index: b.needs_grad(1).then(|| b.save(index)),
+        scalar_src: src.num_dims() == 0,
     });
 }
 
@@ -177,10 +178,12 @@ impl Node for GatherBackward0 {
 
 /// `x.scatter_add(dim, index, src)`: `x` gets `g`, and `src` gets the elements of `g` it was
 /// added to. As in PyTorch, that gradient has the shape of the index, so a backward pass fails
-/// when `src` is larger than the index.
+/// when `src` is larger than the index; for a zero-dimensional `src` (`scalar_src`), which
+/// PyTorch's engine sums the gradient to, it is summed here.
 struct ScatterAddBackward0 {
     dim: usize,
     index: Option<SavedId>,
+    scalar_src: bool,
 }
 
 impl Node for ScatterAddBackward0 {
@@ -194,7 +197,12 @@ impl Node for ScatterAddBackward0 {
         let g = only(grads);
         let src = ctx.needs_input_grad(1).then(|| {
             let index = index.as_ref().expect("saved for an edge");
-            g.gather(self.dim as i64, index)
+            let src = g.gather(self.dim as i64, index);
+            if self.scalar_src {
+                src.sum_to_size(())
+            } else {
+                src
+            }
         });
         vec![ctx.needs_input_grad(0).then_some(g), src]
     }

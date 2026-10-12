@@ -95,9 +95,25 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
     let shape = broadcast_shapes(&a.shape(), &b.shape());
     let out = Tensor::empty_on(shape.clone(), out_dtype, device);
     if device == Device::Cpu {
-        let ad = a.materialize(compute, device, &shape);
-        let bd = b.materialize(compute, device, &shape);
-        cpu::binary(op, &out.data(), &ad, &bd);
+        // As in PyTorch, `f16` and `bf16` products and quotients keep a scalar operand in their
+        // `f32` computation type, while the other operations round it to the dtype first.
+        let keeps_scalar = matches!(op, Mul | Div) && matches!(compute, DType::F16 | DType::BF16);
+        match (&a, &b) {
+            (Resolved::Tensor(_), Resolved::Scalar(s))
+            | (Resolved::Scalar(s), Resolved::Tensor(_))
+                if keeps_scalar =>
+            {
+                let scalar_first = matches!(a, Resolved::Scalar(_));
+                let t = if scalar_first { &b } else { &a };
+                let td = t.materialize(compute, device, &shape);
+                cpu::binary_scalar(op, &out.data(), &td, s.to_f64(), scalar_first);
+            }
+            _ => {
+                let ad = a.materialize(compute, device, &shape);
+                let bd = b.materialize(compute, device, &shape);
+                cpu::binary(op, &out.data(), &ad, &bd);
+            }
+        }
     }
     crate::autograd::formulas::binary(op, &lhs, &rhs, &out);
     out

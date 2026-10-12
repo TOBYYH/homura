@@ -1,11 +1,12 @@
 """Check the reference behavior that tests/autograd_formulas.rs and tests/m1_ops.rs encode (M1
-step 4); does not write fixtures.
+step 4), and the review fixes that tests/m1_regressions.rs encodes; does not write fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
 asserted and the difference is noted: messages name homura's dtypes and operations, half and
 single precision sums of repeated positions are rounded once from f64, an out-of-range position
 is reported even when `self` is empty, `index_add` rejects zero-dimensional `self` like homura's
-`index_select`, tensors must share a device, and the backward graph keeps one node per slice.
+`index_select`, tensors must share a device, the backward graph keeps one node per slice, and
+`as_strided` can't differentiate an input whose elements overlap.
 """
 
 import math
@@ -486,5 +487,148 @@ assert message(lambda: leaf_.index_add_(0, torch.tensor([0]), torch.ones(1))) ==
 with torch.no_grad():
     leaf_.index_add_(0, torch.tensor([1]), torch.ones(1))
 assert leaf_.tolist() == [0, 1, 0]
+
+# ---------------------------------------------------------------- review fixes (m1_regressions.rs)
+# A zero-dimensional scatter_add src gets a zero-dimensional gradient, summed by the engine.
+for device in ["cpu", "meta"]:
+    for self_shape in [(), (1,), (3,)]:
+        for index_shape, hits in [((), 1.0), ((1,), 1.0), ((0,), 0.0)]:
+            for dim, both in [(0, False), (0, True), (-1, False), (-1, True)]:
+                x = torch.ones(self_shape, device=device, requires_grad=both)
+                src = torch.full((), 3.0, device=device, requires_grad=True)
+                index = torch.zeros(index_shape, dtype=torch.long, device=device)
+                y = x.scatter_add(dim, index, src)
+                w = torch.full(y.shape, 2.0, device=device, requires_grad=True)
+                inputs = (src, x) if both else (src,)
+                g = torch.autograd.grad(y, inputs, w, create_graph=True)
+                assert g[0].shape == ()
+                (gw,) = torch.autograd.grad(g[0], w)
+                assert gw.shape == y.shape
+                if both:
+                    assert g[1].shape == self_shape
+                if device == "cpu":
+                    assert g[0].item() == 2 * hits
+                    assert gw.flatten().tolist() == [hits] + [0.0] * (y.numel() - 1)
+                    if both:
+                        assert g[1].flatten().tolist() == [2.0] * x.numel()
+    src = torch.ones(1, device=device, requires_grad=True)
+    y = torch.ones(3, device=device).scatter_add(0, torch.zeros((), dtype=torch.long, device=device), src)
+    assert message(lambda: y.sum().backward()) == (
+        "Function ScatterAddBackward0 returned an invalid gradient at index 1 - got [] but expected "
+        "shape compatible with [1]"
+    )
+
+# Meta as_strided gradients of shapes near the size limit.
+for n in [1 << 20, (2**63 - 1) // 32]:
+    x = torch.zeros(n, device="meta", requires_grad=True)
+    every_other = x[::2]
+    for y in [
+        x.as_strided((n,), (1,), 0),
+        x.as_strided((2, n - 1), (1, 1), 0),
+        x.as_strided((n - 1,), (1,), 1),
+        every_other.as_strided((n // 4,), (4,), 2),
+    ]:
+        u = torch.zeros(y.shape, device="meta", requires_grad=True)
+        (g,) = torch.autograd.grad(y, x, u, create_graph=True)
+        assert (g.shape, g.dtype, g.device.type) == ((n,), torch.float32, "meta")
+        assert torch.autograd.grad(g.sum(), u)[0].shape == y.shape
+# PyTorch supports an input whose elements overlap; homura rejects it (see the docstring above).
+row = torch.zeros(2, device="meta", requires_grad=True)
+row.expand(3, 2).as_strided((2,), (1,), 0).sum().backward()
+assert row.grad.shape == (2,)
+
+# f16 and bf16 products and quotients keep a scalar in f32; other operations round it first.
+c = 2 / math.sqrt(math.pi)
+inf = math.inf
+ops = [
+    lambda x: x * 1e5,
+    lambda x: 1e5 * x,
+    lambda x: x * 1e-8,
+    lambda x: x * c,
+    lambda x: x * 100000,
+    lambda x: x / c,
+    lambda x: x / 1e5,
+    lambda x: x / 1e-8,
+    lambda x: x.clone().mul_(1e5),
+    lambda x: x.clone().div_(1e-8),
+    lambda x: x - 1e5,
+    lambda x: x + c,
+    lambda x: x**c,
+    lambda x: (x == 1.0001).float(),
+]
+expected = {
+    torch.float16: [
+        [0, inf, inf, inf],
+        [0, inf, inf, inf],
+        [0, 0.0006551742553710938, 5.960464477539063e-08, 0],
+        [0, inf, 3.384765625, 1.1279296875],
+        [0, inf, inf, inf],
+        [0, 58048, 2.658203125, 0.88623046875],
+        [0, 0.6552734375, 2.9981136322021484e-05, 1.0013580322265625e-05],
+        [0, inf, inf, inf],
+        [0, inf, inf, inf],
+        [0, inf, inf, inf],
+        [-inf, -inf, -inf, -inf],
+        [1.1279296875, 65504, 4.12890625, 2.12890625],
+        [0, inf, 3.453125, 1],
+        [0, 0, 0, 1],
+    ],
+    torch.bfloat16: [
+        [0, 6543114240, 299008, 99840],
+        [0, 6543114240, 299008, 99840],
+        [0, 0.0006561279296875, 3.003515303134918e-08, 1.0011717677116394e-08],
+        [0, 73728, 3.390625, 1.125],
+        [0, 6543114240, 299008, 99840],
+        [0, 58112, 2.65625, 0.88671875],
+        [0, 0.65625, 3.0040740966796875e-05, 1.0013580322265625e-05],
+        [0, 6562710028288, 299892736, 100139008],
+        [0, 6543114240, 299008, 99840],
+        [0, 6562710028288, 299892736, 100139008],
+        [-99840, -34304, -99840, -99840],
+        [1.125, 65536, 4.125, 2.125],
+        [0, 262144, 3.4375, 1],
+        [0, 0, 0, 1],
+    ],
+}
+quotients = {torch.float16: [inf, 49984, 24992, inf], torch.bfloat16: [inf, 49920, 24960, 199680]}
+for dtype, rows in expected.items():
+    x = torch.tensor([0, 65504, 3, 1], dtype=torch.float64).to(dtype)
+    for i, (op, row) in enumerate(zip(ops, rows)):
+        assert op(x).double().tolist() == row, (dtype, i, op(x).tolist())
+    d = torch.tensor([0, 2, 4, 0.5], dtype=dtype)
+    assert (1e5 / d).double().tolist() == quotients[dtype]
+for dtype, products, divided in [
+    (
+        torch.float32,
+        [3.3851375579833984, 7.898654460906982, 1.1283792206876573e-30],
+        [2.6586806774139404, 6.203588008880615, 8.862269142205257e-31],
+    ),
+    (
+        torch.float64,
+        [3.385137501286538, 7.898654169668588, 1.1283791670955127e-30],
+        [2.658680776358274, 6.203588478169306, 8.862269254527581e-31],
+    ),
+]:
+    x = torch.tensor([3, 7, 1e-30], dtype=torch.float64).to(dtype)
+    assert (x * c).double().tolist() == products and (x / c).double().tolist() == divided
+
+# The scalar factor of a half precision product is kept in f32 in the backward pass too.
+for dtype, product, erf in [
+    (torch.float16, 3.384765625, [0.87890625, 0.70947265625, -0.04132080078125]),
+    (torch.bfloat16, 3.390625, [0.87890625, 0.7109375, -0.041259765625]),
+]:
+    for scalar_first in [False, True]:
+        x = torch.tensor([3.0], dtype=dtype, requires_grad=True)
+        y = c * x if scalar_first else x * c
+        u = torch.tensor([3.0], dtype=dtype, requires_grad=True)
+        (g,) = torch.autograd.grad(y, x, u, create_graph=True)
+        assert g.tolist() == [product]
+        r = torch.tensor([3.0], dtype=dtype)
+        assert torch.autograd.grad((g * r).sum(), u)[0].tolist() == [product]
+    x = torch.tensor([3.0], dtype=dtype, requires_grad=True)
+    assert torch.autograd.grad(x * 1e5, x, torch.zeros_like(x))[0].tolist() == [0]
+    x = torch.tensor([0.5, -1.25, 2.0], dtype=dtype, requires_grad=True)
+    upstream = torch.tensor([1.0, 3.0, -2.0], dtype=dtype)
+    assert torch.autograd.grad(x.erf(), x, upstream)[0].tolist() == erf
 
 print("check_m1_formulas: all reference checks passed")

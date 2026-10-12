@@ -5,7 +5,7 @@ use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::{record, record_unimplemented};
 use crate::autograd::saved::SavedId;
 use crate::ops::{BinaryOp, Operand};
-use crate::{Shape, Tensor};
+use crate::{DType, Device, Scalar, Shape, Tensor};
 
 /// Records the backward node of `out = op(lhs, rhs)`.
 ///
@@ -52,18 +52,25 @@ pub(crate) fn binary(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
         Sub => record(&inputs, &[out], |_| SubBackward0 { shapes }),
         _ => record(&inputs, &[out], |b| {
             // The gradient of each input is `g` times the other operand. As in PyTorch, a scalar
-            // is saved as a tensor, so it is released with the graph like any other factor.
+            // is saved as a tensor, so it is released with the graph like any other factor. That
+            // tensor keeps the scalar's own type and value on the CPU, like PyTorch's wrapped
+            // numbers, and becomes a scalar again for the multiplication.
             let first_factor = b.needs_grad(0).then(|| match &second {
                 Operand::Tensor(t) => b.save(t),
-                Operand::Scalar(s) => b.save(&Tensor::from_data(crate::ops::scalar_data(
-                    *s,
-                    first.dtype(),
-                    first.device(),
-                ))),
+                Operand::Scalar(s) => {
+                    let dtype = match s {
+                        Scalar::Bool(_) => DType::Bool,
+                        Scalar::Int(_) => DType::I64,
+                        Scalar::Float(_) => DType::F64,
+                    };
+                    let data = crate::ops::scalar_data(*s, dtype, Device::Cpu);
+                    b.save(&Tensor::from_data(data))
+                }
             });
             let second_factor = b.needs_grad(1).then(|| b.save(first));
             MulBackward0 {
                 factors: [first_factor, second_factor],
+                scalar_factor: matches!(second, Operand::Scalar(_)),
                 shapes,
             }
         }),
@@ -126,9 +133,11 @@ impl Node for RsubBackward1 {
 }
 
 /// `a * b`: `a` gets `g * b` and `b` gets `g * a`, summed to their shapes. Each factor is saved
-/// only when the other one needs a gradient.
+/// only when the other one needs a gradient. When `b` is a scalar, `scalar_factor` is set and
+/// its saved tensor is multiplied as a scalar.
 struct MulBackward0 {
     factors: [Option<SavedId>; 2],
+    scalar_factor: bool,
     shapes: [Shape; 2],
 }
 
@@ -148,8 +157,22 @@ impl Node for MulBackward0 {
                     return None;
                 }
                 let factor = factors[i].as_ref().expect("saved for an edge");
-                Some(g.mul(factor).sum_to_size(&self.shapes[i]))
+                let product = if i == 0 && self.scalar_factor {
+                    g.mul(scalar_of(factor))
+                } else {
+                    g.mul(factor)
+                };
+                Some(product.sum_to_size(&self.shapes[i]))
             })
             .collect()
+    }
+}
+
+/// The scalar saved as `factor` by [`binary`].
+fn scalar_of(factor: &Tensor) -> Scalar {
+    match factor.dtype() {
+        DType::Bool => Scalar::Bool(factor.item()),
+        DType::I64 => Scalar::Int(factor.item()),
+        _ => Scalar::Float(factor.item()),
     }
 }

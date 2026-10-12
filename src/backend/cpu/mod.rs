@@ -480,6 +480,28 @@ pub(crate) fn binary(op: BinaryOp, out: &TensorData, a: &TensorData, b: &TensorD
     }
 }
 
+/// `out = a * s`, `a / s` or `s / a` (`scalar_first`) for `Mul` and `Div` of a floating point
+/// `a`, with the scalar `s` converted to the computation type of `a`'s dtype instead of to the
+/// dtype itself, as in PyTorch's CPU kernels: `f16` and `bf16` are multiplied or divided by the
+/// scalar in `f32` and rounded once.
+pub(crate) fn binary_scalar(
+    op: BinaryOp,
+    out: &TensorData,
+    a: &TensorData,
+    s: f64,
+    scalar_first: bool,
+) {
+    dispatch_float!(a.dtype, T => {
+        let s = <T as FloatElement>::C::of(s);
+        match (op, scalar_first) {
+            (BinaryOp::Mul, _) => map1::<T, T>(out, a, |x| T::down(x.up() * s)),
+            (BinaryOp::Div, false) => map1::<T, T>(out, a, |x| T::down(x.up() / s)),
+            (BinaryOp::Div, true) => map1::<T, T>(out, a, |x| T::down(s / x.up())),
+            _ => unreachable!("{op:?} rounds its scalar to the dtype"),
+        }
+    })
+}
+
 /// `out = cond ? x : y`. `x` and `y` have the dtype of `out`, `cond` is `Bool`; all have the
 /// shape of `out`.
 pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &TensorData) {

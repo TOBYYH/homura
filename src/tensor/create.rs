@@ -428,5 +428,5 @@ pub fn eye_with(n: usize, options: impl Into<TensorOptions>) -> Tensor {
     from_values(n * n, o.float_dtype(), o.device(), |i| {
         Scalar::Int((i / n == i % n) as i64)
     })
-    .view([n as i64, n as i64])
+    .unsafe_view([n as i64, n as i64])
 }

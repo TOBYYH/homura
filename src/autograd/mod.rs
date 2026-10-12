@@ -1,13 +1,25 @@
 //! Automatic differentiation.
 //!
-//! The grad mode switch is public. The backward graph types (nodes, saved tensors, per-tensor
-//! state and the view rules) are in place, but operations don't record into them yet.
+//! Operations don't record a backward graph yet. For now this module holds the grad mode switch:
+//! [`no_grad`], [`enable_grad`] and [`set_grad_enabled`] turn graph recording off or on for the
+//! current thread until the returned guard is dropped. They are also re-exported at the crate
+//! root.
+//!
+//! ```
+//! use homura::autograd;
+//!
+//! {
+//!     let _guard = autograd::no_grad();
+//!     assert!(!autograd::is_grad_enabled());
+//! }
+//! assert!(autograd::is_grad_enabled());
+//! ```
 
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-// Operations start recording into these modules in M1 step 3; until then only the tests and
-// `Tensor::requires_grad` use them.
+// Operations start recording into these modules in M1 step 3; until then only the tests,
+// `Tensor::requires_grad` and the view operations (through `view_of`) use them.
 #[allow(dead_code)]
 mod accumulate;
 #[cfg(test)]
@@ -21,7 +33,7 @@ mod record;
 #[allow(dead_code)]
 mod saved;
 
-pub(crate) use meta::{AutogradMeta, ViewInfo, requires_grad};
+pub(crate) use meta::{AutogradMeta, ViewInfo, requires_grad, view_of};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };

@@ -62,12 +62,16 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     }
     let out = Tensor::empty_on(shape, dtype, device);
     if device == Device::Cpu {
-        let mut offset = 0;
+        let out_data = out.data();
+        let mut start = 0;
         for t in parts {
             let n = t.layout.shape[dim];
-            let dst = out.narrow(dim as i64, offset as i64, n).data();
+            // The part of the output along `dim` that `t` fills, as `narrow` would select it.
+            let mut dst = out_data.clone();
+            dst.layout.offset = dst.layout.offset_at(dim, start);
+            dst.layout.shape[dim] = n;
             cpu::copy(&dst, t);
-            offset += n;
+            start += n;
         }
     }
     out
@@ -211,7 +215,7 @@ impl Tensor {
         self.reshape(interleaved)
             .expand(expanded)
             .deep_clone()
-            .view(result)
+            .unsafe_view(result)
     }
 
     /// Reverses the order of elements along `dims`, returning a copy.

@@ -5,8 +5,9 @@
 //! and dtypes without any data.
 
 use crate::backend::cpu;
-use crate::tensor::TensorData;
-use crate::{DType, Device, Scalar, Tensor};
+use crate::shape::compute_view_strides;
+use crate::tensor::{Layout, TensorData};
+use crate::{DType, Device, Scalar, Shape, Tensor};
 
 mod binary;
 mod composite;
@@ -163,9 +164,41 @@ pub(crate) fn cast_data(data: &TensorData, dtype: DType) -> TensorData {
     out
 }
 
+/// A contiguous copy of `data` in new storage, like [`Tensor::deep_clone`] but for operations
+/// to use internally: it is never recorded for autograd.
+pub(crate) fn clone_data(data: &TensorData) -> TensorData {
+    let out = Tensor::empty_on(data.layout.shape.clone(), data.dtype, data.device()).data();
+    if data.device() == Device::Cpu {
+        cpu::copy(&out, data);
+    }
+    out
+}
+
+/// `data` with `shape`, which has the same number of elements: the same storage when the layout
+/// allows it, otherwise a contiguous copy. Like [`Tensor::reshape`] but for operations to use
+/// internally: the result is not a tensor, so nothing is recorded as a view or for autograd.
+pub(crate) fn reshape_data(data: &TensorData, shape: Shape) -> TensorData {
+    debug_assert_eq!(shape.num_elements(), data.layout.num_elements());
+    let l = &data.layout;
+    match compute_view_strides(&l.shape, &l.strides, &shape) {
+        Some(strides) => TensorData {
+            layout: Layout {
+                shape,
+                strides,
+                offset: l.offset,
+            },
+            ..data.clone()
+        },
+        None => TensorData {
+            layout: Layout::contiguous(shape),
+            ..clone_data(data)
+        },
+    }
+}
+
 /// A zero-dimensional tensor holding `value`.
 pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> TensorData {
-    let out = Tensor::empty_on(crate::Shape::scalar(), dtype, device).data();
+    let out = Tensor::empty_on(Shape::scalar(), dtype, device).data();
     if device == Device::Cpu {
         cpu::fill(&out, value);
     }
@@ -173,8 +206,9 @@ pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> Tensor
 }
 
 impl Tensor {
-    /// Writes the result of an in-place operation into `self`, after checking that it has the
-    /// shape of `self` and that its dtype may be cast to the dtype of `self`.
+    /// Writes the result of an in-place operation into `self` with
+    /// [`write_copy`](Tensor::write_copy), after checking that it has the shape of `self` and that
+    /// its dtype may be cast to the dtype of `self`.
     pub(crate) fn assign_result(&self, result: &Tensor) {
         let (dst, src) = (self.data(), result.data());
         if dst.layout.shape != src.layout.shape {
@@ -189,13 +223,13 @@ impl Tensor {
                 src.dtype, dst.dtype
             );
         }
-        self.copy_(result);
+        self.write_copy(result);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Device, Tensor};
+    use crate::{DType, Device, Tensor};
 
     #[test]
     fn in_place_ops_bump_the_shared_version() {
@@ -219,6 +253,104 @@ mod tests {
         let meta = crate::zeros_with([2], Device::Meta);
         meta.add_(1.0);
         assert_eq!(meta.version(), 1);
+    }
+
+    #[test]
+    fn each_in_place_op_bumps_the_version_exactly_once() {
+        type InPlace = fn(&Tensor);
+        let ops: [(&str, InPlace); 22] = [
+            ("add_ scalar", |x| {
+                x.add_(1.0);
+            }),
+            ("add_ tensor", |x| {
+                x.add_(crate::ones_with([3], x.device()));
+            }),
+            ("sub_", |x| {
+                x.sub_(1.0);
+            }),
+            ("mul_", |x| {
+                x.mul_(crate::ones_with([1, 3], x.device()));
+            }),
+            ("div_", |x| {
+                x.div_(2.0);
+            }),
+            ("pow_", |x| {
+                x.pow_(2.0);
+            }),
+            ("clamp_ scalar", |x| {
+                x.clamp_(0.0, 1.0);
+            }),
+            ("clamp_ tensor", |x| {
+                x.clamp_(crate::zeros_with([3], x.device()), 1.0);
+            }),
+            ("masked_fill_", |x| {
+                x.masked_fill_(&crate::ones_with([3], (DType::Bool, x.device())), 5.0);
+            }),
+            ("addcmul_", |x| {
+                let t = crate::ones_with([3], x.device());
+                x.addcmul_(&t, &t, 0.5);
+            }),
+            ("addcdiv_", |x| {
+                let t = crate::ones_with([3], x.device());
+                x.addcdiv_(&t, &t, 0.5);
+            }),
+            ("lerp_ scalar", |x| {
+                x.lerp_(&crate::zeros_with([3], x.device()), 0.5);
+            }),
+            ("lerp_ tensor", |x| {
+                let t = crate::full_with([3], 0.25, x.device());
+                x.lerp_(&t, &t);
+            }),
+            ("copy_", |x| {
+                x.copy_(&crate::zeros_with([1, 3], x.device()));
+            }),
+            ("copy_ broadcast", |x| {
+                x.copy_(&crate::zeros_with([3], x.device()));
+            }),
+            ("copy_ other dtype", |x| {
+                x.copy_(&crate::zeros_with([3], (DType::I64, x.device())));
+            }),
+            ("copy_ self", |x| {
+                x.copy_(x);
+            }),
+            ("fill_", |x| {
+                x.fill_(2.0);
+            }),
+            ("zero_", |x| {
+                x.zero_();
+            }),
+            ("uniform_", |x| {
+                x.uniform_(0.0, 1.0);
+            }),
+            ("normal_", |x| {
+                x.normal_(0.0, 1.0);
+            }),
+            ("add_ through a transposed view", |x| {
+                x.transpose(0, 1).add_(1.0);
+            }),
+        ];
+        for device in [Device::Cpu, Device::Meta] {
+            for (name, op) in ops {
+                // Through the tensor itself and through a view of a larger one.
+                let x = crate::ones_with([1, 3], device);
+                let base = crate::ones_with([2, 3], device);
+                let view = base.narrow(0, 1, 1);
+                for (t, observed) in [(&x, &x), (&view, &base)] {
+                    let start = observed.version();
+                    op(t);
+                    assert_eq!(observed.version(), start + 1, "{name} on {device}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_between_overlapping_views_bumps_the_version_once() {
+        let x = crate::arange(6.0);
+        let start = x.version();
+        x.narrow(0, 1, 5).copy_(&x.narrow(0, 0, 5));
+        assert_eq!(x.version(), start + 1);
+        assert_eq!(x.to_vec::<f32>(), [0.0, 0.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]

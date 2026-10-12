@@ -1,6 +1,6 @@
 //! Elementwise binary and ternary operations, and in-place writes.
 
-use super::{BinaryOp, Operand, cast_data, common_device, scalar_data};
+use super::{BinaryOp, Operand, cast_data, clone_data, common_device, scalar_data};
 use crate::backend::cpu;
 use crate::dtype::ResultType;
 use crate::shape::broadcast_shapes;
@@ -314,6 +314,29 @@ impl Tensor {
     /// be proven to occupy distinct memory (an expanded tensor, for example), or if `src` is a
     /// meta tensor and `self` is not.
     pub fn copy_(&self, src: &Tensor) -> &Self {
+        self.write_copy(src);
+        self
+    }
+
+    /// Sets every element to `value`.
+    pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
+        self.write_fill(value.into());
+        self
+    }
+
+    /// Sets every element to zero.
+    pub fn zero_(&self) -> &Self {
+        self.write_fill(0.into());
+        self
+    }
+
+    /// The data half of [`copy_`](Tensor::copy_), with the same checks and panics: writes `src`
+    /// into `self` and bumps the version exactly once, without touching autograd state.
+    ///
+    /// Every public in-place operation writes its data with this function or
+    /// [`write_fill`](Tensor::write_fill), exactly once, and never through another public
+    /// in-place operation.
+    pub(crate) fn write_copy(&self, src: &Tensor) {
         let dst = self.data();
         let mut s = src.data();
         check_writable(&dst);
@@ -323,40 +346,33 @@ impl Tensor {
             (Device::Meta, _) => {}
             (Device::Cpu, Device::Cpu) => {
                 if dst.partially_overlaps(&s) {
-                    s = src.deep_clone().data();
+                    s = clone_data(&s);
                 }
                 // The version changes in the same critical section as the data.
                 cpu::exec(|| {
                     cpu::copy(&dst, &s);
                     dst.storage.bump_version();
                 });
-                return self;
+                return;
             }
             (_, Device::Meta) => panic!("Cannot copy out of meta tensor; no data!"),
             (d, sd) => panic!("copy from {sd} to {d} is not supported"),
         }
         dst.storage.bump_version();
-        self
     }
 
-    /// Sets every element to `value`.
-    pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
+    /// The data half of [`fill_`](Tensor::fill_), see [`write_copy`](Tensor::write_copy).
+    pub(crate) fn write_fill(&self, value: Scalar) {
         let dst = self.data();
         check_writable(&dst);
         if dst.device() == Device::Cpu {
             cpu::exec(|| {
-                cpu::fill(&dst, value.into());
+                cpu::fill(&dst, value);
                 dst.storage.bump_version();
             });
         } else {
             dst.storage.bump_version();
         }
-        self
-    }
-
-    /// Sets every element to zero.
-    pub fn zero_(&self) -> &Self {
-        self.fill_(0)
     }
 }
 

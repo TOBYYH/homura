@@ -303,7 +303,7 @@ impl Tensor {
             .chain(shape[dim + 1..].iter())
             .map(|&d| d as i64)
             .collect();
-        selected.view(new_shape)
+        selected.unsafe_view(new_shape)
     }
 
     fn select_positions(&self, dim: usize, index: &Tensor, allow_negative: bool) -> Tensor {

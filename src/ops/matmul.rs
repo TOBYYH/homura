@@ -1,8 +1,9 @@
 //! Matrix multiplication.
 
-use super::common_device;
+use super::{common_device, reshape_data};
 use crate::backend::cpu;
 use crate::shape::broadcast_shapes;
+use crate::tensor::{Layout, TensorData};
 use crate::{Device, Shape, Tensor};
 
 impl Tensor {
@@ -31,17 +32,19 @@ impl Tensor {
                 a.dtype, b.dtype
             );
         }
+        // The operands are rearranged as raw layouts rather than with the view operations, so
+        // that nothing but the result is recorded as a view or for autograd.
         let a2 = if da == 1 {
-            self.unsqueeze(0)
+            a.layout.unsqueeze(0)
         } else {
-            self.clone()
+            a.layout.clone()
         };
         let b2 = if db == 1 {
-            other.unsqueeze(-1)
+            b.layout.unsqueeze(1)
         } else {
-            other.clone()
+            b.layout.clone()
         };
-        let (sa, sb) = (a2.shape(), b2.shape());
+        let (sa, sb) = (&a2.shape, &b2.shape);
         let (m, k) = (sa[sa.len() - 2], sa[sa.len() - 1]);
         let (k2, n) = (sb[sb.len() - 2], sb[sb.len() - 1]);
         if k != k2 {
@@ -49,18 +52,22 @@ impl Tensor {
         }
         let batch = broadcast_shapes(&sa[..sa.len() - 2], &sb[..sb.len() - 2]);
         let batch_size = batch.num_elements();
-        let with = |tail: [usize; 2]| -> Vec<i64> {
-            batch.iter().chain(tail.iter()).map(|&d| d as i64).collect()
+        // Broadcasts the batch dimensions and merges them into one. That copies when they can't
+        // share a stride, as with the batch [2, 5] of `[2, 1, 3, 4] @ [1, 5, 4, 6]`, where the
+        // left operand has a stride of 0 inside it.
+        let batched = |data: &TensorData, layout: &Layout, rows: usize, cols: usize| {
+            let full: Shape = batch.iter().copied().chain([rows, cols]).collect();
+            let expanded = TensorData {
+                layout: layout.expand_to(&full),
+                ..data.clone()
+            };
+            reshape_data(&expanded, Shape::new(&[batch_size, rows, cols]))
         };
-        let a3 = a2
-            .expand(with([m, k]))
-            .reshape([batch_size as i64, m as i64, k as i64]);
-        let b3 = b2
-            .expand(with([k, n]))
-            .reshape([batch_size as i64, k as i64, n as i64]);
-        let out = Tensor::empty_on(Shape::new(&[batch_size, m, n]), a.dtype, device);
+        let a3 = batched(&a, &a2, m, k);
+        let b3 = batched(&b, &b2, k, n);
+        let out = Tensor::empty_on(Shape::new(&[batch_size, m, n]), a.dtype, device).data();
         if device == Device::Cpu {
-            cpu::matmul(&out.data(), &a3.data(), &b3.data());
+            cpu::matmul(&out, &a3, &b3);
         }
         let mut shape = batch.to_vec();
         if da > 1 {
@@ -69,7 +76,7 @@ impl Tensor {
         if db > 1 {
             shape.push(n);
         }
-        let shape: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
-        out.view(shape)
+        // The result is contiguous, so this never copies.
+        Tensor::from_data(reshape_data(&out, Shape::new(&shape)))
     }
 }

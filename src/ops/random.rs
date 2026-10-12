@@ -347,7 +347,8 @@ impl Tensor {
             self.device(),
             Dist::Uniform(from, to),
         );
-        self.copy_(&r)
+        self.write_copy(&r);
+        self
     }
 
     /// Fills `self` with samples from a normal distribution.
@@ -358,7 +359,8 @@ impl Tensor {
             self.device(),
             Dist::Normal(mean, std),
         );
-        self.copy_(&r)
+        self.write_copy(&r);
+        self
     }
 }
 

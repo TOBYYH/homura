@@ -85,6 +85,22 @@ impl Layout {
         is_contiguous(&self.shape, &self.strides)
     }
 
+    /// This layout with a dimension of size 1 inserted at position `dim` (at most the number of
+    /// dimensions).
+    pub fn unsqueeze(&self, dim: usize) -> Layout {
+        let mut l = self.clone();
+        // The stride of a size-1 dimension is never used to address memory; fall back to 1 in
+        // the unlikely case that PyTorch's choice doesn't fit.
+        let stride = if dim < l.shape.len() {
+            l.shape[dim].checked_mul(l.strides[dim]).unwrap_or(1)
+        } else {
+            1
+        };
+        l.shape.insert(dim, 1);
+        l.strides.insert(dim, stride);
+        l
+    }
+
     /// Broadcasts this layout to `shape` by giving new and size-1 dimensions a stride of 0.
     pub fn expand_to(&self, shape: &Shape) -> Layout {
         let n = shape.len();
@@ -296,11 +312,24 @@ impl Tensor {
         })
     }
 
-    /// A new tensor that shares this tensor's storage with a different layout.
+    /// A view of this tensor with `layout`, as the public view operations create it: unlike
+    /// [`with_layout`](Tensor::with_layout), the result records its root base (see `ViewInfo`),
+    /// so that it is known to share storage with it.
     ///
     /// # Panics
     ///
-    /// Panics if the layout reaches outside the storage. Every view is created here, so the CPU
+    /// Panics if the layout reaches outside the storage.
+    pub(crate) fn make_view(&self, layout: Layout) -> Tensor {
+        crate::autograd::view_of(self, layout)
+    }
+
+    /// A new tensor that shares this tensor's storage with a different layout, without being
+    /// recorded as a view of it: for an operation that reshapes a result it has just allocated,
+    /// see `unsafe_view`. The public view operations use [`make_view`](Tensor::make_view).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layout reaches outside the storage. `make_view` checks the same, so the CPU
     /// kernels can rely on all layouts lying inside their storage.
     pub(crate) fn with_layout(&self, layout: Layout) -> Tensor {
         let data = self.data();
@@ -427,11 +456,6 @@ impl Tensor {
 
     /// Copies the data into a new contiguous tensor (PyTorch's `x.clone()`).
     pub fn deep_clone(&self) -> Tensor {
-        let src = self.data();
-        let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
-        if src.device() == Device::Cpu {
-            cpu::copy(&out.data(), &src);
-        }
-        out
+        Tensor::from_data(crate::ops::clone_data(&self.data()))
     }
 }

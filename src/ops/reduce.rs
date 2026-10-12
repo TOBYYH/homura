@@ -1,6 +1,6 @@
 //! Reductions.
 
-use super::ReduceOp;
+use super::{ReduceOp, reshape_data};
 use crate::backend::cpu;
 use crate::shape::{Dims, dims_mask, normalize_dim};
 use crate::{DType, Device, Shape, Tensor};
@@ -63,11 +63,14 @@ fn arg_op(
     values: bool,
     name: &str,
 ) -> (Option<Tensor>, Tensor) {
-    let (x, dim, keepdim) = match dim {
-        Some(d) => (x.clone(), d, keepdim),
-        None => (x.reshape([-1]), 0, false),
-    };
     let src = x.data();
+    let (src, dim, keepdim) = match dim {
+        Some(d) => (src, d, keepdim),
+        None => {
+            let n = src.layout.num_elements();
+            (reshape_data(&src, Shape::new(&[n])), 0, false)
+        }
+    };
     let nd = src.layout.shape.len();
     let dim = normalize_dim(dim, nd);
     let size = if nd == 0 { 1 } else { src.layout.shape[dim] };

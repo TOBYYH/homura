@@ -18,7 +18,7 @@
 //! This project is in early development: only the CPU reference backend and the meta device are
 //! implemented, and the API is not stable yet.
 
-mod autograd;
+pub mod autograd;
 mod backend;
 mod defaults;
 mod device;

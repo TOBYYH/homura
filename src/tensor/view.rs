@@ -10,6 +10,18 @@ impl Tensor {
     /// A view with a different shape (one dimension may be `-1`). The memory layout must allow
     /// it without copying; [`reshape`](Tensor::reshape) copies when needed.
     pub fn view(&self, shape: impl IntoShapeSpec) -> Tensor {
+        self.make_view(self.view_layout(shape))
+    }
+
+    /// [`view`](Tensor::view) for a result that the calling operation has just allocated, like
+    /// PyTorch's `_unsafe_view`: the result is not recorded as a view, since no one else holds the
+    /// tensor whose storage it shares. Otherwise in-place operations on the result would be
+    /// treated as writes to a view.
+    pub(crate) fn unsafe_view(&self, shape: impl IntoShapeSpec) -> Tensor {
+        self.with_layout(self.view_layout(shape))
+    }
+
+    fn view_layout(&self, shape: impl IntoShapeSpec) -> Layout {
         let l = self.layout();
         let shape = infer_size(&shape.into_shape_spec(), l.num_elements());
         let Some(strides) = compute_view_strides(&l.shape, &l.strides, &shape) else {
@@ -18,11 +30,11 @@ impl Tensor {
                  dimension spans across two contiguous subspaces). Use .reshape(...) instead."
             );
         };
-        self.with_layout(Layout {
+        Layout {
             shape,
             strides,
             offset: l.offset,
-        })
+        }
     }
 
     /// A tensor with a different shape (one dimension may be `-1`): a view when the memory
@@ -31,12 +43,12 @@ impl Tensor {
         let l = self.layout();
         let shape = infer_size(&shape.into_shape_spec(), l.num_elements());
         match compute_view_strides(&l.shape, &l.strides, &shape) {
-            Some(strides) => self.with_layout(Layout {
+            Some(strides) => self.make_view(Layout {
                 shape,
                 strides,
                 offset: l.offset,
             }),
-            None => self.deep_clone().view(shape),
+            None => self.deep_clone().unsafe_view(shape),
         }
     }
 
@@ -65,7 +77,7 @@ impl Tensor {
             shape[i] = l.shape[d];
             strides[i] = l.strides[d];
         }
-        self.with_layout(Layout {
+        self.make_view(Layout {
             shape: Shape::new(&shape),
             strides: Strides::new(&strides),
             offset: l.offset,
@@ -79,12 +91,12 @@ impl Tensor {
         if n == 0 {
             normalize_dim(dim0, n);
             normalize_dim(dim1, n);
-            return self.with_layout(l);
+            return self.make_view(l);
         }
         let (a, b) = (normalize_dim(dim0, n), normalize_dim(dim1, n));
         l.shape.swap(a, b);
         l.strides.swap(a, b);
-        self.with_layout(l)
+        self.make_view(l)
     }
 
     /// A view broadcast to `shape`: size-1 dimensions may grow and new leading dimensions may be
@@ -115,7 +127,7 @@ impl Tensor {
                 spec[i] as usize
             };
         }
-        self.with_layout(l.expand_to(&Shape::new(&target)))
+        self.make_view(l.expand_to(&Shape::new(&target)))
     }
 
     /// [`expand`](Tensor::expand) to the shape of `other`.
@@ -141,7 +153,7 @@ impl Tensor {
     }
 
     fn keep_dims(&self, l: &Layout, keep: &[usize]) -> Tensor {
-        self.with_layout(Layout {
+        self.make_view(Layout {
             shape: keep.iter().map(|&d| l.shape[d]).collect(),
             strides: keep.iter().map(|&d| l.strides[d]).collect(),
             offset: l.offset,
@@ -150,18 +162,9 @@ impl Tensor {
 
     /// Inserts a dimension of size 1 at position `dim` (`-1` appends at the end).
     pub fn unsqueeze(&self, dim: i64) -> Tensor {
-        let mut l = self.layout();
+        let l = self.layout();
         let d = normalize_dim(dim, l.shape.len() + 1);
-        // The stride of a size-1 dimension is never used to address memory; fall back to 1 in
-        // the unlikely case that PyTorch's choice doesn't fit.
-        let stride = if d < l.shape.len() {
-            l.shape[d].checked_mul(l.strides[d]).unwrap_or(1)
-        } else {
-            1
-        };
-        l.shape.insert(d, 1);
-        l.strides.insert(d, stride);
-        self.with_layout(l)
+        self.make_view(l.unsqueeze(d))
     }
 
     /// The `length` elements along `dim` starting at `start` (negative values count from the
@@ -188,7 +191,7 @@ impl Tensor {
         }
         l.offset = l.offset_at(d, start);
         l.shape[d] = length;
-        self.with_layout(l)
+        self.make_view(l)
     }
 
     /// The slice at `index` along `dim`, with that dimension removed.
@@ -209,7 +212,7 @@ impl Tensor {
         l.offset = l.offset_at(d, index);
         l.shape.remove(d);
         l.strides.remove(d);
-        self.with_layout(l)
+        self.make_view(l)
     }
 
     /// A Python-style slice `start:end:step` along `dim`: bounds may be negative and are clamped
@@ -242,7 +245,7 @@ impl Tensor {
                 .checked_mul(step as usize)
                 .expect("slice stride overflows usize");
         }
-        self.with_layout(l)
+        self.make_view(l)
     }
 
     /// Merges dimensions `start_dim..=end_dim` into one.
@@ -281,8 +284,8 @@ impl Tensor {
         if shape.len() != stride.len() {
             panic!("mismatch in length of strides and shape");
         }
-        // `with_layout` checks that the view lies inside the storage.
-        self.with_layout(Layout {
+        // `make_view` checks that the view lies inside the storage.
+        self.make_view(Layout {
             shape,
             strides: Strides::new(&stride),
             offset: storage_offset,
@@ -295,6 +298,96 @@ impl Tensor {
             self.clone()
         } else {
             self.deep_clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DType, Device, NewAxis, Tensor};
+
+    /// Whether `t` is recorded as a view of the root `base`.
+    fn is_view_of(t: &Tensor, base: &Tensor) -> bool {
+        t.view_info()
+            .is_some_and(|v| v.base.is_same(base) && v.base_history_gen == 0)
+    }
+
+    #[test]
+    fn public_views_record_their_root_base() {
+        for device in [Device::Cpu, Device::Meta] {
+            let x = crate::zeros_with([2, 3, 4], device);
+            let views = [
+                ("view", x.view([6, 4])),
+                ("reshape", x.reshape([4, 6])),
+                ("flatten", x.flatten(0, 1)),
+                ("permute", x.permute([2, 0, 1])),
+                ("transpose", x.transpose(0, 2)),
+                ("expand", x.expand([5, 2, 3, 4])),
+                (
+                    "expand_as",
+                    x.expand_as(&crate::zeros_with([2, 2, 3, 4], device)),
+                ),
+                ("squeeze", x.squeeze()),
+                ("squeeze_dim", x.squeeze_dim(0)),
+                ("unsqueeze", x.unsqueeze(-1)),
+                ("narrow", x.narrow(1, 1, 2)),
+                ("select", x.select(0, 1)),
+                ("index", x.index((.., 1..3, NewAxis))),
+                ("as_strided", x.as_strided([2, 2], [1, 2], 1)),
+                ("split", x.split(1, 0)[1].clone()),
+                ("chunk", x.chunk(2, 2)[0].clone()),
+                ("contiguous of a view", x.narrow(0, 0, 1).contiguous()),
+                // Views of views record the root.
+                (
+                    "view of a view",
+                    x.transpose(0, 1).narrow(0, 1, 2).unsqueeze(1),
+                ),
+            ];
+            for (name, v) in &views {
+                assert!(is_view_of(v, &x), "{name} on {device}");
+            }
+        }
+        let s = crate::tensor(1.0);
+        for (name, v) in [
+            ("transpose", s.transpose(0, -1)),
+            ("view", s.view([1])),
+            ("reshape", s.reshape([1, 1])),
+            ("flatten", s.flatten(0, -1)),
+        ] {
+            assert!(is_view_of(&v, &s), "zero-dimensional {name}");
+        }
+    }
+
+    #[test]
+    fn fresh_results_are_not_views() {
+        let x = crate::rand([2, 3, 4]);
+        let t = x.transpose(0, 1);
+        let fresh = [
+            ("reshape that copies", t.reshape([-1])),
+            ("flatten that copies", t.flatten(0, -1)),
+            ("contiguous", t.contiguous()),
+            ("deep_clone", t.deep_clone()),
+            ("repeat", x.repeat([2, 1, 1])),
+            ("repeat once", x.repeat([1, 1, 1])),
+            ("tensor index", x.index((.., crate::tensor([[2i64, 0]])))),
+            ("index_select", x.index_select(1, &crate::tensor([0i64]))),
+            ("matmul", x.matmul(&crate::ones([4, 5]))),
+            ("matmul with a vector", x.matmul(&crate::ones([4]))),
+            ("dot", crate::ones([4]).matmul(&crate::ones([4]))),
+            ("broadcast matmul", t.matmul(&crate::ones([2, 1, 4, 5]))),
+            ("concat", crate::concat(&[&x, &x], 1)),
+            ("stack", crate::stack(&[&x, &x], 0)),
+            ("argmax", t.argmax()),
+            ("max", t.max()),
+            ("to", x.to(DType::F64)),
+            ("add", &t + 1.0),
+            ("eye", crate::eye(3)),
+            ("tensor", crate::tensor([[1.0, 2.0]])),
+            ("arange", crate::arange(4)),
+            ("zeros", crate::zeros([2, 2])),
+        ];
+        for (name, r) in &fresh {
+            assert!(r.view_info().is_none(), "{name}");
         }
     }
 }

@@ -292,6 +292,51 @@ fn run(c: &Case) -> bool {
             "i64_f32" | "bool_f32" | "f16_f32" => x().to(DType::F32),
             _ => return false,
         }),
+        "erf" => out(x().erf()),
+        "sign" => out(x().sign()),
+        "index_add" => {
+            let (idx, src) = (c.input("idx"), c.input("src"));
+            out(match op {
+                "dim1_i32" => x().index_add(-1, &idx, &src),
+                _ => x().index_add(0, &idx, &src),
+            })
+        }
+        "gather" => {
+            let idx = c.input("idx");
+            out(match op {
+                "dim1" | "int" => x().gather(1, &idx),
+                "dim0_smaller" => x().gather(0, &idx),
+                "i32_negative_dim" => x().gather(-1, &idx),
+                _ => return false,
+            })
+        }
+        "scatter_add" => {
+            let (idx, src) = (c.input("idx"), c.input("src"));
+            out(match op {
+                "dim0" | "f16" => x().scatter_add(0, &idx, &src),
+                "src_larger" | "int" => x().scatter_add(1, &idx, &src),
+                _ => return false,
+            })
+        }
+        "select_scatter" => {
+            let src = c.input("src");
+            out(match op {
+                "dim0" => x().select_scatter(&src, 0, 1),
+                "negative" => x().select_scatter(&src, -1, -1),
+                "cast" => x().select_scatter(&src, 0, 2),
+                _ => return false,
+            })
+        }
+        "slice_scatter" => {
+            let src = c.input("src");
+            out(match op {
+                "dim0" => x().slice_scatter(&src, 0, Some(1), Some(3), 1),
+                "step" => x().slice_scatter(&src, 1, None, None, 2),
+                "clamped" => x().slice_scatter(&src, 1, Some(-2), Some(100), 1),
+                "defaults" => x().slice_scatter(&src, 0, None, None, 1),
+                _ => return false,
+            })
+        }
         "sum_to_size" => out(x().sum_to_size(match op {
             "leading" => vec![3, 4],
             "ones" => vec![2, 1, 4],
@@ -386,6 +431,15 @@ const SHAPE: &[&str] = &[
     "view",
 ];
 const CREATE: &[&str] = &["create", "cast"];
+const BACKWARD_OPS: &[&str] = &[
+    "erf",
+    "sign",
+    "index_add",
+    "gather",
+    "scatter_add",
+    "select_scatter",
+    "slice_scatter",
+];
 
 #[test]
 fn unary_ops() {
@@ -417,9 +471,15 @@ fn creation_and_casting() {
     run_categories(CREATE);
 }
 
+/// The operators M1 adds because backward formulas need them.
+#[test]
+fn operators_of_backward_formulas() {
+    run_categories(BACKWARD_OPS);
+}
+
 #[test]
 fn every_golden_case_has_a_test() {
-    let known: Vec<&str> = [UNARY, BINARY, REDUCE, LINALG, SHAPE, CREATE].concat();
+    let known: Vec<&str> = [UNARY, BINARY, REDUCE, LINALG, SHAPE, CREATE, BACKWARD_OPS].concat();
     for case in golden().cases() {
         assert!(
             known.contains(&category(&case)),

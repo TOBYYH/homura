@@ -16,6 +16,7 @@ mod view;
 
 pub use create::*;
 pub use index::{Ellipsis, IndexItem, IndexSpec, NewAxis, TensorIndex};
+pub(crate) use view::{select_position, slice_bounds};
 
 /// An n-dimensional array with reference semantics, like a PyTorch tensor.
 ///
@@ -200,6 +201,33 @@ impl Layout {
         i.checked_mul(self.strides[dim])
             .and_then(|o| o.checked_add(self.offset))
             .expect("storage offset overflows usize")
+    }
+
+    /// This layout at index `i` along `dim`, with that dimension removed.
+    pub fn select(&self, dim: usize, i: usize) -> Layout {
+        let mut l = self.clone();
+        l.offset = l.offset_at(dim, i);
+        l.shape.remove(dim);
+        l.strides.remove(dim);
+        l
+    }
+
+    /// The `len` positions `start`, `start + step`, ... of this layout along `dim`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new stride doesn't fit in `usize`.
+    pub fn slice(&self, dim: usize, start: usize, len: usize, step: usize) -> Layout {
+        let mut l = self.clone();
+        l.offset = l.offset_at(dim, start);
+        l.shape[dim] = len;
+        // With fewer than two elements the stride is never used, and a huge step may not fit.
+        if len > 1 {
+            l.strides[dim] = l.strides[dim]
+                .checked_mul(step)
+                .expect("slice stride overflows usize");
+        }
+        l
     }
 
     /// Whether distinct indices of this layout might refer to the same storage element.

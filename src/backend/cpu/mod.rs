@@ -26,7 +26,7 @@ mod reduce;
 
 pub(crate) use iter::{Plan, walk_strides};
 pub(crate) use linalg::matmul;
-pub(crate) use misc::{flip, index_select, softmax, triangle};
+pub(crate) use misc::{flip, gather, index_add, index_select, scatter_add, softmax, triangle};
 pub(crate) use num::{Float, FloatElement, IntElement};
 pub(crate) use reduce::{arg_reduce, reduce, var};
 
@@ -358,10 +358,16 @@ pub(crate) fn unary(op: UnaryOp, out: &TensorData, src: &TensorData) {
     let dtype = src.dtype;
     match op {
         LogicalNot => dispatch_all!(dtype, T => map1::<T, bool>(out, src, |x| !x.to_bool())),
-        Neg | Abs | Relu if dtype.is_integral() => dispatch_int!(dtype, T => match op {
+        Sign if dtype == DType::Bool => map1::<bool, bool>(out, src, |x| x),
+        Neg | Abs | Relu | Sign if dtype.is_integral() => dispatch_int!(dtype, T => match op {
             Neg => map1::<T, T>(out, src, |x| x.wneg()),
             Abs => map1::<T, T>(out, src, |x| x.wabs()),
-            _ => map1::<T, T>(out, src, |x| if x > T::ZERO { x } else { T::ZERO }),
+            Relu => map1::<T, T>(out, src, |x| if x > T::ZERO { x } else { T::ZERO }),
+            _ => map1::<T, T>(out, src, |x| match x.cmp(&T::ZERO) {
+                std::cmp::Ordering::Greater => T::ONE,
+                std::cmp::Ordering::Less => T::ONE.wneg(),
+                std::cmp::Ordering::Equal => T::ZERO,
+            }),
         }),
         _ => dispatch_float!(dtype, T => {
             type C = <T as FloatElement>::C;
@@ -379,6 +385,16 @@ pub(crate) fn unary(op: UnaryOp, out: &TensorData, src: &TensorData) {
                 Neg => float_map!(|x| -x),
                 Abs => float_map!(|x| x.abs()),
                 Relu => float_map!(|x| if x.is_nan() || x > C::ZERO { x } else { C::ZERO }),
+                Sign => float_map!(|x| {
+                    // NaN and -0.0 give +0.0, as in PyTorch.
+                    if x > C::ZERO {
+                        one
+                    } else if x < C::ZERO {
+                        -one
+                    } else {
+                        C::ZERO
+                    }
+                }),
                 Exp => float_map!(|x| x.exp()),
                 Log => float_map!(|x| x.ln()),
                 Sqrt => float_map!(|x| x.sqrt()),
@@ -386,6 +402,7 @@ pub(crate) fn unary(op: UnaryOp, out: &TensorData, src: &TensorData) {
                 Reciprocal => float_map!(|x| one / x),
                 Sin => float_map!(|x| x.sin()),
                 Cos => float_map!(|x| x.cos()),
+                Erf => float_map!(|x| Float::erf(x)),
                 Tanh => float_map!(|x| x.tanh()),
                 Sigmoid => float_map!(|x| one / (one + (-x).exp())),
                 Silu => float_map!(|x| x / (one + (-x).exp())),

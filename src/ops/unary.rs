@@ -30,6 +30,8 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
             }
             dtype
         }
+        // Like PyTorch, the sign keeps integer and bool dtypes.
+        Sign => dtype,
         Silu | Gelu | GeluTanh => {
             if !dtype.is_floating_point() {
                 panic!("{op:?} is not implemented for {dtype} tensors");
@@ -62,6 +64,12 @@ impl Tensor {
     /// Absolute value.
     pub fn abs(&self) -> Tensor {
         unary_op(UnaryOp::Abs, self)
+    }
+
+    /// The sign of each element: `-1`, `0` or `1` in the dtype of `self`. As in PyTorch, NaN and
+    /// `-0.0` give `0.0`, and bool tensors are copied unchanged.
+    pub fn sign(&self) -> Tensor {
+        unary_op(UnaryOp::Sign, self)
     }
 
     /// `e^x`.
@@ -97,6 +105,11 @@ impl Tensor {
     /// Cosine.
     pub fn cos(&self) -> Tensor {
         unary_op(UnaryOp::Cos, self)
+    }
+
+    /// The error function `erf(x) = 2/√π ∫₀ˣ e^(−t²) dt`.
+    pub fn erf(&self) -> Tensor {
+        unary_op(UnaryOp::Erf, self)
     }
 
     /// Hyperbolic tangent.

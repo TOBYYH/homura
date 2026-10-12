@@ -7,6 +7,54 @@ use crate::shape::{
 };
 use crate::{Shape, Strides};
 
+/// The dimension and the position that `select(dim, index)` picks in a tensor of `shape`, with
+/// negative values counted from the end.
+///
+/// # Panics
+///
+/// Panics with PyTorch's messages if `shape` is zero-dimensional or `dim` or `index` is out of
+/// range.
+pub(crate) fn select_position(shape: &Shape, dim: i64, index: i64) -> (usize, usize) {
+    if shape.is_empty() {
+        panic!("select() cannot be applied to a 0-dim tensor.");
+    }
+    let d = normalize_dim(dim, shape.len());
+    let size = shape[d] as i64;
+    if index < -size || index >= size {
+        panic!(
+            "select(): index {index} out of range for tensor of size {shape:?} at dimension {d}"
+        );
+    }
+    (d, (if index < 0 { index + size } else { index }) as usize)
+}
+
+/// The Python-style slice `start:end:step` of a dimension of `size`: the start and end clamped
+/// into `0..=size` (negative values count from the end) and the number of positions.
+///
+/// # Panics
+///
+/// Panics if `step` is not positive.
+pub(crate) fn slice_bounds(
+    size: usize,
+    start: Option<i64>,
+    end: Option<i64>,
+    step: i64,
+) -> (usize, usize, usize) {
+    if step <= 0 {
+        panic!("slice step must be positive");
+    }
+    let size = size as i64;
+    let clamp = |v: i64| (if v < 0 { v + size } else { v }).clamp(0, size);
+    let start = clamp(start.unwrap_or(0));
+    let end = clamp(end.unwrap_or(size));
+    let len = if end > start {
+        (end - start - 1) / step + 1
+    } else {
+        0
+    };
+    (start as usize, end as usize, len as usize)
+}
+
 impl Tensor {
     /// A view with a different shape (one dimension may be `-1`). The memory layout must allow
     /// it without copying; [`reshape`](Tensor::reshape) copies when needed.
@@ -189,7 +237,7 @@ impl Tensor {
     /// The `length` elements along `dim` starting at `start` (negative values count from the
     /// end).
     pub fn narrow(&self, dim: i64, start: i64, length: usize) -> Tensor {
-        let mut l = self.layout();
+        let l = self.layout();
         if l.shape.is_empty() {
             panic!("narrow() cannot be applied to a 0-dim tensor.");
         }
@@ -208,33 +256,18 @@ impl Tensor {
         {
             panic!("start ({start}) + length ({length}) exceeds dimension size ({size}).");
         }
-        l.offset = l.offset_at(d, start);
-        l.shape[d] = length;
-        let out = self.make_view(l);
-        record_unimplemented("narrow", &[Some(self)], &out);
+        let out = self.make_view(l.slice(d, start, length, 1));
+        // As in PyTorch, where `narrow` is a slice.
+        formulas::slice(self, d, start, start + length, 1, &out);
         out
     }
 
     /// The slice at `index` along `dim`, with that dimension removed.
     pub fn select(&self, dim: i64, index: i64) -> Tensor {
-        let mut l = self.layout();
-        if l.shape.is_empty() {
-            panic!("select() cannot be applied to a 0-dim tensor.");
-        }
-        let d = normalize_dim(dim, l.shape.len());
-        let size = l.shape[d] as i64;
-        if index < -size || index >= size {
-            panic!(
-                "select(): index {index} out of range for tensor of size {:?} at dimension {d}",
-                l.shape
-            );
-        }
-        let index = if index < 0 { index + size } else { index } as usize;
-        l.offset = l.offset_at(d, index);
-        l.shape.remove(d);
-        l.strides.remove(d);
-        let out = self.make_view(l);
-        record_unimplemented("select", &[Some(self)], &out);
+        let l = self.layout();
+        let (d, index) = select_position(&l.shape, dim, index);
+        let out = self.make_view(l.select(d, index));
+        formulas::select(self, d, index, &out);
         out
     }
 
@@ -247,29 +280,10 @@ impl Tensor {
         end: Option<i64>,
         step: i64,
     ) -> Tensor {
-        if step <= 0 {
-            panic!("slice step must be positive");
-        }
-        let mut l = self.layout();
-        let size = l.shape[dim] as i64;
-        let clamp = |v: i64| (if v < 0 { v + size } else { v }).clamp(0, size);
-        let start = clamp(start.unwrap_or(0));
-        let end = clamp(end.unwrap_or(size));
-        let len = if end > start {
-            (end - start - 1) / step + 1
-        } else {
-            0
-        };
-        l.offset = l.offset_at(dim, start as usize);
-        l.shape[dim] = len as usize;
-        // With fewer than two elements the stride is never used, and a huge step may not fit.
-        if len > 1 {
-            l.strides[dim] = l.strides[dim]
-                .checked_mul(step as usize)
-                .expect("slice stride overflows usize");
-        }
-        let out = self.make_view(l);
-        record_unimplemented("slice", &[Some(self)], &out);
+        let l = self.layout();
+        let (start, end, len) = slice_bounds(l.shape[dim], start, end, step);
+        let out = self.make_view(l.slice(dim, start, len, step as usize));
+        formulas::slice(self, dim, start, end, step as usize, &out);
         out
     }
 
@@ -296,6 +310,10 @@ impl Tensor {
 
     /// A view with an explicit shape, strides and storage offset (in elements).
     ///
+    /// Gradients flow back to the elements of `self` that the view shares with it. Computing the
+    /// gradient of a `self` whose elements overlap in memory (an expanded tensor, for example) is
+    /// not supported yet and panics when a backward pass reaches it.
+    ///
     /// # Panics
     ///
     /// Panics if the view would reach outside the storage.
@@ -315,7 +333,7 @@ impl Tensor {
             strides: Strides::new(&stride),
             offset: storage_offset,
         });
-        record_unimplemented("as_strided", &[Some(self)], &out);
+        formulas::as_strided(self, &out);
         out
     }
 

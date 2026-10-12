@@ -7,16 +7,20 @@
 //! [`NotImplemented`] through `record_unimplemented`.
 
 mod binary;
+mod index;
 mod misc;
 mod reduce;
 mod unary;
 mod view;
 
 pub(crate) use binary::binary;
+pub(crate) use index::{
+    gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
+};
 pub(crate) use misc::{deep_clone, to_copy};
 pub(crate) use reduce::{sum, sum_to_size};
 pub(crate) use unary::unary;
-pub(crate) use view::{expand, unsafe_view, view};
+pub(crate) use view::{as_strided, expand, select, slice, unsafe_view, view};
 
 use super::node::{ApplyContext, Node};
 use crate::Tensor;

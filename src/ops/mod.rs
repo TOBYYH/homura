@@ -15,6 +15,7 @@ mod matmul;
 mod overload;
 mod random;
 mod reduce;
+mod scatter;
 mod shape_ops;
 mod unary;
 
@@ -30,6 +31,7 @@ pub use unary::GeluApproximate;
 pub(crate) enum UnaryOp {
     Neg,
     Abs,
+    Sign,
     Relu,
     Exp,
     Log,
@@ -38,6 +40,7 @@ pub(crate) enum UnaryOp {
     Reciprocal,
     Sin,
     Cos,
+    Erf,
     Tanh,
     Sigmoid,
     Silu,
@@ -258,7 +261,7 @@ mod tests {
     #[test]
     fn each_in_place_op_bumps_the_version_exactly_once() {
         type InPlace = fn(&Tensor);
-        let ops: [(&str, InPlace); 22] = [
+        let ops: [(&str, InPlace); 24] = [
             ("add_ scalar", |x| {
                 x.add_(1.0);
             }),
@@ -327,6 +330,14 @@ mod tests {
             }),
             ("add_ through a transposed view", |x| {
                 x.transpose(0, 1).add_(1.0);
+            }),
+            ("index_add_", |x| {
+                let index = crate::zeros_with([1], (DType::I64, x.device()));
+                x.index_add_(1, &index, &crate::ones_with([1, 1], x.device()));
+            }),
+            ("scatter_add_", |x| {
+                let index = crate::zeros_with([1, 1], (DType::I64, x.device()));
+                x.scatter_add_(1, &index, &crate::ones_with([1, 1], x.device()));
             }),
         ];
         for device in [Device::Cpu, Device::Meta] {

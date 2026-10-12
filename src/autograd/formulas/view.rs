@@ -3,6 +3,7 @@
 use super::only;
 use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::record;
+use crate::tensor::Layout;
 use crate::{Shape, Tensor};
 
 /// Records the backward node of `out = x.view(..)`, also used by `reshape` when it can share
@@ -23,6 +24,40 @@ pub(crate) fn unsafe_view(x: &Tensor, out: &Tensor) {
 pub(crate) fn expand(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| ExpandBackward0 { self_shape });
+}
+
+/// Records the backward node of `out = x.select(dim, index)`, with `index` already wrapped.
+pub(crate) fn select(x: &Tensor, dim: usize, index: usize, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| SelectBackward0 {
+        self_shape: x.shape(),
+        dim,
+        index,
+    });
+}
+
+/// Records the backward node of `out`, the positions `start..end` with `step` of `x` along
+/// `dim`, which slicing and `narrow` view. `start` and `end` are already clamped into the
+/// dimension.
+pub(crate) fn slice(x: &Tensor, dim: usize, start: usize, end: usize, step: usize, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| SliceBackward0 {
+        self_shape: x.shape(),
+        dim,
+        start,
+        end,
+        step,
+    });
+}
+
+/// Records the backward node of `out = x.as_strided(..)`.
+pub(crate) fn as_strided(x: &Tensor, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| {
+        let input = x.layout();
+        AsStridedBackward0 {
+            input_overlaps: input.may_overlap_internally(),
+            input,
+            output: out.layout(),
+        }
+    });
 }
 
 /// `x.view(shape)`: the gradient reshaped back to the shape of `x`.
@@ -68,4 +103,116 @@ impl Node for ExpandBackward0 {
     fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
         vec![Some(only(grads).sum_to_size(&self.self_shape))]
     }
+}
+
+/// `x.select(dim, index)`: the gradient written into that slice of zeros of the shape of `x`.
+struct SelectBackward0 {
+    self_shape: Shape,
+    dim: usize,
+    index: usize,
+}
+
+impl Node for SelectBackward0 {
+    fn name(&self) -> &'static str {
+        "SelectBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let g = only(grads);
+        let zeros = g.new_zeros(&self.self_shape);
+        vec![Some(zeros.select_scatter(
+            &g,
+            self.dim as i64,
+            self.index as i64,
+        ))]
+    }
+}
+
+/// A slice of `x` (slicing or `narrow`): the gradient written into that slice of zeros of the
+/// shape of `x`.
+struct SliceBackward0 {
+    self_shape: Shape,
+    dim: usize,
+    start: usize,
+    end: usize,
+    step: usize,
+}
+
+impl Node for SliceBackward0 {
+    fn name(&self) -> &'static str {
+        "SliceBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let g = only(grads);
+        let zeros = g.new_zeros(&self.self_shape);
+        vec![Some(zeros.slice_scatter(
+            &g,
+            self.dim as i64,
+            Some(self.start as i64),
+            Some(self.end as i64),
+            self.step as i64,
+        ))]
+    }
+}
+
+/// `x.as_strided(..)`: each element of the gradient goes to the storage element it views, and
+/// `x` collects what reaches its own elements. The gradient is summed by storage offset into a
+/// buffer that covers both `x` and the output, which `x`'s layout then reads back. An input with
+/// elements that overlap in memory would need its sums divided among them, which isn't supported
+/// yet.
+struct AsStridedBackward0 {
+    input: Layout,
+    output: Layout,
+    input_overlaps: bool,
+}
+
+impl Node for AsStridedBackward0 {
+    fn name(&self) -> &'static str {
+        "AsStridedBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        if self.input_overlaps {
+            panic!(
+                "computing the gradient of as_strided for an input whose elements overlap in \
+                 memory is not supported yet; deep_clone() the input first"
+            );
+        }
+        let g = only(grads);
+        let (Some((in_start, in_end)), Some((out_start, out_end))) =
+            (self.input.span(), self.output.span())
+        else {
+            // Either side is empty: nothing reaches `x`.
+            return vec![Some(g.new_zeros(&self.input.shape))];
+        };
+        let first = in_start.min(out_start);
+        let len = in_end.max(out_end) - first;
+        let positions = storage_positions(&self.output, first);
+        let index = Tensor::from_host(&positions, Shape::new(&[positions.len()]), g.device());
+        let sums = g.new_zeros([len]).index_add(0, &index, &g.reshape([-1]));
+        vec![Some(sums.as_strided(
+            &self.input.shape[..],
+            &self.input.strides[..],
+            in_start - first,
+        ))]
+    }
+}
+
+/// The storage offset of every element of `l` in row-major order, relative to `first`.
+fn storage_positions(l: &Layout, first: usize) -> Vec<i64> {
+    let mut positions = Vec::with_capacity(l.num_elements());
+    let mut index = vec![0; l.shape.len()];
+    for _ in 0..l.num_elements() {
+        let offset: usize = index.iter().zip(l.strides.iter()).map(|(i, s)| i * s).sum();
+        positions.push((l.offset + offset - first) as i64);
+        for d in (0..index.len()).rev() {
+            index[d] += 1;
+            if index[d] < l.shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    positions
 }

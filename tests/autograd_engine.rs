@@ -853,15 +853,9 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
         ("transpose", x.transpose(0, 1)),
         ("unsqueeze", x.unsqueeze(0)),
         ("squeeze", x.unsqueeze(0).squeeze()),
-        ("narrow", x.narrow(0, 1, 1)),
-        ("select", x.select(0, 1)),
-        ("slice", x.index((.., 0..1))),
-        ("as_strided", x.as_strided([2], [1], 0)),
         ("concat", homura::concat(&[&x, &w], 0)),
         ("flip", x.flip(0)),
         ("triu", x.triu(0)),
-        ("index_select", x.index_select(0, &index)),
-        ("index", x.index((&index,))),
         ("addmm", x.addmm(&w, &w, 0.0, 1.0)),
     ];
     for (op, out) in cases {

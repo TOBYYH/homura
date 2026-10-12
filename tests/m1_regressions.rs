@@ -8,7 +8,7 @@ use std::f64::consts::FRAC_2_SQRT_PI;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use homura::autograd::{self, GradOptions};
+use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
 use homura::{DType, Device, Tensor};
 
 const DEVICES: [Device; 2] = [Device::Cpu, Device::Meta];
@@ -486,4 +486,52 @@ fn half_product_gradients_keep_their_scalar_factor_in_f32() {
         let g = grads(&(c * &x), &[&x], &homura::ones_like(&x), false).remove(0);
         assert_eq!((g.dtype(), g.device()), (dtype, Device::Meta));
     }
+}
+
+#[test]
+fn gradient_checks_run_in_grad_mode_whatever_the_callers_mode() {
+    let x = Tensor::from_slice(&[0.5f64], [1]);
+    x.requires_grad_(true);
+    let square = |xs: &[Tensor]| vec![&xs[0] * &xs[0]];
+    // Right first derivative (x), wrong second one: the factor is a constant to the backward
+    // pass.
+    let cut = |xs: &[Tensor]| vec![&xs[0] * xs[0].detach()];
+    let options = GradcheckOptions::default;
+    for enabled in [true, false] {
+        let _mode = homura::set_grad_enabled(enabled);
+        assert!(gradcheck(square, &[&x], options()).is_ok(), "{enabled}");
+        assert!(gradgradcheck(square, &[&x], options()).is_ok(), "{enabled}");
+        assert!(gradcheck(cut, &[&x], options()).is_err(), "{enabled}");
+        assert!(gradgradcheck(cut, &[&x], options()).is_err(), "{enabled}");
+        // The caller's mode is restored after a success, a failure and a panic.
+        assert_eq!(homura::is_grad_enabled(), enabled);
+        let message = panic_message(|| {
+            let _ = gradgradcheck(|_: &[Tensor]| panic!("failed"), &[&x], options());
+        });
+        assert_eq!(message, "failed");
+        assert_eq!(homura::is_grad_enabled(), enabled);
+    }
+    // A function without differentiable outputs still passes in any mode.
+    let _mode = homura::no_grad();
+    let constant = |xs: &[Tensor]| vec![homura::zeros_like(&xs[0])];
+    assert!(gradgradcheck(constant, &[&x], options()).is_ok());
+}
+
+#[test]
+fn gradient_checks_never_count_a_finite_derivative_close_to_an_infinite_one() {
+    // The outputs, ±1e308, are finite, but their difference overflows: the numerical derivative
+    // is infinite and the analytical one, without a graph, zero.
+    let x = Tensor::from_slice(&[0.0f64], [1]);
+    x.requires_grad_(true);
+    let options = GradcheckOptions {
+        eps: 1.0,
+        ..Default::default()
+    };
+    let message = gradcheck(|xs| vec![xs[0].detach() * 1e308], &[&x], options)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("is 0 analytically but inf numerically"),
+        "{message}"
+    );
 }

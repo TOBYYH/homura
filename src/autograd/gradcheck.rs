@@ -5,7 +5,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::{GradOptions, grad, no_grad};
+use super::{GradOptions, enable_grad, grad, no_grad};
 use crate::{DType, Device, Tensor};
 
 /// Options of [`gradcheck`] and [`gradgradcheck`], with PyTorch's defaults, which suit `F64`
@@ -61,13 +61,14 @@ fn error(message: String) -> Result<(), GradcheckError> {
 /// variables: each must be an `F64` tensor on the CPU whose elements don't overlap in memory and
 /// that shares no storage with another input. The other inputs, such as index tensors, are
 /// constants. For every floating point output and every variable, the Jacobian computed by
-/// backward passes must match the numerical one: `|analytical - numerical| <= atol + rtol *
-/// |numerical|` for each entry. Outputs that don't require grad have no graph, so their
+/// backward passes must match the numerical one: equal, or both finite with `|analytical -
+/// numerical| <= atol + rtol * |numerical|`, for each entry (`torch.allclose`). Outputs that don't require grad have no graph, so their
 /// analytical Jacobians are zero, and they are compared too (PyTorch skips them unless no
 /// output requires grad).
 ///
-/// Each numerical derivative perturbs one element in place, in no-grad mode, and runs `f` again
-/// from scratch. The element is restored afterwards, also when `f` panics. Check only points
+/// The check runs `f` in grad mode, whatever the caller's mode, which is restored when it
+/// returns or panics; PyTorch's fails in no-grad mode instead. Each numerical derivative
+/// perturbs one element in place, in no-grad mode, and runs `f` again from scratch. The element is restored afterwards, also when `f` panics. Check only points
 /// where `f` is smooth: ties, kinks, non-finite values and the like need exact reference values
 /// instead. Tensors without elements have empty Jacobians, so check their gradients' shapes and
 /// values separately.
@@ -93,6 +94,7 @@ pub fn gradcheck(
     inputs: &[&Tensor],
     options: GradcheckOptions,
 ) -> Result<(), GradcheckError> {
+    let _grad_mode = enable_grad();
     let inputs: Vec<Tensor> = inputs.iter().map(|&t| t.clone()).collect();
     let variables = check_inputs(&inputs);
     let base = f(&inputs);
@@ -188,7 +190,8 @@ pub fn gradcheck(
 /// as further variables. Differentiating with respect to `g` too catches a formula that cuts
 /// `g` off its graph. A gradient without a graph has zero analytical derivatives and is still
 /// compared with the numerical ones (see [`gradcheck`]). The inputs follow the rules of
-/// [`gradcheck`].
+/// [`gradcheck`], and `f` runs in grad mode like there. A function none of whose outputs
+/// requires grad has no gradients to check and passes.
 ///
 /// # Panics
 ///
@@ -198,6 +201,8 @@ pub fn gradgradcheck(
     inputs: &[&Tensor],
     options: GradcheckOptions,
 ) -> Result<(), GradcheckError> {
+    // Without grad mode, no output would require grad and nothing would be checked.
+    let _grad_mode = enable_grad();
     let xs: Vec<Tensor> = inputs.iter().map(|&t| t.clone()).collect();
     let variables = check_inputs(&xs);
     let outputs = f(&xs);
@@ -333,9 +338,13 @@ fn analytical_row(out: &Tensor, k: usize, variables: &[&Tensor]) -> Vec<Vec<f64>
 }
 
 /// Whether the analytical derivative `a` is close enough to the numerical one `n`, as in
-/// `torch.allclose(a, n)`: equal infinities are close, NaN is never close.
+/// `torch.allclose(a, n)`: equal values are close, including equal infinities; otherwise both
+/// must be finite and within the tolerances. NaN is never close.
 fn close(a: f64, n: f64, options: &GradcheckOptions) -> bool {
-    a == n || (a - n).abs() <= options.atol + options.rtol * n.abs()
+    a == n
+        || (a.is_finite()
+            && n.is_finite()
+            && (a - n).abs() <= options.atol + options.rtol * n.abs())
 }
 
 /// The multi-index of element `j` of `shape` in row-major order.
@@ -526,6 +535,37 @@ mod tests {
         let (a, n) = reported_values(&message);
         assert_eq!(a, 0.0);
         assert!((n - 2.0).abs() < 1e-6, "{message}");
+    }
+
+    #[test]
+    fn closeness_follows_torch_allclose() {
+        // Each `(analytical, numerical, close)` as `torch.allclose` with the default tolerances
+        // decides in the reference build.
+        let (inf, nan) = (f64::INFINITY, f64::NAN);
+        let cases = [
+            (1.0, 1.0, true),
+            (inf, inf, true),
+            (-inf, -inf, true),
+            (-inf, inf, false),
+            (0.0, inf, false),
+            (1e308, inf, false),
+            (inf, 1e308, false),
+            (nan, nan, false),
+            (nan, 1.0, false),
+            (1.0, nan, false),
+            (0.0, 0.5e-5, true),
+            (0.0, 2e-5, false),
+            (1.0005, 1.0, true),
+            (1.002, 1.0, false),
+            (1e308, -1e308, false),
+        ];
+        for (a, n, expected) in cases {
+            assert_eq!(
+                close(a, n, &GradcheckOptions::default()),
+                expected,
+                "{a} {n}"
+            );
+        }
     }
 
     #[test]

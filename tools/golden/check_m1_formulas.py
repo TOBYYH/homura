@@ -631,4 +631,42 @@ for dtype, product, erf in [
     upstream = torch.tensor([1.0, 3.0, -2.0], dtype=dtype)
     assert torch.autograd.grad(x.erf(), x, upstream)[0].tolist() == erf
 
+# gradcheck compares like torch.allclose: equal values (also equal infinities) are close,
+# otherwise both must be finite and within atol + rtol * |numerical|; NaN never is.
+for a, n, expected in [
+    (1.0, 1.0, True),
+    (inf, inf, True),
+    (-inf, -inf, True),
+    (-inf, inf, False),
+    (0.0, inf, False),
+    (1e308, inf, False),
+    (inf, 1e308, False),
+    (math.nan, math.nan, False),
+    (math.nan, 1.0, False),
+    (1.0, math.nan, False),
+    (0.0, 0.5e-5, True),
+    (0.0, 2e-5, False),
+    (1.0005, 1.0, True),
+    (1.002, 1.0, False),
+    (1e308, -1e308, False),
+]:
+    t = lambda v: torch.tensor([v], dtype=torch.float64)  # noqa: E731
+    assert torch.allclose(t(a), t(n), rtol=1e-3, atol=1e-5) == expected, (a, n)
+x = torch.tensor([0.0], dtype=torch.float64, requires_grad=True)
+assert not torch.autograd.gradcheck(lambda x: x.detach() * 1e308, (x,), eps=1.0, raise_exception=False)
+# PyTorch's checks don't pass in no-grad mode, not even for a correct function: gradcheck fails
+# and gradgradcheck raises. homura's turn grad mode on for the check instead.
+x = torch.tensor([0.5], dtype=torch.float64, requires_grad=True)
+with torch.no_grad():
+    assert not torch.autograd.gradcheck(lambda x: x * x, (x,), raise_exception=False)
+    try:
+        torch.autograd.gradgradcheck(lambda x: x * x, (x,), raise_exception=False)
+        raise AssertionError("expected an error")
+    except TypeError:
+        pass
+    assert not torch.is_grad_enabled()
+assert torch.autograd.gradcheck(lambda x: x * x, (x,))
+assert torch.autograd.gradgradcheck(lambda x: x * x, (x,))
+assert not torch.autograd.gradgradcheck(lambda x: x * x.detach(), (x,), raise_exception=False)
+
 print("check_m1_formulas: all reference checks passed")

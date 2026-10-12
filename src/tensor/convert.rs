@@ -54,11 +54,13 @@ impl Tensor {
         if dtype == data.dtype && device == data.device() {
             return self.clone();
         }
-        match (data.device(), device) {
+        let out = match (data.device(), device) {
             (_, Device::Meta) => Tensor::empty_on(data.layout.shape.clone(), dtype, device),
             (Device::Meta, _) => panic!("Cannot copy out of meta tensor; no data!"),
             (Device::Cpu, Device::Cpu) => Tensor::from_data(cast_data(&data, dtype)),
             (from, to) => panic!("copying from {from} to {to} is not supported yet"),
-        }
+        };
+        crate::autograd::formulas::to_copy(self, &out);
+        out
     }
 }

@@ -195,7 +195,11 @@ fn in_place_changes_to_saved_tensors_are_reported_like_pytorch() {
         (&non_leaf, "[f32 [3]], which is output 0 of ScaleBackward0,"),
     ] {
         let consumer = node(vec![gradient_edge(&w)], Some(saved), &w);
-        saved.add_(1.0);
+        // In no-grad mode, where in-place operations are allowed on leaves that require grad.
+        {
+            let _no_grad = crate::no_grad();
+            saved.add_(1.0);
+        }
         let message = panic_message(|| {
             consumer.call(vec![Some(t(&[1., 1., 1.]))]);
         });
@@ -353,7 +357,10 @@ fn saved_non_leaves_detached_in_place_refuse_to_be_used() {
     // Modified in place, then detached: the detach error comes first, as in PyTorch.
     let d = non_leaf();
     let saved = SavedTensor::input(&d);
-    d.add_(1.0);
+    {
+        let _no_grad = crate::no_grad();
+        d.add_(1.0);
+    }
     rebase_history(&d, node(vec![gradient_edge(&w)], None, &w), 0);
     assert!(unpack_message(&saved).starts_with("one of the variables needed"));
     detach_history(&d);

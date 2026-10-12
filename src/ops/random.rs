@@ -341,6 +341,7 @@ impl Tensor {
     /// Panics if `from > to`, or if `from`, `to` or `to - from` is not a finite value of the dtype
     /// of `self`, as PyTorch does.
     pub fn uniform_(&self, from: f64, to: f64) -> &Self {
+        crate::autograd::check_inplace(self, &[]);
         let r = random_tensor(
             self.shape(),
             self.dtype(),
@@ -353,6 +354,7 @@ impl Tensor {
 
     /// Fills `self` with samples from a normal distribution.
     pub fn normal_(&self, mean: f64, std: f64) -> &Self {
+        crate::autograd::check_inplace(self, &[]);
         let r = random_tensor(
             self.shape(),
             self.dtype(),

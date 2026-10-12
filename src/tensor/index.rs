@@ -296,7 +296,7 @@ impl Tensor {
             );
         }
         let flat = index.reshape([-1]).to(DType::I64).contiguous();
-        let selected = self.select_positions(dim, &flat, true);
+        let selected = self.select_positions("index", dim, &flat, true);
         let shape = self.shape();
         let new_shape: Vec<i64> = shape[..dim]
             .iter()
@@ -307,7 +307,13 @@ impl Tensor {
         selected.unsafe_view(new_shape)
     }
 
-    fn select_positions(&self, dim: usize, index: &Tensor, allow_negative: bool) -> Tensor {
+    fn select_positions(
+        &self,
+        op: &'static str,
+        dim: usize,
+        index: &Tensor,
+        allow_negative: bool,
+    ) -> Tensor {
         let (src, idx) = (self.data(), index.data());
         let device = crate::ops::common_device([&src, &idx]);
         let mut shape = src.layout.shape.clone();
@@ -316,6 +322,7 @@ impl Tensor {
         if device == Device::Cpu {
             cpu::index_select(&out.data(), &src, dim, &idx, allow_negative);
         }
+        crate::autograd::record_unimplemented(op, &[Some(self)], &out);
         out
     }
 
@@ -337,6 +344,6 @@ impl Tensor {
         }
         let d = crate::shape::normalize_dim(dim, nd);
         let flat = index.reshape([-1]).to(DType::I64).contiguous();
-        self.select_positions(d, &flat, false)
+        self.select_positions("index_select", d, &flat, false)
     }
 }

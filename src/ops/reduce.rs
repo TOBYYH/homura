@@ -1,8 +1,9 @@
 //! Reductions.
 
 use super::{ReduceOp, reshape_data};
+use crate::autograd::record_unimplemented;
 use crate::backend::cpu;
-use crate::shape::{Dims, dims_mask, normalize_dim};
+use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
 use crate::{DType, Device, Shape, Tensor};
 
 /// The shape left after reducing the dimensions in `mask`.
@@ -115,54 +116,115 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
 impl Tensor {
     /// Sum of all elements. Integer and bool inputs give `I64`.
     pub fn sum(&self) -> Tensor {
-        reduce_op(ReduceOp::Sum, self, &[], false, "sum")
+        let out = reduce_op(ReduceOp::Sum, self, &[], false, "sum");
+        crate::autograd::formulas::sum(self, &out);
+        out
     }
 
     /// Sum over `dims` (all dimensions if empty).
     pub fn sum_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
-        reduce_op(ReduceOp::Sum, self, &dims.into_dims(), keepdim, "sum")
+        let out = reduce_op(ReduceOp::Sum, self, &dims.into_dims(), keepdim, "sum");
+        record_unimplemented("sum_dim", &[Some(self)], &out);
+        out
+    }
+
+    /// Sums `self` down to `size`, the reverse of broadcasting a tensor of shape `size` to the
+    /// shape of `self` (`torch.Tensor.sum_to_size`): leading dimensions that `size` lacks, and
+    /// dimensions where `size` has 1 and `self` doesn't, are summed. Returns `self` itself when
+    /// nothing is summed; otherwise integer and bool inputs give `I64`, like
+    /// [`sum`](Tensor::sum).
+    ///
+    /// ```
+    /// let x = homura::ones([2, 3]);
+    /// assert_eq!(x.sum_to_size([3]).to_vec::<f32>(), [2.0, 2.0, 2.0]);
+    /// assert_eq!(x.sum_to_size([2, 1]).to_vec::<f32>(), [3.0, 3.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` doesn't broadcast to the shape of `self`.
+    pub fn sum_to_size(&self, size: impl IntoShape) -> Tensor {
+        let size = size.into_shape();
+        let shape = self.shape();
+        let lead = shape.len().checked_sub(size.len());
+        let expandable = lead.is_some_and(|lead| {
+            size.iter()
+                .zip(&shape[lead..])
+                .all(|(&s, &n)| s == n || s == 1)
+        });
+        let Some(lead) = lead.filter(|_| expandable) else {
+            panic!("size {{{size:?}}} is not expandable to size {{{shape:?}}}.");
+        };
+        let dims: Vec<i64> = (0..shape.len())
+            .filter(|&d| d < lead || (size[d - lead] == 1 && shape[d] != 1))
+            .map(|d| d as i64)
+            .collect();
+        if dims.is_empty() {
+            return self.clone();
+        }
+        // Summed with kept dimensions, so the result has the elements of `size` in order.
+        let summed = reduce_op(ReduceOp::Sum, self, &dims, true, "sum");
+        let out = Tensor::from_data(reshape_data(&summed.data(), size));
+        crate::autograd::formulas::sum_to_size(self, &out);
+        out
     }
 
     /// Mean of all elements. Requires a floating point input.
     pub fn mean(&self) -> Tensor {
-        reduce_op(ReduceOp::Mean, self, &[], false, "mean")
+        let out = reduce_op(ReduceOp::Mean, self, &[], false, "mean");
+        record_unimplemented("mean", &[Some(self)], &out);
+        out
     }
 
     /// Mean over `dims` (all dimensions if empty).
     pub fn mean_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
-        reduce_op(ReduceOp::Mean, self, &dims.into_dims(), keepdim, "mean")
+        let out = reduce_op(ReduceOp::Mean, self, &dims.into_dims(), keepdim, "mean");
+        record_unimplemented("mean_dim", &[Some(self)], &out);
+        out
     }
 
     /// Product of all elements. Integer and bool inputs give `I64`.
     pub fn prod(&self) -> Tensor {
-        reduce_op(ReduceOp::Prod, self, &[], false, "prod")
+        let out = reduce_op(ReduceOp::Prod, self, &[], false, "prod");
+        record_unimplemented("prod", &[Some(self)], &out);
+        out
     }
 
     /// Product along `dim`.
     pub fn prod_dim(&self, dim: i64, keepdim: bool) -> Tensor {
-        reduce_op(ReduceOp::Prod, self, &[dim], keepdim, "prod")
+        let out = reduce_op(ReduceOp::Prod, self, &[dim], keepdim, "prod");
+        record_unimplemented("prod_dim", &[Some(self)], &out);
+        out
     }
 
     /// Largest element (NaN if there is any).
     pub fn max(&self) -> Tensor {
-        reduce_op(ReduceOp::Max, self, &[], false, "max")
+        let out = reduce_op(ReduceOp::Max, self, &[], false, "max");
+        record_unimplemented("max", &[Some(self)], &out);
+        out
     }
 
     /// Largest values along `dim` and their indices (the first one on ties).
     pub fn max_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, true, true, "max");
-        (v.unwrap(), i)
+        let v = v.unwrap();
+        record_unimplemented("max_dim", &[Some(self)], &v);
+        (v, i)
     }
 
     /// Smallest element (NaN if there is any).
     pub fn min(&self) -> Tensor {
-        reduce_op(ReduceOp::Min, self, &[], false, "min")
+        let out = reduce_op(ReduceOp::Min, self, &[], false, "min");
+        record_unimplemented("min", &[Some(self)], &out);
+        out
     }
 
     /// Smallest values along `dim` and their indices (the first one on ties).
     pub fn min_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, false, true, "min");
-        (v.unwrap(), i)
+        let v = v.unwrap();
+        record_unimplemented("min_dim", &[Some(self)], &v);
+        (v, i)
     }
 
     /// Index of the largest element in the flattened tensor.
@@ -188,22 +250,30 @@ impl Tensor {
     /// Variance of all elements, dividing by `N - correction` (`correction = 1` is Bessel's
     /// correction, PyTorch's default).
     pub fn var(&self, correction: i64) -> Tensor {
-        var_op(self, &[], correction, false, false)
+        let out = var_op(self, &[], correction, false, false);
+        record_unimplemented("var", &[Some(self)], &out);
+        out
     }
 
     /// Variance over `dims` (all dimensions if empty).
     pub fn var_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
-        var_op(self, &dims.into_dims(), correction, keepdim, false)
+        let out = var_op(self, &dims.into_dims(), correction, keepdim, false);
+        record_unimplemented("var_dim", &[Some(self)], &out);
+        out
     }
 
     /// Standard deviation of all elements; see [`var`](Tensor::var).
     pub fn std(&self, correction: i64) -> Tensor {
-        var_op(self, &[], correction, false, true)
+        let out = var_op(self, &[], correction, false, true);
+        record_unimplemented("std", &[Some(self)], &out);
+        out
     }
 
     /// Standard deviation over `dims` (all dimensions if empty).
     pub fn std_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
-        var_op(self, &dims.into_dims(), correction, keepdim, true)
+        let out = var_op(self, &dims.into_dims(), correction, keepdim, true);
+        record_unimplemented("std_dim", &[Some(self)], &out);
+        out
     }
 
     /// Whether all elements are nonzero, as a zero-dimensional `Bool` tensor (`U8` for `U8`

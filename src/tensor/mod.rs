@@ -45,6 +45,17 @@ struct TensorImpl {
     view: Option<ViewInfo>,
 }
 
+/// A weak handle to a tensor, for tests that check when tensors are destroyed.
+#[cfg(test)]
+pub(crate) struct WeakTensor(std::sync::Weak<TensorImpl>);
+
+#[cfg(test)]
+impl WeakTensor {
+    pub(crate) fn upgrade(&self) -> Option<Tensor> {
+        self.0.upgrade().map(Tensor)
+    }
+}
+
 /// How a tensor's elements are placed in its storage.
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
@@ -432,19 +443,17 @@ impl Tensor {
         self.dtype().size_in_bytes()
     }
 
-    /// Whether gradients are computed for this tensor. Always `false` until operations record
-    /// the backward graph.
-    pub fn requires_grad(&self) -> bool {
-        crate::autograd::requires_grad(self)
-    }
-
     /// Whether `self` and `other` are handles to the same tensor (Python's `x is y`).
     pub fn is_same(&self, other: &Tensor) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn downgrade(&self) -> WeakTensor {
+        WeakTensor(Arc::downgrade(&self.0))
+    }
+
     /// The version counter of the storage, bumped by every in-place operation.
-    #[allow(dead_code)]
     pub(crate) fn version(&self) -> u64 {
         self.0
             .data
@@ -454,8 +463,11 @@ impl Tensor {
             .version()
     }
 
-    /// Copies the data into a new contiguous tensor (PyTorch's `x.clone()`).
+    /// Copies the data into a new contiguous tensor (PyTorch's `x.clone()`). The copy is
+    /// connected to the graph: gradients flow through it to `self`.
     pub fn deep_clone(&self) -> Tensor {
-        Tensor::from_data(crate::ops::clone_data(&self.data()))
+        let out = Tensor::from_data(crate::ops::clone_data(&self.data()));
+        crate::autograd::formulas::deep_clone(self, &out);
+        out
     }
 }

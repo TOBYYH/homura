@@ -83,12 +83,12 @@ pub(crate) fn grad_accumulator(t: &Tensor) -> NodeRef {
     {
         return node;
     }
-    let node = NodeBuilder::new(vec![]).build(
+    let node = NodeBuilder::new(vec![]).build_accumulator(
         AccumulateGrad {
             leaf: t.clone(),
             serial: Mutex::new(()),
         },
-        vec![input_meta],
+        input_meta,
     );
     meta.grad_accumulator = Some(node.downgrade());
     node

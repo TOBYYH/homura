@@ -20,6 +20,8 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     if src.device() == Device::Cpu {
         cpu::softmax(&out.data(), &src, dim, log);
     }
+    let name = if log { "log_softmax" } else { "softmax" };
+    crate::autograd::record_unimplemented(name, &[Some(x)], &out);
     out
 }
 
@@ -92,7 +94,11 @@ fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scala
 /// ignored when `beta` is zero (so NaN in it does not propagate), as PyTorch's `add*` operations
 /// do. `input` must still have the dtype and device of `product` and broadcast to its shape,
 /// whatever `beta` is. The coefficients are converted to the dtype first, see [`coefficient`].
+///
+/// `op` names the operation for autograd: with `beta` zero, `input` still needs a zero gradient,
+/// which isn't implemented yet.
 fn scaled_sum(
+    op: &'static str,
     input: &Tensor,
     product: Tensor,
     beta: Scalar,
@@ -116,6 +122,12 @@ fn scaled_sum(
         product.mul(alpha)
     };
     if beta.to_f64() == 0.0 {
+        if crate::autograd::needs_grad(&[Some(input)]) {
+            // The value ignores `input`, but its gradient must be zeros rather than missing.
+            let out = Tensor::from_data(product.data());
+            crate::autograd::record_unimplemented(op, &[Some(input), Some(&product)], &out);
+            return out;
+        }
         return product;
     }
     let scaled = if beta.to_f64() == 1.0 {
@@ -166,6 +178,7 @@ impl Tensor {
         check_dims(mat1, 2, "mat1");
         check_dims(mat2, 2, "mat2");
         scaled_sum(
+            "addmm",
             self,
             mat1.matmul(mat2),
             beta.into(),
@@ -185,6 +198,7 @@ impl Tensor {
         check_dims(mat, 2, "mat");
         check_dims(vec, 1, "vec");
         scaled_sum(
+            "addmv",
             self,
             mat.matmul(vec),
             beta.into(),
@@ -222,6 +236,7 @@ impl Tensor {
         // Cast before multiplication so a wider self also widens the product computation.
         let outer = vec1.to(dtype).unsqueeze(1).mul(vec2.to(dtype).unsqueeze(0));
         scaled_sum(
+            "addr",
             &input,
             outer,
             beta.into(),
@@ -248,6 +263,7 @@ impl Tensor {
             );
         }
         scaled_sum(
+            "baddbmm",
             self,
             batch1.matmul(batch2),
             beta.into(),
@@ -277,6 +293,7 @@ impl Tensor {
         // input dtype would.
         let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
         scaled_sum(
+            "addbmm",
             self,
             product,
             beta.into(),
@@ -328,6 +345,7 @@ impl Tensor {
 
     /// In-place [`addcmul`](Tensor::addcmul).
     pub fn addcmul_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
+        crate::autograd::check_inplace(self, &[Some(tensor1), Some(tensor2)]);
         let result = self.addcmul(tensor1, tensor2, value);
         self.assign_result(&result);
         self
@@ -335,6 +353,7 @@ impl Tensor {
 
     /// In-place [`addcdiv`](Tensor::addcdiv).
     pub fn addcdiv_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
+        crate::autograd::check_inplace(self, &[Some(tensor1), Some(tensor2)]);
         let result = self.addcdiv(tensor1, tensor2, value);
         self.assign_result(&result);
         self
@@ -342,6 +361,12 @@ impl Tensor {
 
     /// In-place [`lerp`](Tensor::lerp).
     pub fn lerp_(&self, end: &Tensor, weight: impl Into<Operand>) -> &Self {
+        let weight = weight.into();
+        let weight_tensor = match &weight {
+            Operand::Tensor(w) => Some(w),
+            Operand::Scalar(_) => None,
+        };
+        crate::autograd::check_inplace(self, &[Some(end), weight_tensor]);
         let result = self.lerp(end, weight);
         self.assign_result(&result);
         self

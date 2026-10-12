@@ -49,6 +49,7 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
     if src.device() == Device::Cpu {
         cpu::unary(op, &out.data(), &cast_data(&src, compute));
     }
+    crate::autograd::formulas::unary(op, x, &out);
     out
 }
 

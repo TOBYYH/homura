@@ -29,8 +29,11 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     }
     let dtype = rt.result();
     let parts: Vec<_> = all.iter().filter(|t| t.layout.shape != [0]).collect();
+    let inputs: Vec<Option<&Tensor>> = tensors.iter().map(|t| Some(t.borrow())).collect();
     let Some(first) = parts.first() else {
-        return Tensor::empty_on(Shape::new(&[0]), dtype, device);
+        let out = Tensor::empty_on(Shape::new(&[0]), dtype, device);
+        crate::autograd::record_unimplemented("concat", &inputs, &out);
+        return out;
     };
     let nd = first.layout.shape.len();
     if nd == 0 {
@@ -74,6 +77,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
             start += n;
         }
     }
+    crate::autograd::record_unimplemented("concat", &inputs, &out);
     out
 }
 
@@ -171,6 +175,8 @@ impl Tensor {
         if src.device() == Device::Cpu {
             cpu::triangle(&out.data(), &src, diagonal, upper);
         }
+        let name = if upper { "triu" } else { "tril" };
+        crate::autograd::record_unimplemented(name, &[Some(self)], &out);
         out
     }
 
@@ -232,6 +238,7 @@ impl Tensor {
         if src.device() == Device::Cpu {
             cpu::flip(&out.data(), &src, &mask);
         }
+        crate::autograd::record_unimplemented("flip", &[Some(self)], &out);
         out
     }
 }

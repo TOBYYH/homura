@@ -14,10 +14,10 @@ enum Resolved {
 }
 
 impl Resolved {
-    fn new(o: Operand) -> Resolved {
+    fn new(o: &Operand) -> Resolved {
         match o {
             Operand::Tensor(t) => Resolved::Tensor(t.data()),
-            Operand::Scalar(s) => Resolved::Scalar(s),
+            Operand::Scalar(s) => Resolved::Scalar(*s),
         }
     }
 
@@ -58,7 +58,7 @@ fn device_of(operands: &[&Resolved]) -> Device {
 /// `op(lhs, rhs)` with broadcasting and type promotion. At least one operand must be a tensor.
 pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
     use BinaryOp::*;
-    let (a, b) = (Resolved::new(lhs), Resolved::new(rhs));
+    let (a, b) = (Resolved::new(&lhs), Resolved::new(&rhs));
     let device = device_of(&[&a, &b]);
     let mut rt = ResultType::new();
     a.add_to(&mut rt);
@@ -99,7 +99,16 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
         let bd = b.materialize(compute, device, &shape);
         cpu::binary(op, &out.data(), &ad, &bd);
     }
+    crate::autograd::formulas::binary(op, &lhs, &rhs, &out);
     out
+}
+
+/// The tensor of an operand, `None` for a scalar.
+fn tensor_of(o: &Operand) -> Option<&Tensor> {
+    match o {
+        Operand::Tensor(t) => Some(t),
+        Operand::Scalar(_) => None,
+    }
 }
 
 /// Selects elements from `x` where `condition` is true and from `y` elsewhere (`torch.where`).
@@ -116,7 +125,8 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
             cond.dtype
         );
     }
-    let (x, y) = (Resolved::new(x.into()), Resolved::new(y.into()));
+    let (x_operand, y_operand) = (x.into(), y.into());
+    let (x, y) = (Resolved::new(&x_operand), Resolved::new(&y_operand));
     let mut devices = vec![&cond];
     devices.extend(x.tensor());
     devices.extend(y.tensor());
@@ -138,6 +148,8 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
             &y.materialize(dtype, device, &shape),
         );
     }
+    let inputs = [tensor_of(&x_operand), tensor_of(&y_operand)];
+    crate::autograd::record_unimplemented("where", &inputs, &out);
     out
 }
 
@@ -147,6 +159,8 @@ impl Tensor {
     }
 
     fn binary_(&self, op: BinaryOp, other: impl Into<Operand>) -> &Self {
+        let other = other.into();
+        crate::autograd::check_inplace(self, &[tensor_of(&other)]);
         let result = self.binary(op, other);
         self.assign_result(&result);
         self
@@ -256,21 +270,43 @@ impl Tensor {
     /// Clamps every element into `[min, max]`; the bounds may be tensors or scalars. Equivalent
     /// to `self.maximum(min).minimum(max)`, so NaN propagates and `min > max` gives `max`.
     pub fn clamp(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> Tensor {
-        self.maximum(min).minimum(max)
+        let (min, max) = (min.into(), max.into());
+        // Computed without recording the two steps: clamp gets a node of its own.
+        let out = {
+            let _no_grad = crate::no_grad();
+            self.maximum(min.clone()).minimum(max.clone())
+        };
+        let inputs = [Some(self), tensor_of(&min), tensor_of(&max)];
+        crate::autograd::record_unimplemented("clamp", &inputs, &out);
+        out
     }
 
     /// Clamps every element to at least `min`.
     pub fn clamp_min(&self, min: impl Into<Operand>) -> Tensor {
-        self.maximum(min)
+        let min = min.into();
+        let out = {
+            let _no_grad = crate::no_grad();
+            self.maximum(min.clone())
+        };
+        crate::autograd::record_unimplemented("clamp_min", &[Some(self), tensor_of(&min)], &out);
+        out
     }
 
     /// Clamps every element to at most `max`.
     pub fn clamp_max(&self, max: impl Into<Operand>) -> Tensor {
-        self.minimum(max)
+        let max = max.into();
+        let out = {
+            let _no_grad = crate::no_grad();
+            self.minimum(max.clone())
+        };
+        crate::autograd::record_unimplemented("clamp_max", &[Some(self), tensor_of(&max)], &out);
+        out
     }
 
     /// In-place [`clamp`](Tensor::clamp).
     pub fn clamp_(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> &Self {
+        let (min, max) = (min.into(), max.into());
+        crate::autograd::check_inplace(self, &[tensor_of(&min), tensor_of(&max)]);
         let result = self.clamp(min, max);
         self.assign_result(&result);
         self
@@ -301,6 +337,8 @@ impl Tensor {
 
     /// In-place [`masked_fill`](Tensor::masked_fill).
     pub fn masked_fill_(&self, mask: &Tensor, value: impl Into<Operand>) -> &Self {
+        let value = value.into();
+        crate::autograd::check_inplace(self, &[Some(mask), tensor_of(&value)]);
         let result = self.masked_fill(mask, value);
         self.assign_result(&result);
         self
@@ -314,18 +352,21 @@ impl Tensor {
     /// be proven to occupy distinct memory (an expanded tensor, for example), or if `src` is a
     /// meta tensor and `self` is not.
     pub fn copy_(&self, src: &Tensor) -> &Self {
+        crate::autograd::check_inplace(self, &[Some(src)]);
         self.write_copy(src);
         self
     }
 
     /// Sets every element to `value`.
     pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
+        crate::autograd::check_inplace(self, &[]);
         self.write_fill(value.into());
         self
     }
 
     /// Sets every element to zero.
     pub fn zero_(&self) -> &Self {
+        crate::autograd::check_inplace(self, &[]);
         self.write_fill(0.into());
         self
     }

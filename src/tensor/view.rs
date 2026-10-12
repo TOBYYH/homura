@@ -1,6 +1,7 @@
 //! Operations that return views sharing the storage of the input.
 
 use super::{Layout, Tensor};
+use crate::autograd::{formulas, record_unimplemented};
 use crate::shape::{
     Dims, IntoShape, IntoShapeSpec, compute_view_strides, dims_mask, infer_size, normalize_dim,
 };
@@ -10,15 +11,19 @@ impl Tensor {
     /// A view with a different shape (one dimension may be `-1`). The memory layout must allow
     /// it without copying; [`reshape`](Tensor::reshape) copies when needed.
     pub fn view(&self, shape: impl IntoShapeSpec) -> Tensor {
-        self.make_view(self.view_layout(shape))
+        let out = self.make_view(self.view_layout(shape));
+        formulas::view(self, &out);
+        out
     }
 
     /// [`view`](Tensor::view) for a result that the calling operation has just allocated, like
     /// PyTorch's `_unsafe_view`: the result is not recorded as a view, since no one else holds the
     /// tensor whose storage it shares. Otherwise in-place operations on the result would be
-    /// treated as writes to a view.
+    /// treated as writes to a view. It is still differentiable: gradients flow through it.
     pub(crate) fn unsafe_view(&self, shape: impl IntoShapeSpec) -> Tensor {
-        self.with_layout(self.view_layout(shape))
+        let out = self.with_layout(self.view_layout(shape));
+        formulas::unsafe_view(self, &out);
+        out
     }
 
     fn view_layout(&self, shape: impl IntoShapeSpec) -> Layout {
@@ -43,11 +48,15 @@ impl Tensor {
         let l = self.layout();
         let shape = infer_size(&shape.into_shape_spec(), l.num_elements());
         match compute_view_strides(&l.shape, &l.strides, &shape) {
-            Some(strides) => self.make_view(Layout {
-                shape,
-                strides,
-                offset: l.offset,
-            }),
+            Some(strides) => {
+                let out = self.make_view(Layout {
+                    shape,
+                    strides,
+                    offset: l.offset,
+                });
+                formulas::view(self, &out);
+                out
+            }
             None => self.deep_clone().unsafe_view(shape),
         }
     }
@@ -77,11 +86,13 @@ impl Tensor {
             shape[i] = l.shape[d];
             strides[i] = l.strides[d];
         }
-        self.make_view(Layout {
+        let out = self.make_view(Layout {
             shape: Shape::new(&shape),
             strides: Strides::new(&strides),
             offset: l.offset,
-        })
+        });
+        record_unimplemented("permute", &[Some(self)], &out);
+        out
     }
 
     /// Swaps two dimensions.
@@ -91,12 +102,14 @@ impl Tensor {
         if n == 0 {
             normalize_dim(dim0, n);
             normalize_dim(dim1, n);
-            return self.make_view(l);
+        } else {
+            let (a, b) = (normalize_dim(dim0, n), normalize_dim(dim1, n));
+            l.shape.swap(a, b);
+            l.strides.swap(a, b);
         }
-        let (a, b) = (normalize_dim(dim0, n), normalize_dim(dim1, n));
-        l.shape.swap(a, b);
-        l.strides.swap(a, b);
-        self.make_view(l)
+        let out = self.make_view(l);
+        record_unimplemented("transpose", &[Some(self)], &out);
+        out
     }
 
     /// A view broadcast to `shape`: size-1 dimensions may grow and new leading dimensions may be
@@ -127,7 +140,9 @@ impl Tensor {
                 spec[i] as usize
             };
         }
-        self.make_view(l.expand_to(&Shape::new(&target)))
+        let out = self.make_view(l.expand_to(&Shape::new(&target)));
+        formulas::expand(self, &out);
+        out
     }
 
     /// [`expand`](Tensor::expand) to the shape of `other`.
@@ -139,7 +154,7 @@ impl Tensor {
     pub fn squeeze(&self) -> Tensor {
         let l = self.layout();
         let keep: Vec<usize> = (0..l.shape.len()).filter(|&d| l.shape[d] != 1).collect();
-        self.keep_dims(&l, &keep)
+        self.keep_dims("squeeze", &l, &keep)
     }
 
     /// Removes the given dimensions if they have size 1 (others are left alone, like PyTorch).
@@ -149,22 +164,26 @@ impl Tensor {
         let keep: Vec<usize> = (0..l.shape.len())
             .filter(|&d| !(mask[d] && l.shape[d] == 1))
             .collect();
-        self.keep_dims(&l, &keep)
+        self.keep_dims("squeeze_dim", &l, &keep)
     }
 
-    fn keep_dims(&self, l: &Layout, keep: &[usize]) -> Tensor {
-        self.make_view(Layout {
+    fn keep_dims(&self, op: &'static str, l: &Layout, keep: &[usize]) -> Tensor {
+        let out = self.make_view(Layout {
             shape: keep.iter().map(|&d| l.shape[d]).collect(),
             strides: keep.iter().map(|&d| l.strides[d]).collect(),
             offset: l.offset,
-        })
+        });
+        record_unimplemented(op, &[Some(self)], &out);
+        out
     }
 
     /// Inserts a dimension of size 1 at position `dim` (`-1` appends at the end).
     pub fn unsqueeze(&self, dim: i64) -> Tensor {
         let l = self.layout();
         let d = normalize_dim(dim, l.shape.len() + 1);
-        self.make_view(l.unsqueeze(d))
+        let out = self.make_view(l.unsqueeze(d));
+        record_unimplemented("unsqueeze", &[Some(self)], &out);
+        out
     }
 
     /// The `length` elements along `dim` starting at `start` (negative values count from the
@@ -191,7 +210,9 @@ impl Tensor {
         }
         l.offset = l.offset_at(d, start);
         l.shape[d] = length;
-        self.make_view(l)
+        let out = self.make_view(l);
+        record_unimplemented("narrow", &[Some(self)], &out);
+        out
     }
 
     /// The slice at `index` along `dim`, with that dimension removed.
@@ -212,7 +233,9 @@ impl Tensor {
         l.offset = l.offset_at(d, index);
         l.shape.remove(d);
         l.strides.remove(d);
-        self.make_view(l)
+        let out = self.make_view(l);
+        record_unimplemented("select", &[Some(self)], &out);
+        out
     }
 
     /// A Python-style slice `start:end:step` along `dim`: bounds may be negative and are clamped
@@ -245,7 +268,9 @@ impl Tensor {
                 .checked_mul(step as usize)
                 .expect("slice stride overflows usize");
         }
-        self.make_view(l)
+        let out = self.make_view(l);
+        record_unimplemented("slice", &[Some(self)], &out);
+        out
     }
 
     /// Merges dimensions `start_dim..=end_dim` into one.
@@ -285,11 +310,13 @@ impl Tensor {
             panic!("mismatch in length of strides and shape");
         }
         // `make_view` checks that the view lies inside the storage.
-        self.make_view(Layout {
+        let out = self.make_view(Layout {
             shape,
             strides: Strides::new(&stride),
             offset: storage_offset,
-        })
+        });
+        record_unimplemented("as_strided", &[Some(self)], &out);
+        out
     }
 
     /// `self` if it is already contiguous, otherwise a contiguous copy.

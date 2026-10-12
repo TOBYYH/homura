@@ -82,6 +82,10 @@ pub(crate) struct NodeCell {
 
 static NEXT_SEQUENCE_NR: AtomicU64 = AtomicU64::new(0);
 
+/// Identifies a node while a backward pass holds references to it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct NodeKey(usize);
+
 impl NodeCell {
     /// Moves out every node reference this cell owns. References that were the last ones yield
     /// their cells, which the caller destroys in turn.
@@ -127,6 +131,11 @@ impl NodeRef {
         Arc::ptr_eq(self.arc(), other.arc())
     }
 
+    /// A key that identifies the node for as long as this reference keeps it alive.
+    pub fn key(&self) -> NodeKey {
+        NodeKey(Arc::as_ptr(self.arc()) as usize)
+    }
+
     pub fn downgrade(&self) -> WeakNodeRef {
         WeakNodeRef(Arc::downgrade(self.arc()))
     }
@@ -156,18 +165,37 @@ impl NodeRef {
         }
     }
 
+    /// [`call_masked`](NodeRef::call_masked) computing the gradients of all edges.
+    #[cfg(test)]
+    pub fn call(&self, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        self.call_masked(grads, None)
+    }
+
     /// Runs the formula on the gradients of the forward outputs and returns the gradients for
     /// the edges, with `None` wherever there is no edge.
+    ///
+    /// With a `mask`, only the gradients of the edges whose entry is true are computed: the
+    /// formula sees the others as not needing a gradient ([`ApplyContext::needs_input_grad`])
+    /// and they come back as `None`. The engine uses this to skip the branches that don't lead
+    /// to the inputs `autograd::grad` asked for, without changing the node, which other graphs
+    /// and passes may share.
     ///
     /// No lock is held while the formula runs. If it panics, the node stays structurally valid
     /// and is destroyed normally; it can run again unless its saved tensors have been released.
     ///
     /// # Panics
     ///
-    /// Panics if `grads` doesn't have one entry per forward output, or if the formula returns
-    /// the wrong number of gradients.
-    pub fn call(&self, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+    /// Panics if `grads` doesn't have one entry per forward output, if `mask` doesn't have one
+    /// entry per edge, or if the formula returns the wrong number of gradients.
+    pub fn call_masked(
+        &self,
+        grads: Vec<Option<Tensor>>,
+        mask: Option<&[bool]>,
+    ) -> Vec<Option<Tensor>> {
         let cell = self.cell();
+        if let Some(mask) = mask {
+            assert_eq!(mask.len(), cell.next_edges.len(), "one mask entry per edge");
+        }
         assert_eq!(
             grads.len(),
             cell.input_meta.len(),
@@ -179,7 +207,9 @@ impl NodeRef {
         if grads.iter().all(Option::is_none) {
             return vec![None; cell.next_edges.len()];
         }
-        let mut out = cell.formula.apply(&ApplyContext { node: self }, grads);
+        let mut out = cell
+            .formula
+            .apply(&ApplyContext { node: self, mask }, grads);
         if out.len() != cell.next_edges.len() {
             panic!(
                 "function {} returned an incorrect number of gradients (expected {}, got {})",
@@ -188,8 +218,8 @@ impl NodeRef {
                 out.len()
             );
         }
-        for (grad, edge) in out.iter_mut().zip(&cell.next_edges) {
-            if edge.is_none() {
+        for (i, (grad, edge)) in out.iter_mut().zip(&cell.next_edges).enumerate() {
+            if edge.is_none() || mask.is_some_and(|m| !m[i]) {
                 *grad = None;
             }
         }
@@ -246,6 +276,8 @@ impl fmt::Debug for WeakNodeRef {
 /// What a running formula can reach: its saved tensors and which inputs need gradients.
 pub(crate) struct ApplyContext<'a> {
     node: &'a NodeRef,
+    /// The edges this call computes, `None` for all of them.
+    mask: Option<&'a [bool]>,
 }
 
 impl ApplyContext<'_> {
@@ -259,10 +291,10 @@ impl ApplyContext<'_> {
         self.node.cell().saved[id.0].unpack(self.node)
     }
 
-    /// Whether input `i` of the forward operation needs a gradient. Formulas skip the work for
-    /// inputs that don't.
+    /// Whether input `i` of the forward operation needs a gradient in this call: it has an edge
+    /// and the engine wants its gradient. Formulas skip the work for inputs that don't.
     pub fn needs_input_grad(&self, i: usize) -> bool {
-        self.node.cell().next_edges[i].is_some()
+        self.node.cell().next_edges[i].is_some() && self.mask.is_none_or(|m| m[i])
     }
 
     /// The running node. Formulas don't get it, so that they can't release saved tensors.
@@ -287,6 +319,12 @@ impl NodeBuilder {
         }
     }
 
+    /// Whether input `i` has an edge, so that the formula may have to compute its gradient.
+    /// Recording code saves the tensors a gradient needs only when this is true.
+    pub fn needs_grad(&self, i: usize) -> bool {
+        self.next_edges[i].is_some()
+    }
+
     /// Saves a tensor that is not an output of this node, usually an input.
     pub fn save(&mut self, t: &Tensor) -> SavedId {
         self.push(SavedTensor::input(t))
@@ -305,12 +343,78 @@ impl NodeBuilder {
 
     /// Finishes the node; `input_meta` describes each output of the forward operation.
     pub fn build(self, formula: impl Node, input_meta: Vec<InputMeta>) -> NodeRef {
+        let sequence_nr = NEXT_SEQUENCE_NR.fetch_add(1, Ordering::Relaxed);
+        self.build_with(sequence_nr, formula, input_meta)
+    }
+
+    /// Finishes the accumulator of a leaf. Like PyTorch's, it gets the largest sequence number,
+    /// so that the engine runs it, and frees the gradient it receives, as soon as it is ready.
+    pub fn build_accumulator(self, formula: impl Node, input_meta: InputMeta) -> NodeRef {
+        self.build_with(u64::MAX, formula, vec![input_meta])
+    }
+
+    fn build_with(
+        self,
+        sequence_nr: u64,
+        formula: impl Node,
+        input_meta: Vec<InputMeta>,
+    ) -> NodeRef {
         NodeRef(Some(Arc::new(NodeCell {
-            sequence_nr: NEXT_SEQUENCE_NR.fetch_add(1, Ordering::Relaxed),
+            sequence_nr,
             formula: Box::new(formula),
             next_edges: self.next_edges,
             input_meta,
             saved: self.saved.into_boxed_slice(),
         })))
+    }
+}
+
+/// The backward node that computed a tensor, PyTorch's `grad_fn`, or the accumulator of a leaf
+/// reached through [`next_functions`](GradFn::next_functions). An opaque handle for inspecting
+/// the graph; nodes can't be run through it.
+///
+/// ```
+/// let x = homura::ones([2]);
+/// x.requires_grad_(true);
+/// let y = (&x * 2.0).sum();
+/// let grad_fn = y.grad_fn().unwrap();
+/// assert_eq!(grad_fn.name(), "SumBackward0");
+/// let (mul, _) = grad_fn.next_functions()[0].clone().unwrap();
+/// assert_eq!(mul.name(), "MulBackward0");
+/// ```
+#[derive(Clone)]
+pub struct GradFn(pub(crate) NodeRef);
+
+impl GradFn {
+    /// The name PyTorch gives this kind of node, such as `"MulBackward0"` or `"AccumulateGrad"`.
+    /// Operations whose derivative is not implemented yet record a `"NotImplemented"` node,
+    /// which fails when a backward pass runs it.
+    pub fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    /// Where the gradients computed by this node go, one entry per input of the forward
+    /// operation: the next node and which of its inputs the gradient is, or `None` where the
+    /// input needs no gradient.
+    pub fn next_functions(&self) -> Vec<Option<(GradFn, usize)>> {
+        self.0
+            .next_edges()
+            .iter()
+            .map(|e| {
+                e.as_ref()
+                    .map(|e| (GradFn(e.node.clone()), e.input_nr as usize))
+            })
+            .collect()
+    }
+
+    /// Whether `self` and `other` are handles to the same node (Python's `a is b`).
+    pub fn is_same(&self, other: &GradFn) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
+impl fmt::Debug for GradFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{}>", self.name())
     }
 }

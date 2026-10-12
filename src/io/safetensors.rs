@@ -205,7 +205,13 @@ pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
                 "can't save meta tensor {name:?}: it has no data"
             )));
         }
-        let c = t.contiguous().data();
+        // Made contiguous at the data level, so that saving records nothing for autograd.
+        let c = t.data();
+        let c = if c.layout.is_contiguous() {
+            c
+        } else {
+            crate::ops::clone_data(&c)
+        };
         let mut raw = cpu::read_bytes(&c);
         to_from_le(&mut raw, c.dtype.size_in_bytes());
         if i > 0 {

@@ -292,6 +292,17 @@ fn run(c: &Case) -> bool {
             "i64_f32" | "bool_f32" | "f16_f32" => x().to(DType::F32),
             _ => return false,
         }),
+        "sum_to_size" => out(x().sum_to_size(match op {
+            "leading" => vec![3, 4],
+            "ones" => vec![2, 1, 4],
+            "mixed" => vec![3, 1],
+            "scalar" => vec![],
+            "same" => vec![2, 3, 4],
+            "int" => vec![1, 5],
+            "empty" => vec![1, 3],
+            "f16" => vec![4],
+            _ => return false,
+        })),
         _ => return false,
     }
     c.assert_all_used();
@@ -345,6 +356,7 @@ const REDUCE: &[&str] = &[
     "int",
     "reduce_f16",
     "reduce_bf16",
+    "sum_to_size",
 ];
 const LINALG: &[&str] = &[
     "matmul",

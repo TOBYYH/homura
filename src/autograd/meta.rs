@@ -6,7 +6,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use super::node::{NodeRef, WeakNodeRef};
+use super::node::{GradFn, NodeRef, WeakNodeRef};
+use super::{BackwardOptions, record};
 use crate::Tensor;
 use crate::tensor::{Layout, TensorData};
 
@@ -166,4 +167,140 @@ pub(crate) fn set_grad(t: &Tensor, grad: Option<Tensor>) {
 /// How many times an in-place operation in grad mode has rewritten the history of `t`.
 pub(crate) fn history_gen(t: &Tensor) -> u64 {
     t.autograd_meta().as_ref().map_or(0, |m| m.history_gen)
+}
+
+impl Tensor {
+    /// Whether gradients flow to this tensor (PyTorch's `requires_grad`): it is a leaf whose own
+    /// flag is set, it was computed by a recorded operation, or it is a view of a tensor that
+    /// requires grad.
+    pub fn requires_grad(&self) -> bool {
+        requires_grad(self)
+    }
+
+    /// Sets whether this leaf requires grad and returns `self`. Operations on tensors that
+    /// require grad record the backward graph.
+    ///
+    /// A view without history (created in no-grad mode, or before its base required grad) is a
+    /// leaf too: setting its flag makes it a leaf of its own, whose gradients accumulate into its
+    /// `.grad`, not into its base's. For a tensor computed by a recorded operation,
+    /// `requires_grad_(true)` does nothing (it already requires grad).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `requires_grad` is true and the dtype is not floating point, or if it is false
+    /// and the tensor is not a leaf, as PyTorch does.
+    pub fn requires_grad_(&self, requires_grad: bool) -> &Self {
+        if !is_leaf(self) {
+            if !requires_grad {
+                panic!(
+                    "you can only change requires_grad flags of leaf variables. If you want to \
+                     use a computed variable in a subgraph that doesn't require differentiation \
+                     use var_no_grad = var.detach()."
+                );
+            }
+            return self;
+        }
+        if requires_grad && !self.is_floating_point() {
+            panic!("only Tensors of floating point dtype can require gradients");
+        }
+        if requires_grad || self.autograd_meta().is_some() {
+            set_requires_grad(self, requires_grad);
+        }
+        self
+    }
+
+    /// Whether this tensor has no history, PyTorch's `is_leaf`: it was created by the user
+    /// rather than computed by a recorded operation. Only leaves accumulate gradients into
+    /// their `.grad`.
+    pub fn is_leaf(&self) -> bool {
+        is_leaf(self)
+    }
+
+    /// The gradient accumulated into this tensor by backward passes, PyTorch's `.grad`.
+    pub fn grad(&self) -> Option<Tensor> {
+        grad(self)
+    }
+
+    /// Replaces the gradient of this tensor, like assigning to PyTorch's `.grad`; `None` clears
+    /// it, which also breaks the reference cycle that `create_graph` can leave (see the
+    /// [`autograd`](crate::autograd) module).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the gradient's dtype, device or shape differ from the tensor's.
+    pub fn set_grad(&self, grad: Option<Tensor>) {
+        if let Some(g) = &grad {
+            let (dtype, grad_dtype) = (self.dtype(), g.dtype());
+            if grad_dtype != dtype {
+                panic!(
+                    "attempting to assign a gradient with dtype '{grad_dtype}' to a tensor with \
+                     dtype '{dtype}'. Please ensure that the gradient and the tensor have the \
+                     same dtype"
+                );
+            }
+            let (device, grad_device) = (self.device(), g.device());
+            if grad_device != device {
+                panic!(
+                    "attempting to assign a gradient with device type '{grad_device}' to a tensor \
+                     with device type '{device}'. Please ensure that the gradient and the tensor \
+                     are on the same device"
+                );
+            }
+            let (shape, grad_shape) = (self.shape(), g.shape());
+            if grad_shape != shape {
+                panic!(
+                    "attempting to assign a gradient of size '{grad_shape:?}' to a tensor of size \
+                     '{shape:?}'. Please ensure that the gradient and the tensor are the same size"
+                );
+            }
+        }
+        set_grad(self, grad);
+    }
+
+    /// The node that computed this tensor, PyTorch's `grad_fn`; `None` for leaves.
+    pub fn grad_fn(&self) -> Option<GradFn> {
+        grad_fn(self).map(|(node, _)| GradFn(node))
+    }
+
+    /// A tensor sharing this tensor's data (and version counter) without its history: it doesn't
+    /// require grad, and isn't treated as a view, so it can be modified in place. Modifying it
+    /// in place is visible in `self`, and is detected by backward passes that saved `self`.
+    pub fn detach(&self) -> Tensor {
+        Tensor::from_data(self.data())
+    }
+
+    /// Removes this tensor from the graph in place, making it a leaf that doesn't require grad,
+    /// and returns `self`. Its gradient, if any, is kept. Graphs that saved it while it had a
+    /// history can't be run any more, as in PyTorch.
+    ///
+    /// # Panics
+    ///
+    /// Panics on views, which can't be detached in place; use [`detach`](Tensor::detach).
+    pub fn detach_(&self) -> &Self {
+        if self.view_info().is_some() {
+            panic!("Can't detach views in-place. Use detach() instead.");
+        }
+        record::detach_history(self);
+        self
+    }
+
+    /// Computes the gradient of this single-element tensor with respect to the leaves of its
+    /// graph and adds it to their `.grad` (PyTorch's `y.backward()`). The tensors the graph
+    /// saved are freed; use [`autograd::backward`](crate::autograd::backward) to keep them or to
+    /// record the pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensor doesn't require grad or has more than one element, or if the
+    /// backward pass fails; see [`autograd::backward`](crate::autograd::backward).
+    pub fn backward(&self) {
+        super::backward(&[self], &[], BackwardOptions::default());
+    }
+
+    /// Like [`backward`](Tensor::backward), with `gradient` as the gradient of this tensor
+    /// (PyTorch's `y.backward(gradient)`): the vector of the vector-Jacobian product. It must
+    /// have the shape of this tensor.
+    pub fn backward_with(&self, gradient: &Tensor) {
+        super::backward(&[self], &[Some(gradient)], BackwardOptions::default());
+    }
 }

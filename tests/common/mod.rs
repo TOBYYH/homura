@@ -79,6 +79,13 @@ impl<'a> Case<'a> {
         assert_close(actual, &expected, &format!("{}/{name}", self.name));
     }
 
+    /// Compares `actual` with the stored tensor `name` of this case with `compare`, which gets
+    /// both tensors.
+    pub fn check_with(&self, name: &str, actual: &Tensor, compare: impl FnOnce(&Tensor, &Tensor)) {
+        self.used.borrow_mut().insert(name.to_string());
+        compare(actual, &self.golden.get(&format!("{}/{name}", self.name)));
+    }
+
     /// Panics if some stored tensor of this case was neither used as input nor checked.
     pub fn assert_all_used(&self) {
         let used = self.used.borrow();

@@ -58,6 +58,12 @@
 //! Backward passes run on the calling thread. Passes on different threads may share leaves:
 //! accumulating into the same `.grad` is serialized and loses nothing.
 //!
+//! # Checking gradients
+//!
+//! [`gradcheck`] compares the gradients that backward passes compute with central differences
+//! of the function, and [`gradgradcheck`] does the same for the gradients of the gradients, like
+//! their PyTorch namesakes. Both work on `F64` inputs at points where the function is smooth.
+//!
 //! # Grad mode
 //!
 //! [`no_grad`], [`enable_grad`] and [`set_grad_enabled`] turn graph recording off or on for the
@@ -84,6 +90,7 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 pub(crate) mod formulas;
+mod gradcheck;
 #[cfg(test)]
 mod graph_tests;
 mod meta;
@@ -91,6 +98,7 @@ mod node;
 mod record;
 mod saved;
 
+pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
 pub(crate) use meta::{AutogradMeta, ViewInfo, view_of};
 pub use node::GradFn;
 pub(crate) use record::{check_inplace, needs_grad, record_unimplemented};

@@ -13,8 +13,11 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+import reference
+
 OUT = Path(__file__).resolve().parents[2] / "tests" / "golden" / "ops.safetensors"
 
+reference.check()
 torch.manual_seed(0)
 data = {}
 

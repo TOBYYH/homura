@@ -1,15 +1,27 @@
 //! Automatic differentiation.
 //!
-//! Only the grad mode switch exists so far; recording the backward graph comes later. Tensors
-//! already carry a slot for their autograd metadata so that adding it does not change their
-//! layout.
+//! The grad mode switch is public. The backward graph types (nodes, saved tensors, per-tensor
+//! state and the view rules) are in place, but operations don't record into them yet.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// Per-tensor autograd state. Always absent for now.
-#[derive(Debug)]
-pub(crate) struct AutogradMeta {}
+// Operations start recording into these modules in M1 step 3; until then only the tests and
+// `Tensor::requires_grad` use them.
+#[allow(dead_code)]
+mod accumulate;
+#[cfg(test)]
+mod graph_tests;
+#[allow(dead_code)]
+mod meta;
+#[allow(dead_code)]
+mod node;
+#[allow(dead_code)]
+mod record;
+#[allow(dead_code)]
+mod saved;
+
+pub(crate) use meta::{AutogradMeta, ViewInfo, requires_grad};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };

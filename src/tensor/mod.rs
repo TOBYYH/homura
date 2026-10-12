@@ -1,8 +1,8 @@
 //! The [`Tensor`] type.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use crate::autograd::AutogradMeta;
+use crate::autograd::{AutogradMeta, ViewInfo};
 use crate::backend::cpu;
 use crate::shape::{contiguous_strides, is_contiguous};
 use crate::storage::Storage;
@@ -37,8 +37,12 @@ pub struct Tensor(Arc<TensorImpl>);
 
 struct TensorImpl {
     data: RwLock<TensorData>,
-    /// `None` for tensors that don't take part in autograd. Always `None` for now.
+    /// `None` for tensors that don't take part in autograd. Lock it only briefly: never run a
+    /// tensor operation or take another tensor's lock while holding it.
     autograd: Mutex<Option<AutogradMeta>>,
+    /// Set when the tensor is created as a view of another one; never changes afterwards, so it
+    /// is read without a lock.
+    view: Option<ViewInfo>,
 }
 
 /// How a tensor's elements are placed in its storage.
@@ -237,10 +241,29 @@ impl TensorData {
 
 impl Tensor {
     pub(crate) fn from_data(data: TensorData) -> Tensor {
+        Tensor::from_parts(data, None, None)
+    }
+
+    pub(crate) fn from_parts(
+        data: TensorData,
+        autograd: Option<AutogradMeta>,
+        view: Option<ViewInfo>,
+    ) -> Tensor {
         Tensor(Arc::new(TensorImpl {
             data: RwLock::new(data),
-            autograd: Mutex::new(None),
+            autograd: Mutex::new(autograd),
+            view,
         }))
+    }
+
+    /// The autograd state, locked. See `TensorImpl::autograd` for the locking rules.
+    pub(crate) fn autograd_meta(&self) -> MutexGuard<'_, Option<AutogradMeta>> {
+        self.0.autograd.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How this tensor is a view of another one, if it is.
+    pub(crate) fn view_info(&self) -> Option<&ViewInfo> {
+        self.0.view.as_ref()
     }
 
     /// A snapshot of the storage, layout and dtype.
@@ -380,13 +403,10 @@ impl Tensor {
         self.dtype().size_in_bytes()
     }
 
-    /// Whether gradients are computed for this tensor. Always `false` until autograd lands.
+    /// Whether gradients are computed for this tensor. Always `false` until operations record
+    /// the backward graph.
     pub fn requires_grad(&self) -> bool {
-        self.0
-            .autograd
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        crate::autograd::requires_grad(self)
     }
 
     /// Whether `self` and `other` are handles to the same tensor (Python's `x is y`).

@@ -13,6 +13,8 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
+import reference
+
 OUT = Path(__file__).resolve().parents[2] / "tests" / "golden" / "llama_layer.safetensors"
 
 # Keep in sync with tests/llama_layer.rs.
@@ -22,6 +24,7 @@ INTERMEDIATE = 160
 EPS = 1e-6
 ROPE_THETA = 10000.0
 
+reference.check()
 torch.manual_seed(0)
 
 

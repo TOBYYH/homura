@@ -538,9 +538,10 @@ case("grad.var_dims_keep", lambda x: x.var((0, 1), keepdim=True, correction=0), 
 case("grad.std", lambda x: x.std(), x=randn(3, 4))
 case("grad.std_dim", lambda x: x.std(0, correction=2), x=randn(4, 3))
 
-# Half precision prod is left out: homura's forward product is computed in f64 and rounded
-# once, PyTorch's is rounded at each step, and the gradient `g * (result / x)` inherits the
-# difference of the results (several rounding steps of the gradient).
+# Random half precision prod is left out: without zeros, the gradient `g * (result / x)` inherits
+# the documented difference of the forward results (homura's product is computed in f64 and
+# rounded once, PyTorch's is rounded at each step). The gradient with zeros doesn't use the
+# result, and has exact half precision cases below (review round 18).
 for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
     case(f"grad_{tag}.sum_dim", lambda x: x.sum(1), x=randn(3, 4, dtype=dtype))
     case(f"grad_{tag}.mean_dim", lambda x: x.mean(-1), x=randn(3, 4, dtype=dtype))
@@ -589,6 +590,39 @@ case(
     x=f([[1e30, 1e30, 1e-30, 1e-30, 0.0], [0.0, 1e-30, 1e-30, 1e30, 1e30]]),
     g=f([1.0, 1.0]),
 )
+
+# Review round 18 (R35, R36): the products of the other elements are accumulated in order, in
+# PyTorch's accumulation type (f64 for f32 and f64, f32 for f16 and bf16), and rounded to the
+# dtype one by one, so the intermediate products overflow and underflow where the reference's do.
+def run(*pairs):
+    return [v for v, n in pairs for _ in range(n)]
+
+
+case(
+    "special.prod_dim_order_f64",
+    lambda x: x.prod(1),
+    x=f([[1e308, 1e308, 1e-308, 1e-308, 0.0], [1e-308, 1e-308, 1e308, 1e308, 0.0], [1e308, 1e-308, 1e-308, 1e308, 0.0]], dtype=torch.float64),
+    g=f([1.0, inf, -2.0], dtype=torch.float64),
+)
+case(
+    "special.prod_dim_order_f32",
+    lambda x: x.prod(1),
+    x=f([run((1e30, 11), (1e-30, 11), (0.0, 1)), run((1e-30, 11), (1e30, 11), (0.0, 1))]),
+    g=f([1.0, -2.0]),
+)
+case(
+    "special.prod_dim_order_f16",
+    lambda x: x.prod(1),
+    x=f([run((1000.0, 14), (0.001, 14), (0.0, 1)), run((0.001, 14), (1000.0, 14), (0.0, 1))], dtype=torch.float16),
+    g=f([1.0, inf], dtype=torch.float16),
+)
+case(
+    "special.prod_dim_order_bf16",
+    lambda x: x.prod(1),
+    x=f([[1e30, 1e30, 1e-30, 1e-30, 0.0], [0.0, 1e-30, 1e-30, 1e30, 1e30]], dtype=torch.bfloat16),
+    g=f([1.0, -2.0], dtype=torch.bfloat16),
+)
+case("special.prod_order_bf16", lambda x: x.prod(), x=f([1e30, 1e30, 1e-30, 0.0], dtype=torch.bfloat16), g=f(1.0, dtype=torch.bfloat16))
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())

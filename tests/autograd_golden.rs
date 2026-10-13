@@ -109,8 +109,14 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "mean" => x().mean(),
         "mean_dim" => x().mean_dim(-1, false),
         "mean_dims_keep" => x().mean_dim([0, 1], true),
-        "prod" | "prod_zero" | "prod_two_zeros" | "prod_overflow" => x().prod(),
-        "prod_dim" | "prod_dim_zeros" | "prod_dim_overflow" => x().prod_dim(1, false),
+        "prod" | "prod_zero" | "prod_two_zeros" | "prod_overflow" | "prod_order_bf16" => x().prod(),
+        "prod_dim"
+        | "prod_dim_zeros"
+        | "prod_dim_overflow"
+        | "prod_dim_order_f64"
+        | "prod_dim_order_f32"
+        | "prod_dim_order_f16"
+        | "prod_dim_order_bf16" => x().prod_dim(1, false),
         "prod_dim_keep" => x().prod_dim(0, true),
         "max" | "max_ties" => x().max(),
         "min" => x().min(),
@@ -182,7 +188,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 230, "only {} cases", cases.len());
+    assert!(cases.len() >= 235, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

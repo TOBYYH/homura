@@ -113,6 +113,19 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
     out
 }
 
+/// For each element of the floating point `x`, the product of the elements before it along `dim`
+/// (after it when `reverse`), as PyTorch's `cumprod` of the shifted input computes it (see
+/// `cpu::exclusive_cumprod`). Not recorded: the gradient of `prod` for inputs with zeros, its only
+/// user, is first-order only.
+pub(crate) fn exclusive_cumprod(x: &Tensor, dim: usize, reverse: bool) -> Tensor {
+    let src = x.data();
+    let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+    if src.device() == Device::Cpu {
+        cpu::exclusive_cumprod(&out.data(), &src, dim, reverse);
+    }
+    out
+}
+
 impl Tensor {
     /// Sum of all elements. Integer and bool inputs give `I64`.
     pub fn sum(&self) -> Tensor {
@@ -263,8 +276,8 @@ impl Tensor {
         out
     }
 
-    /// Variance over `dims` (all dimensions if empty). Over all dimensions, the gradient is
-    /// that of [`var`](Tensor::var) (PyTorch's `var(dim=[])` divides its gradient by
+    /// Variance over `dims` (all dimensions if empty). With an empty list, the gradient is that
+    /// of [`var`](Tensor::var) (PyTorch's `var(dim=[])` divides its gradient by
     /// `1 - correction` instead).
     pub fn var_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
         let dims = dims.into_dims();

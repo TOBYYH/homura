@@ -178,6 +178,114 @@ fn prod_follows_the_reference_at_zeros_and_non_finite_values() {
     }
 }
 
+/// `values` repeated: `rep(&[(1e30, 11), (0., 1)])` is eleven 1e30 and a zero.
+fn rep(runs: &[(f64, usize)]) -> Vec<f64> {
+    runs.iter()
+        .flat_map(|&(v, n)| std::iter::repeat_n(v, n))
+        .collect()
+}
+
+#[test]
+fn prod_with_zeros_accumulates_in_order_like_the_reference_cumprod() {
+    // The products of the elements before and after each one are accumulated one element at a
+    // time in PyTorch's accumulation type (f64 for f32 and f64, f32 for f16 and bf16), and each
+    // is rounded to the dtype: intermediate products overflow or underflow in that type exactly
+    // where the reference's do (review round 18, R35 and R36). Expected values are the pinned
+    // reference's, for an upstream gradient of 1 and of Inf.
+    let (nan, inf) = (f64::NAN, f64::INFINITY);
+    // (dtype, input, gradient for an upstream 1, gradient for an upstream Inf)
+    type Case = (DType, Vec<f64>, Vec<f64>, Vec<f64>);
+    let cases: Vec<Case> = vec![
+        (
+            DType::F64,
+            vec![1e308, 1e308, 1e-308, 1e-308, 0.],
+            vec![0., 0., nan, nan, inf],
+            vec![nan, nan, nan, nan, inf],
+        ),
+        (
+            DType::F64,
+            vec![1e-308, 1e-308, 1e308, 1e308, 0.],
+            vec![0.; 5],
+            vec![nan; 5],
+        ),
+        // Rounding: the last element gets 1e308 * 1e-308 * 1e-308 * 1e308 in this order.
+        (
+            DType::F64,
+            vec![1e308, 1e-308, 1e-308, 1e308, 0.],
+            vec![0., 0., 0., 0., 0.9999999999999999],
+            vec![nan, nan, nan, nan, inf],
+        ),
+        (
+            DType::F32,
+            rep(&[(1e30, 11), (1e-30, 11), (0., 1)]),
+            rep(&[(0., 2), (nan, 20), (inf, 1)]),
+            rep(&[(nan, 22), (inf, 1)]),
+        ),
+        (
+            DType::F32,
+            rep(&[(1e-30, 11), (1e30, 11), (0., 1)]),
+            vec![0.; 23],
+            vec![nan; 23],
+        ),
+        (
+            DType::BF16,
+            vec![1e30, 1e30, 1e-30, 0.],
+            vec![0., 0., nan, inf],
+            vec![nan, nan, nan, inf],
+        ),
+        (
+            DType::BF16,
+            vec![1e30, 1e30, 1e-30, 1e-30, 0.],
+            vec![0., 0., nan, nan, inf],
+            vec![nan, nan, nan, nan, inf],
+        ),
+        (
+            DType::F16,
+            rep(&[(1000., 14), (0.001, 14), (0., 1)]),
+            rep(&[(0., 2), (nan, 26), (inf, 1)]),
+            rep(&[(nan, 28), (inf, 1)]),
+        ),
+        // Each product is rounded to f16 when it is written, while the f32 accumulation goes on.
+        (
+            DType::F16,
+            rep(&[(0.001, 14), (1000., 14), (0., 1)]),
+            rep(&[(0., 28), (1.005859375, 1)]),
+            rep(&[(nan, 28), (inf, 1)]),
+        ),
+    ];
+    for (dtype, values, expected, expected_inf) in cases {
+        let n = values.len();
+        let what = format!("{dtype:?} {values:?}");
+        let x = Tensor::from_slice(&values, [n]).to(dtype);
+        x.requires_grad_(true);
+        let check = |actual: &Tensor, expected: &[f64]| {
+            assert_eq!(actual.dtype(), dtype, "{what}");
+            let actual = actual.to(DType::F64).to_vec::<f64>();
+            let equal = actual
+                .iter()
+                .zip(expected)
+                .all(|(&a, &e)| a == e || (a.is_nan() && e.is_nan()));
+            assert!(equal, "{what}: {actual:?} vs {expected:?}");
+        };
+        check(&grad_of(&x.prod(), &x, &[1.]), &expected);
+        check(&grad_of(&x.prod(), &x, &[inf]), &expected_inf);
+        // The same values in a row and reversed in another, in a non-contiguous tensor, give the
+        // same products in reverse; the upstream gradient scales each row.
+        let reversed: Vec<f64> = values.iter().rev().copied().collect();
+        let rows = Tensor::from_slice(&[&reversed[..], &values[..]].concat(), [2, n])
+            .to(dtype)
+            .flip(0)
+            .transpose(0, 1)
+            .deep_clone()
+            .transpose(0, 1);
+        rows.requires_grad_(true);
+        let mut both: Vec<f64> = expected.clone();
+        both.extend(expected.iter().rev().map(|&e| -2. * e));
+        check(&grad_of(&rows.prod_dim(1, false), &rows, &[1., -2.]), &both);
+        check(&grad_of(&rows.prod_dim(-1, true), &rows, &[1., -2.]), &both);
+    }
+}
+
 #[test]
 fn prod_differentiates_again_without_zeros_and_rejects_zeros() {
     let x = leaf(&[2., 3., 4.], [3]);

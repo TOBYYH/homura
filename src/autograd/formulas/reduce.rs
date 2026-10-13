@@ -5,19 +5,23 @@ use crate::autograd::is_grad_enabled;
 use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
+use crate::ops::exclusive_cumprod;
 use crate::shape::dims_mask;
-use crate::{DType, Device, Shape, Tensor};
+use crate::{Device, Shape, Tensor};
 
 /// The shape that the gradient of a reduction of `shape` over the dimensions in `mask` is
 /// reshaped to before it is broadcast back, with the reduced dimensions put back as 1s, like
 /// PyTorch's `unsqueeze`s; `None` with `keepdim`, which kept them.
 fn unreduced(shape: &Shape, mask: &[bool], keepdim: bool) -> Option<Shape> {
+    if keepdim {
+        return None;
+    }
     let kept: Vec<usize> = shape
         .iter()
         .zip(mask)
         .map(|(&n, &reduced)| if reduced { 1 } else { n })
         .collect();
-    (!keepdim).then(|| Shape::new(&kept))
+    Some(Shape::new(&kept))
 }
 
 /// The number of elements of `shape` in the dimensions in `mask`.
@@ -306,32 +310,14 @@ impl Node for ProdBackward {
 }
 
 /// The product of all elements but one along `dim` of `x`, for each element, as PyTorch's
-/// `prod_safe_zeros_backward` computes it without dividing: the products of the elements before
-/// and of those after it, accumulated in `f64` like PyTorch's `cumprod`, each rounded to the
-/// dtype of `x` and then multiplied. Correct with zeros and infinities, but not differentiable.
+/// `prod_safe_zeros_backward` computes it without dividing: the product of the elements before
+/// it times the product of those after it, each accumulated in order and rounded to the dtype of
+/// `x` like PyTorch's `cumprod`. Correct with zeros and infinities, but computed by a kernel that
+/// isn't recorded, unlike the other formulas: this gradient is first-order only.
 fn products_of_the_others(x: &Tensor, dim: usize) -> Tensor {
-    let d = dim as i64;
-    let wide = x.to(DType::F64);
-    let before = exclusive_cumprod(&wide, dim);
-    let after = exclusive_cumprod(&wide.flip(d), dim).flip(d);
-    before.to(x.dtype()).mul(after.to(x.dtype()))
-}
-
-/// The products of the elements before each one along `dim` (1 for the first), with
-/// `log2(n)` steps that each multiply every element by the one `step` places before it.
-fn exclusive_cumprod(x: &Tensor, dim: usize) -> Tensor {
-    let (d, n) = (dim as i64, x.shape()[dim]);
-    let mut shape = x.shape().to_vec();
-    shape[dim] = 1;
-    let mut products = crate::concat(&[x.new_ones(shape), x.narrow(d, 0, n - 1)], d);
-    let mut step = 1;
-    while step < n {
-        let shifted = products.narrow(d, 0, n - step);
-        let tail = products.narrow(d, step as i64, n - step).mul(&shifted);
-        products = crate::concat(&[products.narrow(d, 0, step), tail], d);
-        step *= 2;
-    }
-    products
+    let before = exclusive_cumprod(x, dim, false);
+    let after = exclusive_cumprod(x, dim, true);
+    before.mul(after)
 }
 
 /// `x.max()` (`MaxBackward1`) and `x.min()` (`MinBackward1`): `g` divided evenly among the

@@ -25,6 +25,7 @@ pub use overload::Number;
 pub use random::{
     manual_seed, rand, rand_like, rand_with, randint, randint_with, randn, randn_like, randn_with,
 };
+pub(crate) use reduce::exclusive_cumprod;
 pub use shape_ops::{concat, stack};
 pub use unary::GeluApproximate;
 

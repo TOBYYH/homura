@@ -223,3 +223,102 @@ pub(crate) fn arg_reduce(
         });
     })
 }
+
+/// A floating point element type and the type PyTorch's CPU kernels accumulate products of it in
+/// (`acc_type`): `f32` for `f16` and `bf16`, `f64` for `f32` and `f64`.
+trait Accumulate: Element {
+    type Acc: Copy + std::ops::Mul<Output = Self::Acc>;
+    const ONE: Self::Acc;
+    fn widen(self) -> Self::Acc;
+    /// Rounds an accumulated value to the element type.
+    fn narrow(acc: Self::Acc) -> Self;
+}
+
+impl Accumulate for half::f16 {
+    type Acc = f32;
+    const ONE: f32 = 1.0;
+    fn widen(self) -> f32 {
+        self.to_f32()
+    }
+    fn narrow(acc: f32) -> Self {
+        half::f16::from_f32(acc)
+    }
+}
+
+impl Accumulate for half::bf16 {
+    type Acc = f32;
+    const ONE: f32 = 1.0;
+    fn widen(self) -> f32 {
+        self.to_f32()
+    }
+    fn narrow(acc: f32) -> Self {
+        half::bf16::from_f32(acc)
+    }
+}
+
+impl Accumulate for f32 {
+    type Acc = f64;
+    const ONE: f64 = 1.0;
+    fn widen(self) -> f64 {
+        self as f64
+    }
+    fn narrow(acc: f64) -> Self {
+        acc as f32
+    }
+}
+
+impl Accumulate for f64 {
+    type Acc = f64;
+    const ONE: f64 = 1.0;
+    fn widen(self) -> f64 {
+        self
+    }
+    fn narrow(acc: f64) -> Self {
+        acc
+    }
+}
+
+/// For each element of `src`, the product of the elements before it along `dim` (after it when
+/// `reverse`), 1 for the first (last), written to the contiguous `out` of the same shape and
+/// dtype. Like PyTorch's CPU `cumprod` of the shifted input, the product is accumulated one
+/// element at a time in the accumulation type of the dtype, and each one is rounded to the dtype
+/// as it is written: the accumulator itself is never rounded.
+pub(crate) fn exclusive_cumprod(out: &TensorData, src: &TensorData, dim: usize, reverse: bool) {
+    fn scan<T: Accumulate>(out: &TensorData, src: &TensorData, dim: usize, reverse: bool) {
+        let shape = &src.layout.shape;
+        let strides = walk_strides(&src.layout);
+        let out_strides = contiguous_strides(shape);
+        let others = |v: &[usize]| -> Vec<usize> {
+            v.iter()
+                .enumerate()
+                .filter(|&(d, _)| d != dim)
+                .map(|(_, &s)| s)
+                .collect()
+        };
+        let (n, step, out_step) = (shape[dim], strides[dim], out_strides[dim]);
+        let lines = Plan::new(&others(shape), [&others(&out_strides), &others(&strides)]);
+        let (po, ps) = (base::<T>(out), base::<T>(src));
+        exec(|| {
+            lines.for_each([out.layout.offset, src.layout.offset], |[o, i]| {
+                let mut acc = T::ONE;
+                for k in 0..n {
+                    let k = if reverse { n - 1 - k } else { k };
+                    // SAFETY: `k < n` stays inside the line, which lies inside both layouts.
+                    unsafe {
+                        *po.add(o + k * out_step) = T::narrow(acc);
+                        acc = acc * (*ps.add(i + k * step)).widen();
+                    }
+                }
+            })
+        });
+    }
+    assert!(out.layout.is_contiguous() && out.layout.shape == src.layout.shape);
+    assert_eq!(out.dtype, src.dtype);
+    match src.dtype {
+        DType::F16 => scan::<half::f16>(out, src, dim, reverse),
+        DType::BF16 => scan::<half::bf16>(out, src, dim, reverse),
+        DType::F32 => scan::<f32>(out, src, dim, reverse),
+        DType::F64 => scan::<f64>(out, src, dim, reverse),
+        other => panic!("expected a floating point dtype, got {other}"),
+    }
+}

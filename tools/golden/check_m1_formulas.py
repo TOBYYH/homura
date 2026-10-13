@@ -1343,4 +1343,34 @@ with torch.no_grad():
     indices.add_(1)
 assert "[torch.LongTensor [2]] is at version 1; expected version 0 instead." in message(lambda: values.sum().backward())
 
+# Review round 18 (R35, R36): the products of the other elements accumulate in order in the
+# accumulation type (f64 for f32 and f64, f32 for half precision) and are rounded one by one.
+def run(*pairs):
+    return [v for v, n in pairs for _ in range(n)]
+
+
+def as_text(t):
+    return [repr(float(e)) for e in t.double().flatten()]
+
+
+for dtype, values, expected, expected_inf in [
+    (torch.float64, [1e308, 1e308, 1e-308, 1e-308, 0.0], [0.0, 0.0, nan, nan, inf], [nan, nan, nan, nan, inf]),
+    (torch.float64, [1e-308, 1e-308, 1e308, 1e308, 0.0], [0.0] * 5, [nan] * 5),
+    (torch.float64, [1e308, 1e-308, 1e-308, 1e308, 0.0], [0.0] * 4 + [0.9999999999999999], [nan] * 4 + [inf]),
+    (torch.float32, run((1e30, 11), (1e-30, 11), (0.0, 1)), run((0.0, 2), (nan, 20), (inf, 1)), run((nan, 22), (inf, 1))),
+    (torch.float32, run((1e-30, 11), (1e30, 11), (0.0, 1)), [0.0] * 23, [nan] * 23),
+    (torch.bfloat16, [1e30, 1e30, 1e-30, 0.0], [0.0, 0.0, nan, inf], [nan, nan, nan, inf]),
+    (torch.bfloat16, [1e30, 1e30, 1e-30, 1e-30, 0.0], [0.0, 0.0, nan, nan, inf], [nan, nan, nan, nan, inf]),
+    (torch.float16, run((1000.0, 14), (0.001, 14), (0.0, 1)), run((0.0, 2), (nan, 26), (inf, 1)), run((nan, 28), (inf, 1))),
+    (torch.float16, run((0.001, 14), (1000.0, 14), (0.0, 1)), run((0.0, 28), (1.005859375, 1)), run((nan, 28), (inf, 1))),
+]:
+    x = torch.tensor(values, dtype=dtype, requires_grad=True)
+    assert as_text(grad_of(x.prod(), x, 1.0)) == [repr(e) for e in expected], (dtype, values)
+    assert as_text(grad_of(x.prod(), x, inf)) == [repr(e) for e in expected_inf], (dtype, values)
+    rows = torch.tensor([values[::-1], values], dtype=dtype).flip(0).t().contiguous().t().requires_grad_()
+    both = expected + [-2.0 * e for e in expected[::-1]]
+    for out in [rows.prod(1), rows.prod(-1, keepdim=True)]:
+        g = torch.tensor([1.0, -2.0], dtype=dtype).reshape(out.shape)
+        assert as_text(torch.autograd.grad(out, rows, g)[0]) == [repr(float(e)) for e in both], (dtype, values)
+
 print("check_m1_formulas: all reference checks passed")

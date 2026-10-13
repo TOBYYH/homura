@@ -28,7 +28,7 @@ pub(crate) use iter::{Plan, walk_strides};
 pub(crate) use linalg::matmul;
 pub(crate) use misc::{flip, gather, index_add, index_select, scatter_add, softmax, triangle};
 pub(crate) use num::{Float, FloatElement, IntElement};
-pub(crate) use reduce::{arg_reduce, reduce, var};
+pub(crate) use reduce::{arg_reduce, exclusive_cumprod, reduce, var};
 
 static EXEC: Mutex<()> = Mutex::new(());
 

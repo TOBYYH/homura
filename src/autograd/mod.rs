@@ -29,11 +29,13 @@
 //! the reductions `sum`, `sum_dim`, `sum_to_size`, `mean`, `mean_dim`, `prod`, `prod_dim`, `max`,
 //! `min`, `max_dim`, `min_dim`, `var`, `var_dim`, `std` and `std_dim`, the views `expand`,
 //! `view`, `reshape`, `permute`, `transpose`, `squeeze`, `squeeze_dim`, `unsqueeze`, `select`,
-//! `narrow`, slicing and `as_strided`, `index_select`, indexing with an integer tensor, `index_add`, `gather`, `scatter_add`, `select_scatter`, `slice_scatter`, `deep_clone`
-//! and `to` (and what is built from them, such as `flatten`, `contiguous`, `repeat`, `split`,
-//! `chunk` and `masked_fill`). The others record a `NotImplemented` node, and a backward pass
-//! that reaches one panics with "the derivative for 'op' is not implemented." instead of silently
-//! dropping gradients; [`grad`] doesn't run the parts of the graph it doesn't need.
+//! `narrow`, slicing and `as_strided`, `index_select`, indexing with an integer tensor,
+//! `index_add`, `gather`, `scatter_add`, `select_scatter`, `slice_scatter`, the copies
+//! `deep_clone`, `to`, `concat`, `flip`, `triu` and `tril` (and what is built from them, such as
+//! `flatten`, `contiguous`, `repeat`, `stack`, `split`, `chunk` and `masked_fill`). The others
+//! record a `NotImplemented` node, and a backward pass that reaches one panics with "the
+//! derivative for 'op' is not implemented." instead of silently dropping gradients; [`grad`]
+//! doesn't run the parts of the graph it doesn't need.
 //!
 //! The gradient of `prod` for an input that contains zeros can't be differentiated again yet: a
 //! backward pass with `create_graph` that computes it panics.

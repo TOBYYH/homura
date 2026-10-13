@@ -831,9 +831,6 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
     let cases: Vec<(&str, Tensor)> = vec![
         ("matmul", x.matmul(&w)),
         ("softmax", x.softmax(-1)),
-        ("concat", homura::concat(&[&x, &w], 0)),
-        ("flip", x.flip(0)),
-        ("triu", x.triu(0)),
         ("addmm", x.addmm(&w, &w, 0.0, 1.0)),
     ];
     for (op, out) in cases {

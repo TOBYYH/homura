@@ -3,6 +3,7 @@
 use std::borrow::Borrow;
 
 use super::common_device;
+use crate::autograd::formulas;
 use crate::backend::cpu;
 use crate::dtype::ResultType;
 use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
@@ -32,7 +33,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     let inputs: Vec<Option<&Tensor>> = tensors.iter().map(|t| Some(t.borrow())).collect();
     let Some(first) = parts.first() else {
         let out = Tensor::empty_on(Shape::new(&[0]), dtype, device);
-        crate::autograd::record_unimplemented("concat", &inputs, &out);
+        formulas::concat(&inputs, 0, vec![None; all.len()], &out);
         return out;
     };
     let nd = first.layout.shape.len();
@@ -77,7 +78,11 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
             start += n;
         }
     }
-    crate::autograd::record_unimplemented("concat", &inputs, &out);
+    let lengths = all
+        .iter()
+        .map(|t| (t.layout.shape != [0]).then(|| t.layout.shape[dim]))
+        .collect();
+    formulas::concat(&inputs, dim, lengths, &out);
     out
 }
 
@@ -175,8 +180,7 @@ impl Tensor {
         if src.device() == Device::Cpu {
             cpu::triangle(&out.data(), &src, diagonal, upper);
         }
-        let name = if upper { "triu" } else { "tril" };
-        crate::autograd::record_unimplemented(name, &[Some(self)], &out);
+        formulas::triangle(self, diagonal, upper, &out);
         out
     }
 
@@ -238,7 +242,8 @@ impl Tensor {
         if src.device() == Device::Cpu {
             cpu::flip(&out.data(), &src, &mask);
         }
-        crate::autograd::record_unimplemented("flip", &[Some(self)], &out);
+        let flipped = (0..mask.len()).filter(|&d| mask[d]).map(|d| d as i64);
+        formulas::flip(self, flipped.collect(), &out);
         out
     }
 }

@@ -144,6 +144,13 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "index_alias" => x().index((.., ..)),
         "index_mixed" => x().index((.., 1.., NewAxis, (0..).step_by(2))),
         "index_full_tensor" => x().index((.., idx())),
+        "concat" => homura::concat(&[x(), &t["e"], y()], -1),
+        "concat_dtypes" => homura::concat(&[x(), y(), &t["n"]], 0),
+        "stack" => homura::stack(&[x(), y()], 1),
+        "flip" => x().flip([0, 2]),
+        "triu" => x().triu(1),
+        "tril" => x().tril(-1),
+        "repeat" => x().repeat([2, 1, 2]),
         _ => return None,
     })
 }
@@ -199,7 +206,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 255, "only {} cases", cases.len());
+    assert!(cases.len() >= 272, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

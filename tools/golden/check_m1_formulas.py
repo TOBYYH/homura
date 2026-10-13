@@ -1,7 +1,7 @@
 """Check the reference behavior that tests/autograd_formulas.rs, tests/autograd_binary.rs,
-tests/autograd_reduce.rs, tests/autograd_views.rs and tests/m1_ops.rs encode (M1 steps 4 and
-6a-6d), and the review fixes that tests/m1_regressions.rs encodes; does not write
-fixtures.
+tests/autograd_reduce.rs, tests/autograd_views.rs, tests/autograd_copies.rs and tests/m1_ops.rs
+encode (M1 steps 4 and 6a-6e), and the review fixes that tests/m1_regressions.rs encodes; does
+not write fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
 asserted and the difference is noted: messages name homura's dtypes and operations, half and
@@ -16,6 +16,9 @@ Indexing with an integer tensor reshapes the picked positions with a recorded `u
 homura can't tell a 1-tuple index from a lone item, so `x[(slice(None),)]` records a slice;
 whether a slice covers its dimension is judged on the slice an index item converts to, and a Rust
 `step_by` range with one position converts to step 1 (`x[:, 0:1:2]` is recorded by PyTorch).
+`stack` and `repeat` are composites in homura (`CatBackward0` over `UnsqueezeBackward0`s, and
+reshapes, `expand` and a copy) where PyTorch records `StackBackward0` and `RepeatBackward0`; the
+gradients are the same.
 """
 
 import math
@@ -1613,5 +1616,166 @@ for device, shape in [("cpu", (0, 1, 3)), ("meta", (0, 1, 3)), ("meta", (1 << 40
     for v in new_views(x):
         (gx,) = torch.autograd.grad(v, x, torch.ones(v.shape, device=device), create_graph=True)
         assert tuple(gx.shape) == shape and gx.device.type == device and gx.dtype == x.dtype
+
+# ---------------------------------------------------------------- step 6e: copies into a new shape
+ACC = "torch::autograd::AccumulateGrad"
+
+
+def exact(t):
+    return [repr(v) for v in t.double().flatten().tolist()]
+
+
+def arange(*shape):
+    return torch.arange(math.prod(shape), dtype=torch.float64).reshape(shape)
+
+
+# concat_narrows_the_gradient_back_to_each_input
+a = torch.arange(6.0).reshape(2, 3).clone().requires_grad_()
+e = torch.zeros(0, requires_grad=True)
+b = counting(2, 2)
+i = torch.tensor([[7, 8], [9, 10]])
+out = torch.cat([a, e, b, i], 1)
+assert out.dtype == torch.float64 and node(out) == ("CatBackward0", [ACC, ACC, ACC, None])
+ga, ge, gb = torch.autograd.grad(out, [a, e, b], torch.arange(1.0, 15.0, dtype=torch.float64).reshape(2, 7))
+assert ga.dtype == torch.float32 and ga.flatten().tolist() == [1.0, 2.0, 3.0, 8.0, 9.0, 10.0]
+assert ge.shape == (0,) and ge.dtype == torch.float32
+assert gb.dtype == torch.float64 and gb.flatten().tolist() == [4.0, 5.0, 11.0, 12.0]
+
+# concat_boundaries
+a = counting(2, 3)
+e = torch.zeros(0, dtype=torch.float64, requires_grad=True)
+g = arange(2, 3)
+out = torch.cat([e, a], -1)
+assert out.shape == (2, 3)
+ge, ga = torch.autograd.grad(out, [e, a], g)
+assert ge.shape == (0,) and torch.equal(ga, g)
+e2 = torch.zeros(0, dtype=torch.float64, requires_grad=True)
+out = torch.cat([e, e2], 0)
+assert out.grad_fn.name() == "CatBackward0"
+assert all(t.shape == (0,) for t in torch.autograd.grad(out, [e, e2], arange(0)))
+z = torch.zeros(2, 0, dtype=torch.float64, requires_grad=True)
+ga, gz = torch.autograd.grad(torch.cat([a, z], 1), [a, z], g)
+assert torch.equal(ga, g) and gz.shape == (2, 0)
+(ga,) = torch.autograd.grad(torch.cat([a, a], 0), a, arange(4, 3))
+assert ga.flatten().tolist() == [6.0, 8.0, 10.0, 12.0, 14.0, 16.0]
+out = torch.cat([a], 0)
+assert out.grad_fn.name() == "CatBackward0" and torch.equal(torch.autograd.grad(out, a, g)[0], g)
+x, y = leaf([1.0, 2.0], torch.float64), leaf([3.0], torch.float64)
+gx, gy = torch.autograd.grad(torch.cat([x, y], 0), [x, y], torch.tensor([math.nan, math.inf, -0.0], dtype=torch.float64))
+assert exact(gx) == ["nan", "inf"] and exact(gy) == ["-0.0"]
+t = arange(3, 2).t().requires_grad_()
+(gt,) = torch.autograd.grad(torch.cat([a, t], 0), t, arange(4, 3))
+assert gt.flatten().tolist() == [6.0, 7.0, 8.0, 9.0, 10.0, 11.0]
+
+# concat_gradients_differentiate_again
+a = torch.arange(4.0).reshape(2, 2).clone().requires_grad_()
+b = counting(2, 1)
+e = torch.zeros(0, dtype=torch.float64, requires_grad=True)
+g = arange(2, 3).requires_grad_()
+ga, ge, gb = torch.autograd.grad(torch.cat([a, e, b], 1), [a, e, b], g, create_graph=True)
+assert node(ga) == ("ToCopyBackward0", ["SliceBackward0"])
+assert node(gb) == ("SliceBackward0", [ACC])
+assert not ge.requires_grad
+(gg,) = torch.autograd.grad((gb * torch.tensor([[5.0], [7.0]], dtype=torch.float64)).sum(), g)
+assert gg.flatten().tolist() == [0.0, 0.0, 5.0, 0.0, 0.0, 7.0]
+
+# stack_is_built_from_unsqueeze_and_concat: PyTorch records one StackBackward0; homura's stack
+# concatenates unsqueezed inputs (CatBackward0 over UnsqueezeBackward0s) with the same gradients.
+a = counting(2, 3)
+s = torch.stack([a, a * 2.0], 1)
+assert s.shape == (2, 2, 3) and node(s) == ("StackBackward0", [ACC, "MulBackward0"])
+(ga,) = torch.autograd.grad(s, a, arange(2, 2, 3))
+assert ga.flatten().tolist() == [6.0, 9.0, 12.0, 24.0, 27.0, 30.0]
+h = torch.arange(1.0, 7.0).reshape(2, 3).requires_grad_()
+s = torch.stack([a, h], -1)
+assert s.shape == (2, 3, 2) and s.dtype == torch.float64
+ga, gh = torch.autograd.grad(s, [a, h], arange(2, 3, 2))
+assert ga.flatten().tolist() == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+assert gh.dtype == torch.float32 and gh.flatten().tolist() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+
+# flip_flips_the_gradient_back
+a = counting(2, 3)
+g = arange(2, 3)
+for out, expected in [
+    (a.flip(0, 1), [5.0, 4.0, 3.0, 2.0, 1.0, 0.0]),
+    (a.flip(-1), [2.0, 1.0, 0.0, 5.0, 4.0, 3.0]),
+    (a.flip([-2]), [3.0, 4.0, 5.0, 0.0, 1.0, 2.0]),
+    (a.flip([]), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+]:
+    assert node(out) == ("FlipBackward0", [ACC]) and out._base is None
+    assert torch.autograd.grad(out, a, g)[0].flatten().tolist() == expected
+s = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
+for out in [s.flip(()), s.flip(0), s.flip(-1), s.flip([0])]:
+    assert out.grad_fn.name() == "FlipBackward0"
+    (gs,) = torch.autograd.grad(out, s, torch.tensor(5.0, dtype=torch.float64))
+    assert gs.shape == () and gs.item() == 5.0
+t = arange(3, 2).t().requires_grad_()
+g = torch.tensor([[math.nan, math.inf, -0.0], [1.0, -math.inf, 2.0]], dtype=torch.float64)
+assert exact(torch.autograd.grad(t.flip(1), t, g)[0]) == ["-0.0", "inf", "nan", "2.0", "-inf", "1.0"]
+g = arange(2, 3).requires_grad_()
+assert node(torch.autograd.grad(a.flip(1), a, g, create_graph=True)[0]) == ("FlipBackward0", [ACC])
+
+# triangles_select_the_gradient
+m = counting(3, 4)
+g = torch.full((3, 4), math.nan, dtype=torch.float64)
+g[0, 0] = math.inf
+n, i, z = "nan", "inf", "0.0"
+for name, out, expected in [
+    ("TriuBackward0", m.triu(0), [i, n, n, n, z, n, n, n, z, z, n, n]),
+    ("TriuBackward0", m.triu(1), [z, n, n, n, z, z, n, n, z, z, z, n]),
+    ("TriuBackward0", m.triu(-1), [i, n, n, n, n, n, n, n, z, n, n, n]),
+    ("TriuBackward0", m.triu(5), [z] * 12),
+    ("TriuBackward0", m.triu(-5), [i] + [n] * 11),
+    ("TrilBackward0", m.tril(0), [i, z, z, z, n, n, z, z, n, n, n, z]),
+    ("TrilBackward0", m.tril(1), [i, n, z, z, n, n, n, z, n, n, n, n]),
+    ("TrilBackward0", m.tril(-1), [z, z, z, z, n, z, z, z, n, n, z, z]),
+    ("TrilBackward0", m.tril(5), [i] + [n] * 11),
+    ("TrilBackward0", m.tril(-5), [z] * 12),
+]:
+    assert node(out) == (name, [ACC])
+    assert exact(torch.autograd.grad(out, m, g)[0]) == expected
+x = arange(2, 3, 3).transpose(1, 2).requires_grad_()
+g = (arange(2, 3, 3) + 1.0).transpose(1, 2)
+assert torch.equal(torch.autograd.grad(x.triu(1), x, g)[0], g.triu(1))
+assert torch.equal(torch.autograd.grad(x.tril(-1), x, g)[0], g.tril(-1))
+g = arange(3, 4).requires_grad_()
+for name, out in [("TriuBackward0", m.triu(1)), ("TrilBackward0", m.tril(-1))]:
+    assert node(torch.autograd.grad(out, m, g, create_graph=True)[0]) == (name, [ACC])
+
+# repeat_sums_the_copies: PyTorch records one RepeatBackward0; homura's repeat is a composite.
+a = counting(2, 3)
+r = a.repeat(2, 1, 2)
+assert r.shape == (2, 2, 6) and r.grad_fn.name() == "RepeatBackward0"
+assert torch.autograd.grad(r, a, arange(2, 2, 6))[0].flatten().tolist() == [30.0, 34.0, 38.0, 54.0, 58.0, 62.0]
+r = a.repeat(0, 2)
+assert r.shape == (0, 6) and torch.autograd.grad(r, a, arange(0, 6))[0].flatten().tolist() == [0.0] * 6
+
+# copies_save_nothing_so_backward_passes_can_repeat
+x = counting(2, 2)
+for out in [torch.cat([x, x], 1), torch.stack([x], 0), x.flip(0), x.triu(0), x.tril(0)]:
+    y = out.sum()
+    y.backward()
+    y.backward()
+assert x.grad.flatten().tolist() == [12.0, 10.0, 10.0, 12.0]
+
+# gradients_of_copies_on_meta_and_empty_inputs
+for device, rows in [("cpu", 0), ("meta", 0), ("meta", 1 << 40)]:
+    x = torch.zeros(2, rows, 3, device=device, requires_grad=True)
+    y = torch.zeros(2, 1, 3, device=device, dtype=torch.float64, requires_grad=True)
+    e = torch.zeros(0, device=device, requires_grad=True)
+    for name, out in [
+        ("concat", torch.cat([x, e, y], 1)),
+        ("stack", torch.stack([x, x], 1)),
+        ("flip", x.flip(0, 2)),
+        ("triu", x.triu(1)),
+        ("tril", x.tril(-1)),
+    ]:
+        g = torch.ones(out.shape, device=device, dtype=out.dtype, requires_grad=True)
+        found = torch.autograd.grad(out, [x, e, y], g, create_graph=True, allow_unused=True)
+        for t, gt in zip([x, e, y], found):
+            if gt is None:
+                assert name != "concat"
+                continue
+            assert gt.shape == t.shape and gt.dtype == t.dtype and gt.device.type == device
 
 print("check_m1_formulas: all reference checks passed")

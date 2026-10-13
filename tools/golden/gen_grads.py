@@ -658,6 +658,34 @@ case(
     g=f([[[[inf, -0.0]]]]),
 )
 
+# ---------------------------------------------------------------- step 6e
+# Copies into a new shape. A skipped one-dimensional empty input ("e") gets an empty gradient, an
+# integer input ("n") none; mixed dtypes get their gradients back in their own dtype. PyTorch's
+# stack and repeat are single nodes, homura's are composites with the same gradients.
+case("grad.concat", lambda x, e, y: torch.cat([x, e, y], -1), x=randn(2, 3), e=randn(0), y=randn(2, 1))
+case(
+    "grad.concat_dtypes",
+    lambda x, y, n: torch.cat([x, y, n], 0),
+    x=randn(2, 3),
+    y=randn(1, 3, dtype=torch.float64),
+    n=torch.randint(-3, 4, (2, 3)),
+)
+case("grad.stack", lambda x, y: torch.stack([x, y], 1), x=randn(2, 3), y=randn(2, 3))
+case("grad.flip", lambda x: x.flip(0, 2), x=randn(2, 3, 4))
+case("grad.triu", lambda x: x.triu(1), x=randn(2, 3, 4))
+case("grad.tril", lambda x: x.tril(-1), x=randn(3, 4))
+case("grad.repeat", lambda x: x.repeat(2, 1, 2), x=randn(2, 3))
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.concat", lambda x, e, y: torch.cat([x, e, y], -1), x=randn(2, 3, dtype=dtype), e=randn(0, dtype=dtype), y=randn(2, 1, dtype=dtype))
+    case(f"grad_{tag}.flip", lambda x: x.flip(0, 2), x=randn(2, 3, 4, dtype=dtype))
+    case(f"grad_{tag}.triu", lambda x: x.triu(1), x=randn(2, 3, 4, dtype=dtype))
+# Concatenating and flipping pass non-finite upstream gradients through unchanged; the triangles
+# select, so NaN and infinite upstream gradients outside them give zeros.
+case("special.concat", lambda x, e, y: torch.cat([x, e, y], -1), x=f([1.0, 2.0]), e=f([]), y=f([3.0]), g=f([nan, inf, -0.0]))
+case("special.flip", lambda x: x.flip(0, 2), x=f([[[1.0, 2.0]], [[3.0, 4.0]]]), g=f([[[nan, -0.0]], [[-inf, 1.0]]]))
+case("special.triu", lambda x: x.triu(1), x=f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), g=f([[inf, nan, -0.0], [nan, -inf, nan]]))
+case("special.tril", lambda x: x.tril(-1), x=f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), g=f([[inf, nan, -0.0], [nan, -inf, nan]]))
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

@@ -464,6 +464,53 @@ fn index_formulas() {
     });
 }
 
+#[test]
+fn copy_formulas() {
+    let x = var(&[2, 3], 0);
+    let t = transposed(2, 3, 1);
+    let y = var(&[2, 1], 2);
+    // Constants: a skipped empty input and an integer input, promoted.
+    let empty = Tensor::from_slice::<f64>(&[], [0]);
+    let int = homura::tensor([[1i64, -2, 3], [4, 5, -6]]);
+    check("concat", &[&x, &t, &y], |x| {
+        vec![
+            homura::concat(&[&x[0], &empty, &x[1]], 0),
+            homura::concat(&[&x[1], &x[2], &x[0]], -1),
+            homura::concat(&[&x[0], &int, &x[0]], 1),
+            homura::concat(&[&x[2]], 0),
+        ]
+    });
+    check("stack", &[&x, &t], |x| {
+        vec![
+            homura::stack(&[&x[0], &x[1]], 0),
+            homura::stack(&[&x[1], &x[0], &x[1]], -1),
+        ]
+    });
+    let b = var(&[2, 3, 3], 3);
+    check("flip", &[&t, &b], |x| {
+        vec![
+            x[0].flip([0, 1]),
+            x[0].flip(-1),
+            x[0].flip(Vec::<i64>::new()),
+            x[1].flip([2, 0]),
+        ]
+    });
+    check("triangles", &[&t, &b], |x| {
+        vec![
+            x[0].triu(0),
+            x[0].triu(1),
+            x[0].tril(-1),
+            x[0].tril(5),
+            x[1].triu(-1),
+            x[1].tril(0),
+        ]
+    });
+    let s = var(&[], 4);
+    check("zero-dimensional flip and stack", &[&s], |x| {
+        vec![x[0].flip(0), homura::stack(&[&x[0], &x[0]], 0)]
+    });
+}
+
 // ---------------------------------------------------------------- empty inputs
 
 #[test]
@@ -474,7 +521,7 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
     let x = var(&[2, 3], 1);
     let none = Tensor::from_slice::<i64>(&[], [0]);
     type Op = (&'static str, fn(&Tensor, &Tensor, &Tensor) -> Tensor);
-    let ops: [Op; 18] = [
+    let ops: [Op; 24] = [
         ("exp", |e, _, _| e.exp()),
         ("relu", |e, _, _| e.relu()),
         ("div", |e, x, _| e / &x.narrow(0, 0, 1)),
@@ -495,6 +542,16 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
         ("unsqueeze", |e, _, _| e.unsqueeze(1)),
         ("squeeze", |e, _, _| e.unsqueeze(1).squeeze_dim([1, 2])),
         ("alias", |e, _, _| e.index((.., ..))),
+        ("concat", |e, x, _| {
+            homura::concat(&[e, &x.narrow(0, 0, 0)], 0)
+        }),
+        ("concat along the empty dimension", |e, _, _| {
+            homura::concat(&[e, e], 1)
+        }),
+        ("stack", |e, _, _| homura::stack(&[e, e], 1)),
+        ("flip", |e, _, _| e.flip([0, 1])),
+        ("triu", |e, _, _| e.triu(1)),
+        ("tril", |e, _, _| e.tril(0)),
     ];
     for (name, op) in ops {
         let y = op(&empty, &x, &none);

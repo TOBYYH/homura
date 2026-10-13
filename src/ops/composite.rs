@@ -1,11 +1,11 @@
 //! Operations defined in terms of other operations, plus softmax.
 
-use super::{Operand, common_device};
+use super::{Operand, common_device, scalar_data};
 use crate::autograd::formulas::ScaledProduct;
 use crate::backend::cpu;
 use crate::dtype::Kind;
 use crate::shape::normalize_dim;
-use crate::{DType, Device, Scalar, Tensor};
+use crate::{DType, Device, Scalar, Shape, Tensor};
 
 fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     let src = x.data();
@@ -91,45 +91,144 @@ fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scala
     }
 }
 
-/// `beta * input + alpha * product` with the dtype of `product`, where the values of `input` are
-/// ignored when `beta` is zero (so NaN in it does not propagate), as PyTorch's `add*` operations
-/// do. `input` must still have the dtype and device of `product` and broadcast to its shape,
-/// whatever `beta` is. The coefficients are converted to the dtype first, see [`coefficient`].
-///
-/// Callers run it in no-grad mode and record the operation's own node: its gradients scale
-/// differently from those of the operations used here.
-fn scaled_sum(
+/// Checks the `input` of an `add*` operation against its result of `shape`, which has the dtype
+/// and device of `factor`, before anything is computed: `input` must have that dtype and device
+/// and broadcast to the shape, whatever `beta` is. Returns the coefficients converted to the
+/// dtype, see [`coefficient`].
+fn check_input(
     input: &Tensor,
-    product: Tensor,
-    beta: Scalar,
-    alpha: Scalar,
+    factor: &Tensor,
+    shape: &Shape,
+    (beta, alpha): (Scalar, Scalar),
     rule: Coefficients,
-) -> Tensor {
-    let (i, p) = (input.data(), product.data());
-    common_device([&i, &p]);
-    if i.dtype != p.dtype {
+) -> (Scalar, Scalar) {
+    let (i, f) = (input.data(), factor.data());
+    common_device([&i, &f]);
+    if i.dtype != f.dtype {
         panic!(
             "self and mat2 must have the same dtype, but got {} and {}",
-            i.dtype, p.dtype
+            i.dtype, f.dtype
         );
     }
-    i.layout.expand_to(&p.layout.shape);
-    let beta = coefficient(beta, p.dtype, "beta", rule);
-    let alpha = coefficient(alpha, p.dtype, "alpha", rule);
-    let product = if alpha.to_f64() == 1.0 {
-        product
-    } else {
-        product.mul(alpha)
-    };
+    i.layout.expand_to(shape);
+    (
+        coefficient(beta, f.dtype, "beta", rule),
+        coefficient(alpha, f.dtype, "alpha", rule),
+    )
+}
+
+/// `t * s`, skipped when `s` is one.
+fn scale(t: Tensor, s: Scalar) -> Tensor {
+    if s.to_f64() == 1.0 { t } else { t.mul(s) }
+}
+
+/// `beta * input + alpha * product`, where the values of `input` are ignored when `beta` is zero
+/// (so NaN in it does not propagate), as PyTorch's `add*` operations do.
+fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
+    let product = scale(product, alpha);
     if beta.to_f64() == 0.0 {
         return product;
     }
-    let scaled = if beta.to_f64() == 1.0 {
-        input.clone()
-    } else {
-        input.mul(beta)
-    };
-    scaled.add(&product)
+    scale(input.clone(), beta).add(&product)
+}
+
+/// A floating point coefficient rounded to `dtype`, as kernels that take it in the tensor's own
+/// type see it.
+fn rounded(s: Scalar, dtype: DType) -> Scalar {
+    match s {
+        Scalar::Float(_) => {
+            let t = Tensor::from_data(scalar_data(s, dtype, Device::Cpu));
+            Scalar::Float(t.to(DType::F64).item())
+        }
+        _ => s,
+    }
+}
+
+/// The CPU kernel PyTorch computes a matrix product scaled by `alpha` with.
+#[derive(Clone, Copy, PartialEq)]
+enum Kernel {
+    /// `addmm`, `baddbmm` and `addbmm`: BLAS `gemm`, or for half precision a product
+    /// accumulated in f32 and combined with the coefficients in f32 before rounding once.
+    Gemm,
+    /// `addmv`: BLAS `gemv`, or for half precision the same, except that it takes the
+    /// coefficients rounded to the dtype.
+    Gemv,
+}
+
+/// `beta * input + alpha * product(x, y)` for the matrix products, with the dtype of the factors
+/// and `product` computing the matrix product itself.
+///
+/// The factors are checked before anything is computed, by computing `product` on metadata only,
+/// so that the checks and messages don't depend on the coefficients. The value follows the CPU
+/// kernels PyTorch dispatches to, so that a zero coefficient doesn't produce NaN where they
+/// don't:
+///
+/// - `F32` and `F64`: BLAS doesn't read the factors when `alpha` is zero, so neither do these
+///   operations; the result is `beta * input` (zeros for a zero `beta`), even if the factors
+///   hold infinities or their product overflows. PyTorch's `baddbmm` computes products of fewer
+///   than 400 elements (`m * k * n`) with a kernel of its own instead, where an overflowing
+///   product times zero is NaN; homura follows BLAS at every size, which is also what GPU
+///   libraries do.
+/// - `F16` and `BF16`: the product is accumulated in f32 and scaled there, then rounded once, so
+///   it overflows to NaN only if it overflows f32. This is PyTorch's `gemv` for a row-major
+///   matrix; for a column-major one (including `[m, 1]`) it scales the vector first and rounds
+///   `beta * input` separately, and its `baddbmm` of 400 or more elements with several batches
+///   drops `beta` when `alpha` is zero. homura's values don't depend on the layout and don't
+///   follow either.
+/// - integers: the product in the dtype, scaled with wrapping arithmetic.
+fn scaled_matrix_product(
+    input: &Tensor,
+    (x, y): (&Tensor, &Tensor),
+    coefficients: (Scalar, Scalar),
+    kernel: Kernel,
+    product: impl Fn(&Tensor, &Tensor) -> Tensor,
+) -> Tensor {
+    let device = common_device([&x.data(), &y.data()]);
+    let meta = |t: &Tensor| Tensor::empty_on(t.shape(), t.dtype(), Device::Meta);
+    let shape = product(&meta(x), &meta(y)).shape();
+    let dtype = x.dtype();
+    let (beta, alpha) = check_input(input, x, &shape, coefficients, Coefficients::Truncate);
+    match dtype {
+        DType::F32 | DType::F64 if alpha.to_f64() == 0.0 => {
+            if beta.to_f64() == 0.0 {
+                crate::zeros_with(shape, (dtype, device))
+            } else {
+                scale(input.clone(), beta).expand(&shape).deep_clone()
+            }
+        }
+        DType::F16 | DType::BF16 => {
+            let (beta, alpha) = match kernel {
+                Kernel::Gemm => (beta, alpha),
+                Kernel::Gemv => (rounded(beta, dtype), rounded(alpha, dtype)),
+            };
+            let p = product(&x.to(DType::F32), &y.to(DType::F32));
+            scaled_sum(&input.to(DType::F32), p, beta, alpha).to(dtype)
+        }
+        _ => scaled_sum(input, product(x, y), beta, alpha),
+    }
+}
+
+/// `addr` of inputs already promoted to one dtype.
+///
+/// Floating point values follow PyTorch's elementwise kernel, `beta * input + alpha * vec1 *
+/// vec2` evaluated left to right in the dtype with the coefficients rounded to it: `alpha`
+/// scales `vec1` before the outer product, so a zero or tiny `alpha` doesn't turn a finite
+/// result into NaN or infinity. Integers and bools compute the outer product first, which gives
+/// the same values; a broadcast product rather than a matmul, which doesn't support bool.
+fn addr_value(input: &Tensor, v1: &Tensor, v2: &Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
+    let dtype = v1.dtype();
+    let shape = Shape::new(&[v1.size(0), v2.size(0)]);
+    let (beta, alpha) = check_input(input, v1, &shape, (beta, alpha), Coefficients::Strict);
+    let outer = |v1: Tensor| v1.unsqueeze(1).mul(v2.unsqueeze(0));
+    if !dtype.is_floating_point() {
+        return scaled_sum(input, outer(v1.clone()), beta, alpha);
+    }
+    let (beta, alpha) = (rounded(beta, dtype), rounded(alpha, dtype));
+    let product = outer(scale(v1.clone(), alpha));
+    if beta.to_f64() == 0.0 {
+        return product;
+    }
+    scale(input.clone(), beta).add(&product)
 }
 
 /// Computes `beta * input + alpha * product(x, y)` with `forward` in no-grad mode and records
@@ -175,7 +274,10 @@ impl Tensor {
     /// result.
     ///
     /// The result keeps the input dtype: for integer inputs, floating point coefficients are
-    /// truncated toward zero, as in PyTorch. This also holds for [`addmv`](Tensor::addmv),
+    /// truncated toward zero, as in PyTorch. For `F32` and `F64`, a zero `alpha` means that the
+    /// factors aren't read, as in BLAS, so infinities in them or an overflowing product don't
+    /// make the result NaN; `F16` and `BF16` products are accumulated and scaled in f32 before
+    /// rounding once. All this also holds for [`addmv`](Tensor::addmv),
     /// [`baddbmm`](Tensor::baddbmm) and [`addbmm`](Tensor::addbmm).
     ///
     /// # Panics
@@ -192,7 +294,9 @@ impl Tensor {
         check_dims(mat2, 2, "mat2");
         let (beta, alpha) = (beta.into(), alpha.into());
         scaled_product(ScaledProduct::Mm, self, mat1, mat2, beta, alpha, || {
-            scaled_sum(self, mat1.matmul(mat2), beta, alpha, Coefficients::Truncate)
+            scaled_matrix_product(self, (mat1, mat2), (beta, alpha), Kernel::Gemm, |a, b| {
+                a.matmul(b)
+            })
         })
     }
 
@@ -208,12 +312,16 @@ impl Tensor {
         check_dims(vec, 1, "vec");
         let (beta, alpha) = (beta.into(), alpha.into());
         scaled_product(ScaledProduct::Mv, self, mat, vec, beta, alpha, || {
-            scaled_sum(self, mat.matmul(vec), beta, alpha, Coefficients::Truncate)
+            scaled_matrix_product(self, (mat, vec), (beta, alpha), Kernel::Gemv, |a, b| {
+                a.matmul(b)
+            })
         })
     }
 
     /// `beta * self + alpha * outer(vec1, vec2)` for 1-D `vec1` and `vec2`.
-    /// The three tensor inputs are promoted to a common dtype before computation.
+    /// The three tensor inputs are promoted to a common dtype before computation. Floating point
+    /// values are computed like PyTorch's kernel, `beta * self + (alpha * vec1) * vec2` in the
+    /// dtype, so a zero or tiny `alpha` doesn't make a finite result NaN or infinite.
     ///
     /// # Panics
     ///
@@ -240,11 +348,9 @@ impl Tensor {
         // (PyTorch's backward rejects mixed dtypes).
         let (input, v1, v2) = (self.to(dtype), vec1.to(dtype), vec2.to(dtype));
         let (beta, alpha) = (beta.into(), alpha.into());
+        // Cast before multiplication so a wider self also widens the product computation.
         scaled_product(ScaledProduct::Outer, &input, &v1, &v2, beta, alpha, || {
-            // A broadcast product rather than a matmul, which doesn't support bool.
-            // Cast before multiplication so a wider self also widens the product computation.
-            let outer = v1.unsqueeze(1).mul(v2.unsqueeze(0));
-            scaled_sum(&input, outer, beta, alpha, Coefficients::Strict)
+            addr_value(&input, &v1, &v2, beta, alpha)
         })
     }
 
@@ -274,12 +380,12 @@ impl Tensor {
             beta,
             alpha,
             || {
-                scaled_sum(
+                scaled_matrix_product(
                     self,
-                    batch1.matmul(batch2),
-                    beta,
-                    alpha,
-                    Coefficients::Truncate,
+                    (batch1, batch2),
+                    (beta, alpha),
+                    Kernel::Gemm,
+                    |a, b| a.matmul(b),
                 )
             },
         )
@@ -311,10 +417,17 @@ impl Tensor {
             beta,
             alpha,
             || {
-                // Integer sums are computed in `I64`; casting back wraps exactly like accumulating
-                // in the input dtype would.
-                let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
-                scaled_sum(self, product, beta, alpha, Coefficients::Truncate)
+                scaled_matrix_product(
+                    self,
+                    (batch1, batch2),
+                    (beta, alpha),
+                    Kernel::Gemm,
+                    |a, b| {
+                        // Integer sums are computed in `I64`; casting back wraps exactly like
+                        // accumulating in the input dtype would.
+                        a.matmul(b).sum_dim(0, false).to(a.dtype())
+                    },
+                )
             },
         )
     }

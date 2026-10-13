@@ -688,7 +688,8 @@ case("special.tril", lambda x: x.tril(-1), x=f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
 
 # ---------------------------------------------------------------- step 6f
 # Matrix products. homura records one matmul node where PyTorch decomposes into dot, mv, mm or bmm
-# and views; the gradients are the same. The scaled products multiply the product of `g` with the
+# and views; the gradients have the same formulas, computed with homura's f64 CPU inner products,
+# so extreme cancellations can overflow in one and not the other (review round 23). The scaled products multiply the product of `g` with the
 # other factor by alpha, so a zero alpha turns an overflowing product into NaN and a huge alpha
 # keeps a tiny product finite; with beta = 0 the input still gets `g * 0`.
 for name, sx, sy in [

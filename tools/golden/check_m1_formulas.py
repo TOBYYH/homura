@@ -2049,4 +2049,116 @@ for device in ["cpu", "meta"]:
         for t, gt in zip([x, a, b], torch.autograd.grad(out, [x, a, b], g, create_graph=True)):
             assert gt.shape == t.shape and gt.device.type == device
 
+# ---------------------------------------------------------------- review round 23 (R38)
+# tests/m1_regressions.rs: the value of a scaled product with alpha = 0. The reference picks its CPU
+# kernel by dtype, size and layout; homura follows BLAS for F32 / F64 matrix products, an f32
+# accumulator for half precision ones, and the elementwise kernel for addr. Cells where the
+# reference's own result depends on the size or layout are asserted here and noted.
+SCALED_ONE = {
+    "addmm": lambda f, v: torch.addmm(f((1, 1), 3.0), f((1, 1), v), f((1, 1), v), beta=2, alpha=0),
+    "addmv": lambda f, v: torch.addmv(f((1,), 3.0), f((1, 1), v), f((1,), v), beta=2, alpha=0),
+    "addr": lambda f, v: torch.addr(f((1, 1), 3.0), f((1,), v), f((1,), v), beta=2, alpha=0),
+    "baddbmm": lambda f, v: torch.baddbmm(f((1, 1, 1), 3.0), f((1, 1, 1), v), f((1, 1, 1), v), beta=2, alpha=0),
+    "addbmm": lambda f, v: torch.addbmm(f((1, 1), 3.0), f((1, 1, 1), v), f((1, 1, 1), v), beta=2, alpha=0),
+}
+N = None
+for dtype, v, expected in [
+    (torch.float16, 1000.0, [6, 6, 6, 6, 6]),
+    (torch.float16, math.inf, [N] * 5),
+    (torch.bfloat16, 1e30, [N, 6, 6, N, N]),  # homura's addmv: NaN, like the row-major case below
+    (torch.bfloat16, math.inf, [N] * 5),
+    (torch.float32, 1e30, [6, 6, 6, N, 6]),  # homura's baddbmm: 6, like 400 elements and more below
+    (torch.float32, math.inf, [6, 6, N, N, 6]),
+    (torch.float64, 1e200, [6, 6, 6, N, 6]),
+    (torch.float64, math.inf, [6, 6, N, N, 6]),
+]:
+    f = lambda shape, value, dtype=dtype: torch.full(shape, value, dtype=dtype)  # noqa: E731
+    for (name, op), want in zip(SCALED_ONE.items(), expected):
+        got = op(f, v).item()
+        assert (math.isnan(got) if want is None else got == want), (name, dtype, v, got)
+f32 = lambda shape, value: torch.full(shape, value)  # noqa: E731
+for m, k, n, want in [(7, 8, 7, None), (8, 8, 7, 6.0)]:
+    for v in [1e30, math.inf]:
+        got = torch.baddbmm(f32((2, m, n), 3.0), f32((2, m, k), v), f32((2, k, n), v), beta=2, alpha=0)[0, 0, 0].item()
+        assert (math.isnan(got) if want is None else got == want), (m, k, n, v, got)
+bf = lambda shape, value: torch.full(shape, value, dtype=torch.bfloat16)  # noqa: E731
+assert torch.addmv(bf((2,), 3.0), bf((2, 3), 1e30), bf((3,), 1e30), beta=2, alpha=0).isnan().all()
+assert (torch.addmv(bf((2,), 3.0), bf((3, 2), 1e30).t(), bf((3,), 1e30), beta=2, alpha=0) == 6).all()
+# The reference's half precision baddbmm of 400 elements or more with several batches drops beta
+# when alpha is zero (one batch, or alpha 1, is right); homura gives beta * input.
+h16 = lambda shape, value: torch.full(shape, value, dtype=torch.float16)  # noqa: E731
+assert (torch.baddbmm(h16((2, 16, 16), 3.0), h16((2, 16, 16), 1.0), h16((2, 16, 16), 1.0), beta=2, alpha=0) == 3).all()
+assert (torch.baddbmm(h16((1, 16, 16), 3.0), h16((1, 16, 16), 1.0), h16((1, 16, 16), 1.0), beta=2, alpha=0) == 6).all()
+
+# zero_alpha_keeps_the_value_finite_and_the_factor_gradients_in_order
+x, a, b = leaf([[3.0]]), leaf([[1e30]]), leaf([[1e30]])
+out = torch.addmm(x, a, b, beta=2, alpha=0)
+assert out.item() == 6.0
+gx, ga, gb = torch.autograd.grad(out, [x, a, b], torch.tensor([[1e10]]))
+assert gx.item() == 2e10 and ga.isnan().all() and gb.isnan().all()
+x, a, b = (torch.full((1, 1), v, dtype=torch.float16, requires_grad=True) for v in (3.0, 1000.0, 1000.0))
+out = torch.addmm(x, a, b, beta=2, alpha=0)
+assert out.item() == 6.0
+out.sum().backward()
+assert a.grad.item() == 0.0
+
+# zero_alpha_boundaries
+a, b = f32((2, 4), math.inf), f32((4, 3), 1e30)
+assert (torch.addmm(f32((3,), 1.0), a, b, beta=2, alpha=-0.0) == 2).all()
+out = torch.addmm(f32((3,), math.nan), a, b, beta=0, alpha=0)
+assert out.shape == (2, 3) and (out == 0).all()
+inp = torch.tensor([-0.0, 1.0, 2.0])
+out = torch.addmm(inp, a, b, beta=1, alpha=0)
+inp.add_(5.0)
+assert exact(out) == ["-0.0", "1.0", "2.0", "-0.0", "1.0", "2.0"]
+t = f32((3, 2), 1e30).t()
+assert (torch.addmm(f32((2, 2), 1.0), t, f32((3, 2), 1e30), beta=3, alpha=0) == 3).all()
+assert (torch.addmv(f32((2,), 1.0), t, f32((3,), 1e30), beta=3, alpha=0) == 3).all()
+b1, b2 = f32((2, 2, 3), 1e30), f32((2, 3, 2), 1e30)
+assert torch.baddbmm(f32((2,), 1.0), b1, b2, beta=3, alpha=0).isnan().all()  # homura: 3 (BLAS)
+assert (torch.addbmm(f32((2, 1), 1.0), b1, b2, beta=3, alpha=0) == 3).all()
+out = torch.addmm(torch.zeros(3, device="meta"), torch.zeros(1 << 40, 2, device="meta"), torch.zeros(2, 3, device="meta"), beta=2, alpha=0)
+assert out.shape == (1 << 40, 3) and out.device.type == "meta"
+
+# zero_alpha_still_checks_every_argument
+ones = torch.ones
+assert message(lambda: torch.addmm(ones(1, 1), ones(1, 2), ones(3, 1), alpha=0)) == "mat1 and mat2 shapes cannot be multiplied (1x2 and 3x1)"
+assert "same dtype" in message(lambda: torch.addmv(ones(2), ones(2, 3), ones(3, dtype=torch.float64), alpha=0))
+for inp in [ones(3, 1), ones(1, 1, dtype=torch.float64), ones(1, 1, device="meta")]:
+    message(lambda: torch.addmm(inp, ones(1, 2), ones(2, 1), alpha=0))
+message(lambda: torch.baddbmm(ones(2, 2), ones(2, 2, 3), ones(2, 2, 2), beta=0, alpha=0))
+
+# addr_scales_the_first_vector_before_the_outer_product
+v = torch.addr(torch.zeros(1, 1), torch.tensor([3e38]), torch.tensor([10.0]), alpha=1e-10).item()
+assert abs(v - 3e29) <= 3e29 * 1e-6, v
+
+# half_scaled_products_take_their_coefficients_like_the_reference_kernels
+h = lambda shape, value: torch.full(shape, value, dtype=torch.float16)  # noqa: E731
+assert torch.addmm(h((1, 1), 0.0), h((1, 1), 1000.0), h((1, 1), 1.0), alpha=1.0004).item() == 1000.5
+assert torch.addmv(h((1,), 0.0), h((1, 1), 1000.0), h((1,), 1.0), alpha=1.0004).item() == 1000.0
+assert torch.addr(h((1, 1), 0.0), h((1,), 1000.0), h((1,), 1.0), alpha=1.0004).item() == 1000.0
+assert torch.baddbmm(h((1, 1, 1), 0.0), h((1, 1, 1), 1000.0), h((1, 1, 1), 1.0), alpha=1.0004).item() == 1000.5
+assert torch.addbmm(h((1, 1), 0.0), h((1, 1, 1), 1000.0), h((1, 1, 1), 1.0), alpha=1.0004).item() == 1000.5
+assert torch.addmm(h((1, 1), 1000.0), h((1, 1), 0.0), h((1, 1), 1.0), beta=1.0004).item() == 1000.5
+assert torch.addmv(h((1,), 1000.0), h((1, 1), 0.0), h((1,), 1.0), beta=1.0004).item() == 1000.0
+assert torch.addr(h((1, 1), 1000.0), h((1,), 0.0), h((1,), 1.0), beta=1.0004).item() == 1000.0
+th = lambda v: torch.tensor(v, dtype=torch.float16)  # noqa: E731
+assert torch.addmv(th([0.0, 0.0]), th([[1000.0, 0.0], [1000.0, 0.0]]), th([1.0, 0.0]), alpha=1.0004).tolist() == [1000.0, 1000.0]
+assert torch.addmv(th([1000.0, 1000.0]), th([[0.0, 0.0], [0.0, 0.0]]), th([1.0, 0.0]), beta=1.0004).tolist() == [1000.0, 1000.0]
+# One rounding of beta * input + alpha * product for a row-major matrix and in addmm; the gemv of a
+# column-major matrix ([1, 1] here) rounds beta * input first (homura: 3000 for any layout).
+assert torch.addmv(th([1000.5, 1000.5]), th([[0.75, 0.0], [0.75, 0.0]]), th([-1.0, 0.0]), beta=3).tolist() == [3000.0, 3000.0]
+assert torch.addmm(h((1, 1), 1000.5), h((1, 1), 0.75), h((1, 1), -1.0), beta=3).item() == 3000.0
+assert torch.addmv(h((1,), 1000.5), h((1, 1), 0.75), h((1,), -1.0), beta=3).item() == 3002.0
+
+# empty_addmv_gives_the_mathematical_shape: the reference keeps the scalar input's shape and fails
+# in its own backward; homura returns the product's shape and differentiates.
+for mat, vec in [((0, 2), (2,)), ((2, 0), (0,))]:
+    x = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
+    m = torch.zeros(mat, dtype=torch.float64, requires_grad=True)
+    v = torch.zeros(vec, dtype=torch.float64, requires_grad=True)
+    out = torch.addmv(x, m, v, beta=1, alpha=1)
+    assert out.shape == ()
+    assert "Expected 1-D argument self" in message(lambda: torch.autograd.grad(out.sum(), [x, m, v]))
+
 print("check_m1_formulas: all reference checks passed")

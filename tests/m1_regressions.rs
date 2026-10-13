@@ -751,3 +751,275 @@ fn zero_dimensional_tensors_reject_repeated_dimensions() {
     let g = autograd::grad(&[&s.squeeze_dim([-1])], &[&s], options).remove(0);
     assert_eq!(g.unwrap().to_vec::<f64>(), [3.0]);
 }
+
+// ---------------------------------------------------------------- R38: scaled products, alpha = 0
+
+/// `op` on the smallest shapes: `input` 3 and both factors `v`, of `dtype`.
+fn scaled_one(op: &str, dtype: DType, v: f64, beta: f64, alpha: f64) -> Tensor {
+    let f = |shape: &[usize], value: f64| homura::full_with(shape, value, dtype);
+    match op {
+        "addmm" => f(&[1, 1], 3.0).addmm(&f(&[1, 1], v), &f(&[1, 1], v), beta, alpha),
+        "addmv" => f(&[1], 3.0).addmv(&f(&[1, 1], v), &f(&[1], v), beta, alpha),
+        "addr" => f(&[1, 1], 3.0).addr(&f(&[1], v), &f(&[1], v), beta, alpha),
+        "baddbmm" => f(&[1, 1, 1], 3.0).baddbmm(&f(&[1, 1, 1], v), &f(&[1, 1, 1], v), beta, alpha),
+        "addbmm" => f(&[1, 1], 3.0).addbmm(&f(&[1, 1, 1], v), &f(&[1, 1, 1], v), beta, alpha),
+        _ => unreachable!(),
+    }
+}
+
+/// The only value of `t`, `None` for NaN.
+fn value(t: &Tensor) -> Option<f64> {
+    let v = t.to(DType::F64).to_vec::<f64>()[0];
+    (!v.is_nan()).then_some(v)
+}
+
+const SCALED: [&str; 5] = ["addmm", "addmv", "addr", "baddbmm", "addbmm"];
+
+#[test]
+fn zero_alpha_scaled_products_follow_the_reference_kernels() {
+    // Review round 23's table with beta 2 and alpha 0 (`None` is NaN), against the pinned
+    // PyTorch: F32 and F64 matrix products follow BLAS and don't read the factors; half precision
+    // products are accumulated and scaled in f32, so they are NaN only if f32 overflows; addr
+    // scales `vec1` before the outer product. Starred cells differ from the reference on these
+    // one-element shapes, where its own result depends on the size or layout (checked below).
+    let inf = f64::INFINITY;
+    let six = Some(6.0);
+    let table: [(DType, f64, [Option<f64>; 5]); 8] = [
+        (DType::F16, 1000.0, [six; 5]),
+        (DType::F16, inf, [None; 5]),
+        // *addmv: the reference gives 6 for this column-major [1, 1] matrix.
+        (DType::BF16, 1e30, [None, None, six, None, None]),
+        (DType::BF16, inf, [None; 5]),
+        // *baddbmm: the reference gives NaN for products of fewer than 400 elements.
+        (DType::F32, 1e30, [six; 5]),
+        (DType::F32, inf, [six, six, None, six, six]),
+        (DType::F64, 1e200, [six; 5]),
+        (DType::F64, inf, [six, six, None, six, six]),
+    ];
+    for (dtype, v, expected) in table {
+        for (op, want) in SCALED.iter().zip(expected) {
+            let out = scaled_one(op, dtype, v, 2.0, 0.0);
+            assert_eq!(out.dtype(), dtype);
+            assert_eq!(value(&out), want, "{op} {dtype} {v}");
+        }
+    }
+    // Where the reference's size and layout make it take the same path as homura: its BLAS
+    // `baddbmm` of 448 elements, and its `gemv` of a row-major BF16 matrix.
+    let f = |shape: &[usize], value: f64, dtype| homura::full_with(shape, value, dtype);
+    for v in [1e30, inf] {
+        let out = f(&[2, 8, 7], 3.0, DType::F32).baddbmm(
+            &f(&[2, 8, 8], v, DType::F32),
+            &f(&[2, 8, 7], v, DType::F32),
+            2,
+            0,
+        );
+        assert!(out.to_vec::<f32>().iter().all(|&x| x == 6.0));
+    }
+    let out = f(&[2], 3.0, DType::BF16).addmv(
+        &f(&[2, 3], 1e30, DType::BF16),
+        &f(&[3], 1e30, DType::BF16),
+        2,
+        0,
+    );
+    assert!(out.to_vec::<f32>().iter().all(|x| x.is_nan()));
+}
+
+#[test]
+fn zero_alpha_keeps_the_value_finite_and_the_factor_gradients_in_order() {
+    // The value ignores the overflowing product, while the factors' gradients still multiply
+    // the overflowing `g @ factorᵀ` by zero (NaN), as in the reference.
+    let leaf = |v: f32| {
+        let t = Tensor::from_slice(&[v], [1, 1]);
+        t.requires_grad_(true);
+        t
+    };
+    let (x, a, b) = (leaf(3.0), leaf(1e30), leaf(1e30));
+    let out = x.addmm(&a, &b, 2, 0);
+    assert_eq!(out.to_vec::<f32>(), [6.0]);
+    let options = GradOptions {
+        grad_outputs: vec![Some(Tensor::from_slice(&[1e10f32], [1, 1]))],
+        ..Default::default()
+    };
+    let grads = autograd::grad(&[&out], &[&x, &a, &b], options);
+    assert_eq!(grads[0].as_ref().unwrap().to_vec::<f32>(), [2e10]);
+    for g in &grads[1..] {
+        assert!(g.as_ref().unwrap().to_vec::<f32>()[0].is_nan());
+    }
+    // F16: 1000 * 1000 overflows F16 but not the f32 accumulator, so the value and the
+    // gradients are finite.
+    let half = |v: f64| {
+        let t = homura::full_with([1, 1], v, DType::F16);
+        t.requires_grad_(true);
+        t
+    };
+    let (x, a, b) = (half(3.0), half(1000.0), half(1000.0));
+    let out = x.addmm(&a, &b, 2, 0);
+    assert_eq!(out.to_vec::<f32>(), [6.0]);
+    out.sum().backward();
+    assert_eq!(a.grad().unwrap().to_vec::<f32>(), [0.0]);
+}
+
+#[test]
+fn zero_alpha_boundaries() {
+    let f = |shape: &[usize], value: f64| homura::full_with(shape, value, DType::F32);
+    let (a, b) = (f(&[2, 4], f64::INFINITY), f(&[4, 3], 1e30));
+    // -0 is zero; a zero beta ignores NaN in the input and gives zeros of the result's shape.
+    assert_eq!(
+        f(&[3], 1.0).addmm(&a, &b, 2, -0.0).to_vec::<f32>(),
+        [2.0; 6]
+    );
+    let out = f(&[3], f64::NAN).addmm(&a, &b, 0, 0);
+    assert_eq!(
+        (out.shape(), out.to_vec::<f32>()),
+        ([2, 3].into(), vec![0.0; 6])
+    );
+    // With beta 1 the result is a new tensor holding the broadcast input, -0 included.
+    let input = Tensor::from_slice(&[-0.0f32, 1.0, 2.0], [3]);
+    let out = input.addmm(&a, &b, 1, 0);
+    input.add_(5.0);
+    assert_eq!(
+        bits(&out),
+        bits(&Tensor::from_slice(
+            &[-0.0f32, 1.0, 2.0, -0.0, 1.0, 2.0],
+            [2, 3]
+        ))
+    );
+    // Non-contiguous factors and every operation's own shapes.
+    let t = f(&[3, 2], 1e30).transpose(0, 1);
+    assert_eq!(
+        f(&[2, 2], 1.0)
+            .addmm(&t, &f(&[3, 2], 1e30), 3, 0)
+            .to_vec::<f32>(),
+        [3.0; 4]
+    );
+    assert_eq!(
+        f(&[2], 1.0).addmv(&t, &f(&[3], 1e30), 3, 0).to_vec::<f32>(),
+        [3.0; 2]
+    );
+    let (b1, b2) = (f(&[2, 2, 3], 1e30), f(&[2, 3, 2], 1e30));
+    assert_eq!(
+        f(&[2], 1.0).baddbmm(&b1, &b2, 3, 0).to_vec::<f32>(),
+        [3.0; 8]
+    );
+    assert_eq!(
+        f(&[2, 1], 1.0).addbmm(&b1, &b2, 3, 0).to_vec::<f32>(),
+        [3.0; 4]
+    );
+    // Metadata only.
+    let m = |shape: &[usize]| homura::zeros_with(shape, Device::Meta);
+    let out = m(&[3]).addmm(&m(&[1 << 40, 2]), &m(&[2, 3]), 2, 0);
+    assert_eq!(
+        (out.shape(), out.device()),
+        ([1 << 40, 3].into(), Device::Meta)
+    );
+}
+
+#[test]
+fn zero_alpha_still_checks_every_argument() {
+    // The factors are checked as before, with the same messages, though they aren't read.
+    let message = |f: &dyn Fn()| {
+        let p = catch_unwind(AssertUnwindSafe(f)).expect_err("expected a panic");
+        p.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap()
+    };
+    let f = |shape: &[usize]| homura::ones(shape);
+    assert_eq!(
+        message(&|| {
+            f(&[1, 1]).addmm(&f(&[1, 2]), &f(&[3, 1]), 1, 0);
+        }),
+        "mat1 and mat2 shapes cannot be multiplied (1x2 and 3x1)"
+    );
+    assert!(
+        message(&|| {
+            f(&[2]).addmv(&f(&[2, 3]), &homura::ones_with([3], DType::F64), 1, 0);
+        })
+        .contains("same dtype")
+    );
+    // The input must broadcast to the result, have its dtype and its device.
+    for (what, input) in [
+        ("shape", f(&[3, 1])),
+        ("dtype", homura::ones_with([1, 1], DType::F64)),
+        ("device", homura::ones_with([1, 1], Device::Meta)),
+    ] {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            input.addmm(&f(&[1, 2]), &f(&[2, 1]), 1, 0);
+        }));
+        assert!(result.is_err(), "{what}");
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        f(&[2, 2]).baddbmm(&f(&[2, 2, 3]), &f(&[2, 2, 2]), 0, 0);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn addr_scales_the_first_vector_before_the_outer_product() {
+    // The reference computes `alpha * vec1 * vec2` left to right: with alpha 1e-10, 3e38 * 10
+    // never overflows F32. (homura computed the outer product first, which was Inf.)
+    let v1 = Tensor::from_slice(&[3e38f32], [1]);
+    let v2 = Tensor::from_slice(&[10f32], [1]);
+    let out = homura::zeros([1, 1]).addr(&v1, &v2, 1, 1e-10);
+    let v = out.to_vec::<f32>()[0];
+    assert!((v - 3e29).abs() <= 3e29 * 1e-6, "{v}");
+}
+
+#[test]
+fn half_scaled_products_take_their_coefficients_like_the_reference_kernels() {
+    // Pinned F16 values: 1.0004 rounds to 1.0 in F16. addmm, baddbmm and addbmm keep the
+    // coefficients in f32 (1000 * 1.0004 = 1000.4, rounded to 1000.5); addmv's gemv and addr's
+    // elementwise kernel round them to F16 first, giving 1000 (for any layout of the matrix).
+    let f = |shape: &[usize], v: f64| homura::full_with(shape, v, DType::F16);
+    let alpha = |op: &str| match op {
+        "addmm" => f(&[1, 1], 0.0).addmm(&f(&[1, 1], 1000.0), &f(&[1, 1], 1.0), 1, 1.0004),
+        "addmv" => f(&[1], 0.0).addmv(&f(&[1, 1], 1000.0), &f(&[1], 1.0), 1, 1.0004),
+        "addr" => f(&[1, 1], 0.0).addr(&f(&[1], 1000.0), &f(&[1], 1.0), 1, 1.0004),
+        "baddbmm" => {
+            f(&[1, 1, 1], 0.0).baddbmm(&f(&[1, 1, 1], 1000.0), &f(&[1, 1, 1], 1.0), 1, 1.0004)
+        }
+        _ => f(&[1, 1], 0.0).addbmm(&f(&[1, 1, 1], 1000.0), &f(&[1, 1, 1], 1.0), 1, 1.0004),
+    };
+    for (op, want) in SCALED.iter().zip([1000.5, 1000.0, 1000.0, 1000.5, 1000.5]) {
+        assert_eq!(value(&alpha(op)), Some(want), "alpha of {op}");
+    }
+    let beta_mm = f(&[1, 1], 1000.0).addmm(&f(&[1, 1], 0.0), &f(&[1, 1], 1.0), 1.0004, 1);
+    let beta_mv = f(&[1], 1000.0).addmv(&f(&[1, 1], 0.0), &f(&[1], 1.0), 1.0004, 1);
+    let beta_r = f(&[1, 1], 1000.0).addr(&f(&[1], 0.0), &f(&[1], 1.0), 1.0004, 1);
+    assert_eq!(value(&beta_mm), Some(1000.5));
+    assert_eq!(value(&beta_mv), Some(1000.0));
+    assert_eq!(value(&beta_r), Some(1000.0));
+    // `beta * input + alpha * product` is rounded once: 3 * 1000.5 - 0.75 = 3000.75 gives 3000,
+    // where rounding 3001.5 to F16 first (3002) would give 3002. (The reference rounds first in
+    // the gemv of a column-major matrix, such as [1, 1], and gives 3002 there.)
+    let mat = Tensor::from_slice(&[0.75f32, 0.0, 0.75, 0.0], [2, 2]).to(DType::F16);
+    let vec = Tensor::from_slice(&[-1f32, 0.0], [2]).to(DType::F16);
+    let out = f(&[2], 1000.5).addmv(&mat, &vec, 3, 1);
+    assert_eq!(out.to_vec::<f32>(), [3000.0, 3000.0]);
+    let out = f(&[1, 1], 1000.5).addmm(&f(&[1, 1], 0.75), &f(&[1, 1], -1.0), 3, 1);
+    assert_eq!(value(&out), Some(3000.0));
+}
+
+#[test]
+fn empty_addmv_gives_the_mathematical_shape() {
+    // Review round 23: for a scalar input and an empty matrix with a non-zero beta, the pinned
+    // PyTorch returns a zero-dimensional result and then fails in its own backward. homura keeps
+    // the result shape of the product, and each input gets a gradient of its shape.
+    for (mat, vec, shape) in [([0, 2], [2], [0]), ([2, 0], [0], [2])] {
+        let x = Tensor::from_slice(&[1.0f64], []);
+        let (m, v) = (
+            homura::zeros_with(mat, DType::F64),
+            homura::zeros_with(vec, DType::F64),
+        );
+        for t in [&x, &m, &v] {
+            t.requires_grad_(true);
+        }
+        let out = x.addmv(&m, &v, 1, 1);
+        assert_eq!(out.shape(), shape);
+        assert!(out.to_vec::<f64>().iter().all(|&e| e == 1.0));
+        let grads = autograd::grad(&[&out.sum()], &[&x, &m, &v], GradOptions::default());
+        for (t, g) in [&x, &m, &v].iter().zip(grads) {
+            assert_eq!(g.unwrap().shape(), t.shape());
+        }
+    }
+}

@@ -1,5 +1,5 @@
-"""Check the reference behavior that tests/autograd_formulas.rs and tests/m1_ops.rs encode (M1
-steps 4, 6a and 6b), and the review fixes that tests/m1_regressions.rs encodes; does not write
+"""Check the reference behavior that tests/autograd_formulas.rs, tests/autograd_binary.rs,
+tests/autograd_reduce.rs and tests/m1_ops.rs encode (M1 steps 4 and 6a-6c), and the review fixes that tests/m1_regressions.rs encodes; does not write
 fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
@@ -7,8 +7,10 @@ asserted and the difference is noted: messages name homura's dtypes and operatio
 single precision sums of repeated positions are rounded once from f64, an out-of-range position
 is reported even when `self` is empty, `index_add` rejects zero-dimensional `self` like homura's
 `index_select`, tensors must share a device, the backward graph keeps one node per slice,
-`as_strided` can't differentiate an input whose elements overlap, and `scalar / x` is one
-division (Python computes `x.reciprocal() * scalar`).
+`as_strided` can't differentiate an input whose elements overlap, `scalar / x` is one
+division (Python computes `x.reciprocal() * scalar`), the gradient of `prod` for an input with
+zeros can't be differentiated again (create_graph), and `var` and `std` over an empty list of
+dimensions get the gradient of the whole reduction (PyTorch counts one reduced element there).
 """
 
 import math
@@ -1103,5 +1105,242 @@ for divide in [False, True]:
                     assert message(lambda: out.sum().backward()).startswith("Trying to backward through the graph a second time")
                 else:
                     out.sum().backward()
+
+# ---------------------------------------------------------------- step 6c: reductions
+nan, inf = math.nan, math.inf
+
+
+def grad_of(out, x, g):
+    return torch.autograd.grad(out, x, torch.tensor(g, dtype=out.dtype).reshape(out.shape))[0]
+
+
+def leaf64(values):
+    return torch.tensor(values, dtype=torch.float64, requires_grad=True)
+
+
+x = leaf64([[1.0, 2, 3], [4, 5, 6]])
+same(grad_of(x.sum(-1), x, [inf, -2.0]), [inf, inf, inf, -2, -2, -2])
+same(grad_of(x.sum(0, keepdim=True), x, [[1.0, 2, 3]]), [1, 2, 3, 1, 2, 3])
+same(grad_of(x.sum((1, 0)), x, 4.0), [4.0] * 6)
+same(grad_of(x.sum(dim=[]), x, 3.0), [3.0] * 6)
+assert x.sum(dim=[]).shape == ()
+same(grad_of(x.sum(dim=[], keepdim=True), x, [[3.0]]), [3.0] * 6)
+same(grad_of(x.mean(), x, 3.0), [0.5] * 6)
+same(grad_of(x.mean(0), x, [2.0, inf, -4]), [1, inf, -2, 1, inf, -2])
+same(grad_of(x.mean(-1, keepdim=True), x, [[3.0], [6]]), [1, 1, 1, 2, 2, 2])
+same(grad_of(x.mean(dim=[], keepdim=True), x, [[3.0]]), [0.5] * 6)
+s0 = leaf64(3.0)
+for out in [s0.sum(0), s0.mean(-1, keepdim=True), s0.mean()]:
+    same(grad_of(out, s0, 2.0), [2.0])
+for out, name in [
+    (x.sum(0), "SumBackward1"),
+    (x.sum(dim=[]), "SumBackward1"),
+    (x.mean(), "MeanBackward0"),
+    (x.mean(1), "MeanBackward1"),
+    (x.mean(dim=[]), "MeanBackward1"),
+]:
+    assert node(out) == (name, [ACC]), node(out)
+
+# prod: `g * (result / x)` without zeros; with zeros the products of the other elements in every
+# slice (PyTorch's cumprod accumulates them in double and rounds them to float), and zeros for a whole product with two
+# zeros outside grad mode.
+for values, g, expected in [
+    ([2.0, 3, 4], 1.0, [12, 8, 6]),
+    ([2.0, 3, 4], inf, [inf] * 3),
+    ([2.0, inf, 4], 1.0, [inf, nan, inf]),
+    ([2.0, nan, 4], 1.0, [nan] * 3),
+    ([2.0, 0, 4], 1.0, [0, 8, 0]),
+    ([2.0, 0, 4], inf, [nan, inf, nan]),
+    ([0.0, inf, 2], 1.0, [inf, 0, nan]),
+    ([0.0, nan, 2], 1.0, [nan, 0, nan]),
+    ([-0.0, 3, 2], 1.0, [6, -0.0, -0.0]),
+    ([0.0, 3, 0], 1.0, [0] * 3),
+    ([0.0, 3, 0], inf, [0] * 3),
+    ([0.0, inf, 0], nan, [0] * 3),
+]:
+    x = leaf64(values)
+    same(grad_of(x.prod(), x, g), expected)
+x = leaf64([[2.0, inf, 4], [0, 3, 5]])
+same(grad_of(x.prod(1), x, [1.0, 1]), [inf, 8, inf, 15, 0, 0])
+x = leaf64([[2.0, inf, 4], [1, 3, 5]])
+same(grad_of(x.prod(-1), x, [1.0, 1]), [inf, nan, inf, 15, 5, 3])
+x = leaf64([[0.0, inf, 0], [1, 3, 5]])
+same(grad_of(x.prod(1), x, [inf, 1.0]), [nan, nan, nan, 15, 5, 3])
+x = leaf64([[0.0, 2], [3, 4]])
+same(grad_of(x.prod(0, keepdim=True), x, [[1.0, 2]]), [3, 8, 0, 4])
+x = leaf([1e30, 1e30, 1e-30, 0.0])
+d = grad_of(x.prod(), x, 1.0).tolist()
+assert d[:2] == [0.0, 0.0] and math.isnan(d[2]) and d[3] == torch.tensor(1e30).item(), d
+v = [1e30, 1e30, 1e-30, 1e-30, 0.0]
+x = leaf([v, v[::-1]])
+d = grad_of(x.prod(1), x, [1.0, 1.0]).flatten().tolist()
+assert [str(e) for e in d] == ["0.0", "0.0", "nan", "0.0", "1.0", "1.0", "0.0", "nan", "0.0", "0.0"], d
+x = leaf(v)
+d = grad_of(x.prod(), x, 1.0).tolist()
+assert [str(e) for e in d] == ["0.0", "0.0", "nan", "0.0", "1.0"], d
+for out, name in [(x.prod(), "ProdBackward0"), (x.prod(0), "ProdBackward1")]:
+    assert node(out) == (name, [ACC]), node(out)
+x = leaf64([2.0, 3, 4])
+(gx,) = torch.autograd.grad(x.prod(), x, create_graph=True)
+same(gx, [12, 8, 6])
+same(grad_of(gx.sum(), x, 1.0), [7, 6, 5])
+x = leaf64([[2.0, 3], [4, 5]])
+(gx,) = torch.autograd.grad(x.prod(1), x, torch.tensor([1.0, 2], dtype=torch.float64), create_graph=True)
+same(gx, [3, 2, 10, 8])
+same(grad_of(gx.sum(), x, 1.0), [1, 1, 2, 2])
+# homura rejects these; PyTorch differentiates its cumulative products again.
+for x, dim in [(leaf64([0.0, 2, 3]), None), (leaf64([0.0, 2, 0]), None), (leaf64([[0.0, 2], [3, 4]]), 1)]:
+    out = x.prod() if dim is None else x.prod(dim)
+    (gx,) = torch.autograd.grad(out, x, torch.ones_like(out), create_graph=True)
+    assert gx.requires_grad
+x = leaf64([[0.0], [2]])
+g = leaf64([3.0, 4])
+(gx,) = torch.autograd.grad(x.prod(1), x, g, create_graph=True)
+same(gx, [3, 4])
+same(torch.autograd.grad(gx.sum(), g)[0], [1, 1])
+s0 = leaf64(0.0)
+same(torch.autograd.grad(s0.prod(), s0, torch.tensor(5.0, dtype=torch.float64), create_graph=True)[0], [5])
+
+# max and min
+for values, g, is_max, expected in [
+    ([1.0, 3, 3, 2], 1.0, True, [0, 0.5, 0.5, 0]),
+    ([1.0, 3, 3, 2], inf, True, [0, inf, inf, 0]),
+    ([1.0, 3, 3, 2], nan, True, [0, nan, nan, 0]),
+    ([nan, 1, nan], 1.0, True, [0.5, 0, 0.5]),
+    ([inf, 1, inf], 1.0, True, [0.5, 0, 0.5]),
+    ([-inf, -inf], 3.0, True, [1.5, 1.5]),
+    ([1.0, nan, 0], 3.0, False, [0, 3, 0]),
+    ([-0.0, 0], 1.0, True, [0.5, 0.5]),
+    ([5.0, 5, 5], 1.0, False, [1 / 3] * 3),
+]:
+    x = leaf64(values)
+    same(grad_of(x.max() if is_max else x.min(), x, g), expected)
+x = leaf64([[1.0, 3, 3], [nan, 2, nan]])
+same(grad_of(x.max(1)[0], x, [inf, 5.0]), [0, inf, 0, 5, 0, 0])
+x = leaf64([[1.0, 3], [1, nan]])
+same(grad_of(x.min(0)[0], x, [2.0, inf]), [2, 0, 0, inf])
+x = leaf64([[1.0, 3, 3], [4, 2, 1]])
+same(grad_of(x.max(-1, keepdim=True)[0], x, [[1.0], [2]]), [0, 1, 0, 2, 0, 0])
+s0 = leaf64(3.0)
+same(grad_of(s0.max(0)[0], s0, 2.0), [2])
+x = leaf64([1.0, 3, 3])
+g = leaf64(2.0)
+(gx,) = torch.autograd.grad(x.max(), x, g, create_graph=True)
+same(gx, [0, 1, 1])
+same(torch.autograd.grad(gx.sum(), g)[0], [1])
+for out, name in [
+    (x.max(), "MaxBackward1"),
+    (x.min(), "MinBackward1"),
+    (x.max(0)[0], "MaxBackward0"),
+    (x.min(0, keepdim=True)[0], "MinBackward0"),
+]:
+    assert node(out) == (name, [ACC]), node(out)
+values, indices = x.max(0)
+assert values.requires_grad and not indices.requires_grad and indices.grad_fn is None
+
+# var and std: inputs 2, 4, ..., 2N with an upstream gradient of 1.
+third, sixth = 4 / 3, 0.40824829046386296
+for n, c, expected in [
+    (2, 2, [[inf, inf], [-inf, inf], [nan, nan], [nan, nan]]),
+    (2, 3, [[inf, inf], [2, -2], [nan, nan], [0, -0.0]]),
+    (1, 1, [[nan], [nan], [nan], [nan]]),
+    (3, 0, [[-third, 0, third], [-third, 0, third], [-sixth, 0, sixth], [-sixth, 0, sixth]]),
+]:
+    fs = [
+        lambda x: x.var(correction=c),
+        lambda x: x.var(0, correction=c),
+        lambda x: x.std(correction=c),
+        lambda x: x.std(0, correction=c),
+    ]
+    for f, e in zip(fs, expected):
+        x = leaf64([2.0 * i for i in range(1, n + 1)])
+        same(grad_of(f(x), x, 1.0), e)
+x = leaf64([1.0, 2, 3])
+for g, expected in [(1.0, [inf, nan, inf]), (0.0, [nan] * 3), (-2.0, [-inf, nan, -inf])]:
+    same(grad_of(x.var(correction=3), x, g), expected)
+same(grad_of(x.var(0, correction=3), x, 1.0), [-inf, nan, inf])
+same(grad_of(x.var(0, correction=4), x, 1.0), [2, -0.0, -2])
+same(grad_of(x.std(0, correction=4), x, 1.0), [0, -0.0, -0.0])
+for f in [lambda x: x.std(correction=3), lambda x: x.std(correction=4), lambda x: x.std(0, correction=3)]:
+    same(grad_of(f(x), x, 1.0), [nan] * 3)
+same(grad_of(x.var(), x, inf), [-inf, nan, inf])
+same(grad_of(x.var(correction=-1), x, 1.0), [-0.5, 0, 0.5])
+for values, expected in [([1.0, inf, 3], [-inf, nan, -inf]), ([1.0, nan, 3], [nan] * 3)]:
+    x = leaf64(values)
+    same(grad_of(x.var(), x, 1.0), expected)
+x = leaf64([2.0, 2, 2])
+for g in [1.0, inf, nan]:
+    same(grad_of(x.std(), x, g), [0] * 3)
+    same(grad_of(x.std(-1, keepdim=True), x, [g]), [0] * 3)
+g = leaf64(0.3)
+(gx,) = torch.autograd.grad(x.std(), x, g, create_graph=True)
+ds = torch.autograd.grad(gx.sum(), [x, g])
+same(ds[0], [0] * 3)
+same(ds[1], [nan])
+s0 = leaf64(3.0)
+for out in [s0.var(), s0.var(0)]:
+    same(grad_of(out, s0, 2.0), [nan])
+for out in [s0.var(correction=0), s0.var(0, correction=0, keepdim=True), s0.std(correction=0), s0.std(-1, correction=0)]:
+    same(grad_of(out, s0, 2.0), [0])
+# homura gives `var(dim=[])` and `std(dim=[])` the whole reduction's gradient; PyTorch counts one
+# reduced element and divides by 1 - correction.
+x = leaf64([[1.0, 2], [4, 8]])
+assert x.var(dim=[]).item() == x.var().item()
+same(grad_of(x.var(dim=[]), x, 1.0), [-inf, -inf, inf, inf])
+assert not torch.equal(grad_of(x.var(dim=[]), x, 1.0), grad_of(x.var(), x, 1.0))
+for out, name in [
+    (x.var(), "VarBackward0"),
+    (x.var(1, correction=0, keepdim=True), "VarBackward0"),
+    (x.std(), "StdBackward0"),
+    (x.std((0, 1)), "StdBackward0"),
+]:
+    assert node(out) == (name, [ACC]), node(out)
+
+# Saved values: sums and means save nothing; max and min over a dimension save the indices.
+for name, f, saves, saves_input in [
+    ("SumBackward1", lambda x: x.sum(1), False, False),
+    ("MeanBackward0", lambda x: x.mean(), False, False),
+    ("MeanBackward1", lambda x: x.mean(1, keepdim=True), False, False),
+    ("ProdBackward0", lambda x: x.prod(), True, True),
+    ("ProdBackward1", lambda x: x.prod(1), True, True),
+    ("MaxBackward1", lambda x: x.max(), True, True),
+    ("MinBackward1", lambda x: x.min(), True, True),
+    ("MaxBackward0", lambda x: x.max(1)[0], True, False),
+    ("MinBackward0", lambda x: x.min(0, keepdim=True)[0], True, False),
+    ("VarBackward0", lambda x: x.var(), True, True),
+    ("VarBackward0", lambda x: x.var(1), True, True),
+    ("StdBackward0", lambda x: x.std(), True, True),
+    ("StdBackward0", lambda x: x.std(0), True, True),
+]:
+    x = leaf64([[1.0, 3, 2], [4, 6, 5]])
+    out = f(x)
+    assert out.grad_fn.name() == name
+    loss = out.sum()
+    loss.backward()
+    second = message(lambda: loss.backward()) if saves else (loss.backward() or None)
+    assert (second is not None and second.startswith("Trying to backward")) == saves, name
+    x = leaf64([[1.0, 3, 2], [4, 6, 5]])
+    loss = f(x).sum()
+    with torch.no_grad():
+        x.add_(1)
+    if saves_input:
+        assert "modified by an inplace operation" in message(lambda: loss.backward()), name
+    else:
+        loss.backward()
+for f, described in [
+    (lambda x: x.prod(), "[torch.DoubleTensor []], which is output 0 of Prod, is at version 1"),
+    (lambda x: x.max(), "[torch.DoubleTensor []], which is output 0 of Max1, is at version 1"),
+    (lambda x: x.std(), "[torch.DoubleTensor []], which is output 0 of Std, is at version 1"),
+]:
+    x = leaf64([[1.0, 3, 2], [4, 6, 5]])
+    out = f(x)
+    with torch.no_grad():
+        out.add_(1)
+    assert described in message(lambda: out.backward())
+x = leaf64([[1.0, 3, 2], [4, 6, 5]])
+values, indices = x.max(1)
+with torch.no_grad():
+    indices.add_(1)
+assert "[torch.LongTensor [2]] is at version 1; expected version 0 instead." in message(lambda: values.sum().backward())
 
 print("check_m1_formulas: all reference checks passed")

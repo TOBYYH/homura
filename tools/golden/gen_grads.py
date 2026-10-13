@@ -509,6 +509,87 @@ for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
             z=positive(3, 1, dtype=dtype),
         )
 
+# ---------------------------------------------------------------- step 6c
+# Reductions, appended after every earlier case so that those keep their inputs.
+def with_zeros(x, *positions):
+    for p in positions:
+        x[p] = 0.0
+    return x
+
+
+case("grad.sum_dim", lambda x: x.sum(1), x=randn(3, 4))
+case("grad.sum_dims_keep", lambda x: x.sum((0, 2), keepdim=True), x=randn(2, 3, 4))
+case("grad.mean", lambda x: x.mean(), x=randn(3, 4))
+case("grad.mean_dim", lambda x: x.mean(-1), x=randn(3, 4))
+case("grad.mean_dims_keep", lambda x: x.mean((0, 1), keepdim=True), x=randn(2, 3, 4))
+case("grad.prod", lambda x: x.prod(), x=randn(3, 4))
+case("grad.prod_dim", lambda x: x.prod(1), x=randn(3, 4))
+case("grad.prod_dim_keep", lambda x: x.prod(0, keepdim=True), x=randn(3, 4))
+# With zeros, the gradient is the product of the other elements in every slice.
+case("grad.prod_zero", lambda x: x.prod(), x=with_zeros(randn(3, 4), (1, 2)))
+case("grad.prod_dim_zeros", lambda x: x.prod(1), x=with_zeros(randn(3, 4), (0, 1), (0, 3), (2, 0)))
+case("grad.max", lambda x: x.max(), x=randn(3, 4))
+case("grad.min", lambda x: x.min(), x=randn(3, 4))
+case("grad.max_dim", lambda x: x.max(1)[0], x=randn(3, 4))
+case("grad.min_dim_keep", lambda x: x.min(0, keepdim=True)[0], x=randn(3, 4))
+case("grad.var", lambda x: x.var(), x=randn(3, 4))
+case("grad.var_dim", lambda x: x.var(1), x=randn(3, 4))
+case("grad.var_dims_keep", lambda x: x.var((0, 1), keepdim=True, correction=0), x=randn(2, 3, 4))
+case("grad.std", lambda x: x.std(), x=randn(3, 4))
+case("grad.std_dim", lambda x: x.std(0, correction=2), x=randn(4, 3))
+
+# Half precision prod is left out: homura's forward product is computed in f64 and rounded
+# once, PyTorch's is rounded at each step, and the gradient `g * (result / x)` inherits the
+# difference of the results (several rounding steps of the gradient).
+for dtype, tag in [(torch.float16, "f16"), (torch.bfloat16, "bf16")]:
+    case(f"grad_{tag}.sum_dim", lambda x: x.sum(1), x=randn(3, 4, dtype=dtype))
+    case(f"grad_{tag}.mean_dim", lambda x: x.mean(-1), x=randn(3, 4, dtype=dtype))
+    case(f"grad_{tag}.max_dim", lambda x: x.max(1)[0], x=randn(3, 4, dtype=dtype))
+    case(f"grad_{tag}.var_dim", lambda x: x.var(1), x=randn(3, 4, dtype=dtype))
+    case(f"grad_{tag}.std", lambda x: x.std(), x=randn(3, 4, dtype=dtype))
+
+# Boundaries, compared exactly.
+case("special.sum_dim", lambda x: x.sum(1), x=f([[1.0, inf], [nan, 2.0]]), g=f([nan, -inf]))
+case("special.mean_dim", lambda x: x.mean(-1), x=f([[1.0, inf], [nan, 2.0]]), g=f([inf, -2.0]))
+case("special.prod", lambda x: x.prod(), x=f([0.0, inf, 2.0]), g=f(1.0))
+case("special.prod_two_zeros", lambda x: x.prod(), x=f([0.0, nan, 0.0, inf]), g=f(nan))
+case("special.prod_overflow", lambda x: x.prod(), x=f([1e30, 1e30, 1e-30, 0.0]), g=f(1.0))
+case(
+    "special.prod_dim",
+    lambda x: x.prod(1),
+    x=f([[2.0, inf, 4.0], [0.0, 3.0, 5.0], [0.0, inf, 0.0], [nan, 1.0, 2.0], [-0.0, 3.0, 2.0]]),
+    g=f([1.0, inf, inf, -2.0, 1.0]),
+)
+case("special.prod_dim_keep", lambda x: x.prod(0, keepdim=True), x=f([[2.0, inf], [nan, 3.0]]), g=f([[inf, 2.0]]))
+case("special.max", lambda x: x.max(), x=f([nan, 1.0, nan, inf]), g=f(inf))
+case("special.min", lambda x: x.min(), x=f([1.0, -inf, 3.0, -inf, -0.0]), g=f(-3.0))
+case("special.max_ties", lambda x: x.max(), x=f([-0.0, 0.0, -1.0]), g=f(nan))
+case(
+    "special.max_dim",
+    lambda x: x.max(1)[0],
+    x=f([[1.0, 3.0, 3.0], [nan, 2.0, nan], [-inf, -inf, -inf]]),
+    g=f([inf, nan, -2.0]),
+)
+case("special.min_dim_keep", lambda x: x.min(0, keepdim=True)[0], x=f([[1.0, 3.0], [1.0, nan]]), g=f([[2.0, inf]]))
+case("special.var", lambda x: x.var(), x=f([1.0, inf, 3.0]), g=f(1.0))
+case("special.var_c2", lambda x: x.var(correction=2), x=f([2.0, 2.0]), g=f(1.0))
+case("special.var_c4", lambda x: x.var(correction=4), x=f([1.0, 2.0, 3.0]), g=f(-2.0))
+case("special.var_dim_c3", lambda x: x.var(1, correction=3), x=f([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]]), g=f([1.0, -2.0]))
+case("special.var_dim_c4", lambda x: x.var(1, correction=4), x=f([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]]), g=f([1.0, inf]))
+case("special.std", lambda x: x.std(), x=f([2.0, 2.0, 2.0]), g=f(inf))
+case("special.std_c3", lambda x: x.std(correction=3), x=f([1.0, 2.0, 3.0]), g=f(1.0))
+case("special.std_dim", lambda x: x.std(0, correction=2), x=f([[2.0, 1.0], [2.0, 3.0], [2.0, 5.0]]), g=f([nan, inf]))
+case("special.std_dim_c4", lambda x: x.std(1, correction=4), x=f([[1.0, 2.0, 3.0], [2.0, 2.0, 2.0]]), g=f([1.0, 1.0]))
+
+# Products of the other elements accumulate in f64, as PyTorch's cumprod does: grouped in f32,
+# those before the last element of each row would overflow and underflow and give NaN, not 1.
+case(
+    "special.prod_dim_overflow",
+    lambda x: x.prod(1),
+    x=f([[1e30, 1e30, 1e-30, 1e-30, 0.0], [0.0, 1e-30, 1e-30, 1e30, 1e30]]),
+    g=f([1.0, 1.0]),
+)
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

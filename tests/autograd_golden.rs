@@ -104,6 +104,29 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "lerp" => x().lerp(y(), &t["z"]),
         "lerp_low" => x().lerp(y(), 0.2),
         "lerp_high" => x().lerp(y(), 0.8),
+        "sum_dim" => x().sum_dim(1, false),
+        "sum_dims_keep" => x().sum_dim([0, 2], true),
+        "mean" => x().mean(),
+        "mean_dim" => x().mean_dim(-1, false),
+        "mean_dims_keep" => x().mean_dim([0, 1], true),
+        "prod" | "prod_zero" | "prod_two_zeros" | "prod_overflow" => x().prod(),
+        "prod_dim" | "prod_dim_zeros" | "prod_dim_overflow" => x().prod_dim(1, false),
+        "prod_dim_keep" => x().prod_dim(0, true),
+        "max" | "max_ties" => x().max(),
+        "min" => x().min(),
+        "max_dim" => x().max_dim(1, false).0,
+        "min_dim_keep" => x().min_dim(0, true).0,
+        "var" => x().var(1),
+        "var_c2" => x().var(2),
+        "var_c4" => x().var(4),
+        "var_dim" => x().var_dim(1, 1, false),
+        "var_dim_c3" => x().var_dim(1, 3, false),
+        "var_dim_c4" => x().var_dim(1, 4, false),
+        "var_dims_keep" => x().var_dim([0, 1], 0, true),
+        "std" => x().std(1),
+        "std_c3" => x().std(3),
+        "std_dim" => x().std_dim(0, 2, false),
+        "std_dim_c4" => x().std_dim(1, 4, false),
         _ => return None,
     })
 }
@@ -159,7 +182,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 179, "only {} cases", cases.len());
+    assert!(cases.len() >= 230, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

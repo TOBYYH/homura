@@ -830,11 +830,6 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
     let index = homura::tensor([1i64, 0]);
     let cases: Vec<(&str, Tensor)> = vec![
         ("matmul", x.matmul(&w)),
-        ("sum_dim", x.sum_dim(0, false)),
-        ("mean", x.mean()),
-        ("max", x.max()),
-        ("max_dim", x.max_dim(1, false).0),
-        ("var", x.var(1)),
         ("softmax", x.softmax(-1)),
         ("permute", x.permute([1, 0])),
         ("transpose", x.transpose(0, 1)),

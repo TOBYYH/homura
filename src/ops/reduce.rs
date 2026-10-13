@@ -1,7 +1,7 @@
 //! Reductions.
 
 use super::{ReduceOp, reshape_data};
-use crate::autograd::record_unimplemented;
+use crate::autograd::formulas;
 use crate::backend::cpu;
 use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
 use crate::{DType, Device, Shape, Tensor};
@@ -117,14 +117,15 @@ impl Tensor {
     /// Sum of all elements. Integer and bool inputs give `I64`.
     pub fn sum(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Sum, self, &[], false, "sum");
-        crate::autograd::formulas::sum(self, &out);
+        formulas::sum(self, &out);
         out
     }
 
     /// Sum over `dims` (all dimensions if empty).
     pub fn sum_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
-        let out = reduce_op(ReduceOp::Sum, self, &dims.into_dims(), keepdim, "sum");
-        record_unimplemented("sum_dim", &[Some(self)], &out);
+        let dims = dims.into_dims();
+        let out = reduce_op(ReduceOp::Sum, self, &dims, keepdim, "sum");
+        formulas::sum_dim(self, &dims, keepdim, &out);
         out
     }
 
@@ -165,42 +166,47 @@ impl Tensor {
         // Summed with kept dimensions, so the result has the elements of `size` in order.
         let summed = reduce_op(ReduceOp::Sum, self, &dims, true, "sum");
         let out = Tensor::from_data(reshape_data(&summed.data(), size));
-        crate::autograd::formulas::sum_to_size(self, &out);
+        formulas::sum_to_size(self, &out);
         out
     }
 
     /// Mean of all elements. Requires a floating point input.
     pub fn mean(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Mean, self, &[], false, "mean");
-        record_unimplemented("mean", &[Some(self)], &out);
+        formulas::mean(self, None, false, &out);
         out
     }
 
     /// Mean over `dims` (all dimensions if empty).
     pub fn mean_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
-        let out = reduce_op(ReduceOp::Mean, self, &dims.into_dims(), keepdim, "mean");
-        record_unimplemented("mean_dim", &[Some(self)], &out);
+        let dims = dims.into_dims();
+        let out = reduce_op(ReduceOp::Mean, self, &dims, keepdim, "mean");
+        formulas::mean(self, Some(&dims), keepdim, &out);
         out
     }
 
     /// Product of all elements. Integer and bool inputs give `I64`.
+    ///
+    /// Its gradient for an input that contains zeros can't be differentiated again yet: a
+    /// backward pass with `create_graph` that computes it panics.
     pub fn prod(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Prod, self, &[], false, "prod");
-        record_unimplemented("prod", &[Some(self)], &out);
+        formulas::prod(self, None, false, &out);
         out
     }
 
-    /// Product along `dim`.
+    /// Product along `dim`. Its gradient has the limit of [`prod`](Tensor::prod)'s.
     pub fn prod_dim(&self, dim: i64, keepdim: bool) -> Tensor {
         let out = reduce_op(ReduceOp::Prod, self, &[dim], keepdim, "prod");
-        record_unimplemented("prod_dim", &[Some(self)], &out);
+        let dim = normalize_dim(dim, self.num_dims());
+        formulas::prod(self, Some(dim), keepdim, &out);
         out
     }
 
     /// Largest element (NaN if there is any).
     pub fn max(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Max, self, &[], false, "max");
-        record_unimplemented("max", &[Some(self)], &out);
+        formulas::extremum(self, true, &out);
         out
     }
 
@@ -208,14 +214,15 @@ impl Tensor {
     pub fn max_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, true, true, "max");
         let v = v.unwrap();
-        record_unimplemented("max_dim", &[Some(self)], &v);
+        let dim = normalize_dim(dim, self.num_dims());
+        formulas::extremum_dim(self, dim, keepdim, true, &v, &i);
         (v, i)
     }
 
     /// Smallest element (NaN if there is any).
     pub fn min(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Min, self, &[], false, "min");
-        record_unimplemented("min", &[Some(self)], &out);
+        formulas::extremum(self, false, &out);
         out
     }
 
@@ -223,7 +230,8 @@ impl Tensor {
     pub fn min_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, false, true, "min");
         let v = v.unwrap();
-        record_unimplemented("min_dim", &[Some(self)], &v);
+        let dim = normalize_dim(dim, self.num_dims());
+        formulas::extremum_dim(self, dim, keepdim, false, &v, &i);
         (v, i)
     }
 
@@ -251,28 +259,33 @@ impl Tensor {
     /// correction, PyTorch's default).
     pub fn var(&self, correction: i64) -> Tensor {
         let out = var_op(self, &[], correction, false, false);
-        record_unimplemented("var", &[Some(self)], &out);
+        formulas::var_std(self, None, correction, false, false, &out);
         out
     }
 
-    /// Variance over `dims` (all dimensions if empty).
+    /// Variance over `dims` (all dimensions if empty). Over all dimensions, the gradient is
+    /// that of [`var`](Tensor::var) (PyTorch's `var(dim=[])` divides its gradient by
+    /// `1 - correction` instead).
     pub fn var_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
-        let out = var_op(self, &dims.into_dims(), correction, keepdim, false);
-        record_unimplemented("var_dim", &[Some(self)], &out);
+        let dims = dims.into_dims();
+        let out = var_op(self, &dims, correction, keepdim, false);
+        formulas::var_std(self, Some(&dims), correction, keepdim, false, &out);
         out
     }
 
     /// Standard deviation of all elements; see [`var`](Tensor::var).
     pub fn std(&self, correction: i64) -> Tensor {
         let out = var_op(self, &[], correction, false, true);
-        record_unimplemented("std", &[Some(self)], &out);
+        formulas::var_std(self, None, correction, false, true, &out);
         out
     }
 
-    /// Standard deviation over `dims` (all dimensions if empty).
+    /// Standard deviation over `dims` (all dimensions if empty); see
+    /// [`var_dim`](Tensor::var_dim).
     pub fn std_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
-        let out = var_op(self, &dims.into_dims(), correction, keepdim, true);
-        record_unimplemented("std_dim", &[Some(self)], &out);
+        let dims = dims.into_dims();
+        let out = var_op(self, &dims, correction, keepdim, true);
+        formulas::var_std(self, Some(&dims), correction, keepdim, true, &out);
         out
     }
 

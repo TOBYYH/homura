@@ -693,3 +693,61 @@ fn half_gelu_gradients_are_computed_in_f32() {
         );
     }
 }
+
+#[test]
+fn zero_dimensional_tensors_reject_repeated_dimensions() {
+    // Review round 20 (R37): `0` and `-1` both name the one dimension a zero-dimensional tensor
+    // accepts, so every list that names it twice is rejected, on every device.
+    type Op = (&'static str, fn(&Tensor, &[i64]) -> Tensor);
+    let ops: [Op; 8] = [
+        ("squeeze_dim", |s, d| s.squeeze_dim(d)),
+        ("sum_dim", |s, d| s.sum_dim(d, false)),
+        ("mean_dim", |s, d| s.mean_dim(d, true)),
+        ("var_dim", |s, d| s.var_dim(d, 0, false)),
+        ("std_dim", |s, d| s.std_dim(d, 0, false)),
+        ("all_dim", |s, d| s.to(DType::Bool).all_dim(d, false)),
+        ("any_dim", |s, d| s.to(DType::Bool).any_dim(d, false)),
+        ("flip", |s, d| s.flip(d)),
+    ];
+    for device in DEVICES {
+        let s = Tensor::from_slice(&[2.0f64], []).to(device);
+        for (name, op) in ops {
+            for dims in [[0, 0], [0, -1], [-1, -1]] {
+                assert_eq!(
+                    panic_message(|| {
+                        op(&s, &dims);
+                    }),
+                    "dim 0 appears multiple times in the list of dims",
+                    "{name} {dims:?} on {device}"
+                );
+            }
+            // Naming it once, or not at all, is fine; any other dimension is out of range.
+            for dims in [&[0][..], &[-1], &[]] {
+                assert_eq!(op(&s, dims).shape(), [], "{name} {dims:?} on {device}");
+            }
+            assert_eq!(
+                panic_message(|| {
+                    op(&s, &[1]);
+                }),
+                "Dimension out of range (expected to be in range of [-1, 0], but got 1)",
+                "{name} on {device}"
+            );
+        }
+    }
+    // Tensors with dimensions keep their checks, and a scalar squeeze its gradient.
+    let x = Tensor::from_slice(&[1.0f64, 2.0], [2, 1]);
+    assert_eq!(
+        panic_message(|| {
+            x.squeeze_dim([1, -1]);
+        }),
+        "dim 1 appears multiple times in the list of dims"
+    );
+    let s = Tensor::from_slice(&[2.0f64], []);
+    s.requires_grad_(true);
+    let options = GradOptions {
+        grad_outputs: vec![Some(Tensor::from_slice(&[3.0f64], []))],
+        ..Default::default()
+    };
+    let g = autograd::grad(&[&s.squeeze_dim([-1])], &[&s], options).remove(0);
+    assert_eq!(g.unwrap().to_vec::<f64>(), [3.0]);
+}

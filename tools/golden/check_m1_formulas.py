@@ -13,7 +13,9 @@ division (Python computes `x.reciprocal() * scalar`), the gradient of `prod` for
 zeros can't be differentiated again (create_graph), and `var` and `std` over an empty list of
 dimensions get the gradient of the whole reduction (PyTorch counts one reduced element there).
 Indexing with an integer tensor reshapes the picked positions with a recorded `unsafe_view`, and
-homura can't tell a 1-tuple index from a lone item, so `x[(slice(None),)]` records a slice.
+homura can't tell a 1-tuple index from a lone item, so `x[(slice(None),)]` records a slice;
+whether a slice covers its dimension is judged on the slice an index item converts to, and a Rust
+`step_by` range with one position converts to step 1 (`x[:, 0:1:2]` is recorded by PyTorch).
 """
 
 import math
@@ -1526,6 +1528,41 @@ s = torch.tensor(2.0, requires_grad=True)
 assert first_chain(s[...]) == ["AliasBackward0"]
 assert first_chain(s[None]) == ["UnsqueezeBackward0"]
 assert first_chain(s[()]) == ["AliasBackward0"]
+# A one-position slice with step 2 is recorded (homura's `(0..1).step_by(2)` converts to step 1
+# and is skipped); an explicit `TensorIndex::Slice` with step 2 matches this.
+column = counting(2, 1)
+assert first_chain(column[:, 0:1:2]) == ["SliceBackward0"]
+assert first_chain(column[:, 0:1:1]) == ["AliasBackward0"]
+(gx,) = torch.autograd.grad(column[:, 0:1:2], column, torch.tensor([[1.0], [2.0]], dtype=torch.float64))
+assert gx.flatten().tolist() == [1.0, 2.0]
+
+# Review round 20 (R37): a zero-dimensional tensor rejects a dimension named twice; CPU says
+# "dim 0 appears multiple times", meta reductions "duplicate value".
+for device in ["cpu", "meta"]:
+    s = torch.tensor(2.0, dtype=torch.float64, device=device)
+    for dims in [(0, 0), (0, -1), (-1, -1)]:
+        for f in [
+            lambda: s.squeeze(dims),
+            lambda: s.sum(dims),
+            lambda: s.mean(dims, keepdim=True),
+            lambda: s.var(dims, correction=0),
+            lambda: s.std(dims, correction=0),
+            lambda: s.bool().all(dims),
+            lambda: s.bool().any(dims),
+            lambda: s.flip(dims),
+        ]:
+            text = message(f)
+            assert "dim 0 appears multiple times in the list of dims" in text or "duplicate value in the list of dims" in text, text
+            if device == "cpu":
+                assert text == "dim 0 appears multiple times in the list of dims", text
+        for f in [lambda: s.squeeze(dims[:1]), lambda: s.sum(dims[:1]), lambda: s.flip(dims[:1]), lambda: s.squeeze(()), lambda: s.flip(())]:
+            assert f().shape == ()
+        assert message(lambda: s.sum((1,))) == "Dimension out of range (expected to be in range of [-1, 0], but got 1)"
+x = torch.tensor([[1.0], [2.0]])
+assert message(lambda: x.squeeze((1, -1))) == "dim 1 appears multiple times in the list of dims"
+s = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
+(gs,) = torch.autograd.grad(s.squeeze((-1,)), s, torch.tensor(3.0, dtype=torch.float64))
+assert gs.item() == 3.0
 
 # skipped_slices_keep_the_gradients
 x = counting(2, 3)

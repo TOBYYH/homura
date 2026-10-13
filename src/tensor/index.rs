@@ -235,7 +235,11 @@ impl Tensor {
     /// (start 0 or omitted, end omitted or at least the size, step 1) is skipped instead of
     /// recorded in the backward graph, and an expression that changes nothing, such as
     /// `(.., ..)` or [`Ellipsis`], gives a new view of all of `self`. A lone slice is always
-    /// recorded; unlike Python, a one-item tuple counts as a lone item.
+    /// recorded; unlike Python, a one-item tuple counts as a lone item. The check uses the slice
+    /// an item converts to: a `step_by` range that yields fewer than two positions can't reveal
+    /// its step and becomes a slice with step 1, so `(0..1).step_by(2)` on a dimension of size 1
+    /// is skipped where Python's `0:1:2` is recorded (values and gradients are the same). Use
+    /// [`TensorIndex::Slice`] to keep the step.
     ///
     /// ```
     /// use homura::{Ellipsis, NewAxis};

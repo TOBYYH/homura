@@ -379,21 +379,25 @@ pub(crate) fn normalize_dim(dim: i64, num_dims: usize) -> usize {
 
 /// Normalizes a list of dimensions into a per-dimension mask. An empty list selects every
 /// dimension (PyTorch's behaviour for reductions).
+///
+/// # Panics
+///
+/// Panics if a dimension is out of range or appears twice. A zero-dimensional tensor accepts
+/// `0` and `-1` like a tensor with one dimension, so naming it twice (`[0, -1]`) is rejected
+/// too, as in PyTorch; its mask is still empty.
 pub(crate) fn dims_mask(dims: &[i64], num_dims: usize) -> Vec<bool> {
     if dims.is_empty() {
         return vec![true; num_dims];
     }
-    let mut mask = vec![false; num_dims];
+    let mut mask = vec![false; num_dims.max(1)];
     for &d in dims {
         let d = normalize_dim(d, num_dims);
-        if num_dims == 0 {
-            continue;
-        }
         if mask[d] {
             panic!("dim {d} appears multiple times in the list of dims");
         }
         mask[d] = true;
     }
+    mask.truncate(num_dims);
     mask
 }
 
@@ -554,6 +558,24 @@ pub(crate) fn compute_view_strides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dims_masks_have_one_entry_per_dimension() {
+        assert_eq!(dims_mask(&[-1, 0], 3), [true, false, true]);
+        assert_eq!(dims_mask(&[], 2), [true, true]);
+        // A zero-dimensional tensor accepts `0` or `-1` once (review round 20, R37), and its
+        // mask stays empty.
+        for dims in [&[0][..], &[-1], &[]] {
+            assert!(dims_mask(dims, 0).is_empty(), "{dims:?}");
+        }
+        for dims in [[0, 0], [0, -1], [-1, -1]] {
+            let err = std::panic::catch_unwind(|| dims_mask(&dims, 0)).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<String>().unwrap(),
+                "dim 0 appears multiple times in the list of dims"
+            );
+        }
+    }
 
     #[test]
     fn dim_vec_inline_and_heap() {

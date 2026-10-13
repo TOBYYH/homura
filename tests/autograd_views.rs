@@ -262,6 +262,8 @@ fn views_save_nothing_so_backward_passes_can_repeat() {
 fn indexing_skips_full_slices_like_pytorch() {
     // Node chains measured on the pinned PyTorch: among several items, a slice starting at 0
     // with a step of 1 and an end at or past the size is skipped; a lone slice is recorded.
+    // The chains are the same except that homura reshapes the positions picked by an integer
+    // tensor with a recorded `unsafe_view` before PyTorch's `IndexBackward0`.
     let x = counting(&[2, 3, 4]);
     let idx = homura::tensor([1i64, 0]);
     let index = &["UnsafeViewBackward0", "IndexBackward0"][..];
@@ -350,6 +352,28 @@ fn indexing_skips_full_slices_like_pytorch() {
         chain(&s.index(Vec::<TensorIndex>::new())),
         ["AliasBackward0"]
     );
+    // Review round 20: a `step_by` range with a single position becomes a slice with step 1,
+    // which covers a dimension of size 1 and is skipped; Python's `x[:, 0:1:2]` and an explicit
+    // slice with step 2 are recorded. Values and gradients are the same either way.
+    let column = counting(&[2, 1]);
+    let short = column.index((.., (0..1).step_by(2)));
+    assert_eq!(chain(&short), ["AliasBackward0"]);
+    let full = TensorIndex::Slice {
+        start: None,
+        end: None,
+        step: 1,
+    };
+    let step = TensorIndex::Slice {
+        start: Some(0),
+        end: Some(1),
+        step: 2,
+    };
+    let explicit = column.index(vec![full, step]);
+    assert_eq!(chain(&explicit), ["SliceBackward0"]);
+    for out in [&short, &explicit] {
+        let gx = grad_with(out, &column, &upstream(out), false);
+        assert_eq!(gx.to_vec::<f64>(), [1.0, 2.0]);
+    }
 }
 
 #[test]

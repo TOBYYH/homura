@@ -27,9 +27,9 @@
 //! `reciprocal`, `sin`, `cos`, `tanh`, `sigmoid`, `relu`, `silu`, `gelu`, `erf`, `maximum`,
 //! `minimum`, `clamp` (and `clamp_min`, `clamp_max`), `where_`, `lerp`, `addcmul`, `addcdiv`,
 //! the reductions `sum`, `sum_dim`, `sum_to_size`, `mean`, `mean_dim`, `prod`, `prod_dim`, `max`,
-//! `min`, `max_dim`, `min_dim`, `var`, `var_dim`, `std` and `std_dim`, `expand`, `view`,
-//! `reshape`, `select`, `narrow`, slicing, `as_strided`, `index_select`, indexing with an integer
-//! tensor, `index_add`, `gather`, `scatter_add`, `select_scatter`, `slice_scatter`, `deep_clone`
+//! `min`, `max_dim`, `min_dim`, `var`, `var_dim`, `std` and `std_dim`, the views `expand`,
+//! `view`, `reshape`, `permute`, `transpose`, `squeeze`, `squeeze_dim`, `unsqueeze`, `select`,
+//! `narrow`, slicing and `as_strided`, `index_select`, indexing with an integer tensor, `index_add`, `gather`, `scatter_add`, `select_scatter`, `slice_scatter`, `deep_clone`
 //! and `to` (and what is built from them, such as `flatten`, `contiguous`, `repeat`, `split`,
 //! `chunk` and `masked_fill`). The others record a `NotImplemented` node, and a backward pass
 //! that reaches one panics with "the derivative for 'op' is not implemented." instead of silently

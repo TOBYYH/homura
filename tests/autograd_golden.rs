@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use common::{Case, Golden, assert_close_tol, tolerance};
 use homura::autograd::{self, GradOptions};
-use homura::{DType, GeluApproximate, Tensor, where_};
+use homura::{DType, GeluApproximate, NewAxis, Tensor, where_};
 
 /// The output of operation `op` of a case, from its inputs by name.
 fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
@@ -133,6 +133,17 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "std_c3" => x().std(3),
         "std_dim" => x().std_dim(0, 2, false),
         "std_dim_c4" => x().std_dim(1, 4, false),
+        "permute" => x().permute([2, 0, 1]),
+        "transpose" => x().transpose(-1, 0),
+        "squeeze" => x().squeeze(),
+        "squeeze_dim" => x().squeeze_dim(-1),
+        "squeeze_dims" => x().squeeze_dim([1, 3]),
+        "squeeze_none" => x().squeeze_dim(Vec::<i64>::new()),
+        "unsqueeze" => x().unsqueeze(if x().num_dims() == 1 { 0 } else { 1 }),
+        "flatten" => x().flatten(1, 2),
+        "index_alias" => x().index((.., ..)),
+        "index_mixed" => x().index((.., 1.., NewAxis, (0..).step_by(2))),
+        "index_full_tensor" => x().index((.., idx())),
         _ => return None,
     })
 }
@@ -188,7 +199,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 235, "only {} cases", cases.len());
+    assert!(cases.len() >= 255, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

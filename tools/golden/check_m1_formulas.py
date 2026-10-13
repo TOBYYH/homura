@@ -1,5 +1,6 @@
 """Check the reference behavior that tests/autograd_formulas.rs, tests/autograd_binary.rs,
-tests/autograd_reduce.rs and tests/m1_ops.rs encode (M1 steps 4 and 6a-6c), and the review fixes that tests/m1_regressions.rs encodes; does not write
+tests/autograd_reduce.rs, tests/autograd_views.rs and tests/m1_ops.rs encode (M1 steps 4 and
+6a-6d), and the review fixes that tests/m1_regressions.rs encodes; does not write
 fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
@@ -11,6 +12,8 @@ is reported even when `self` is empty, `index_add` rejects zero-dimensional `sel
 division (Python computes `x.reciprocal() * scalar`), the gradient of `prod` for an input with
 zeros can't be differentiated again (create_graph), and `var` and `std` over an empty list of
 dimensions get the gradient of the whole reduction (PyTorch counts one reduced element there).
+Indexing with an integer tensor reshapes the picked positions with a recorded `unsafe_view`, and
+homura can't tell a 1-tuple index from a lone item, so `x[(slice(None),)]` records a slice.
 """
 
 import math
@@ -1372,5 +1375,206 @@ for dtype, values, expected, expected_inf in [
     for out in [rows.prod(1), rows.prod(-1, keepdim=True)]:
         g = torch.tensor([1.0, -2.0], dtype=dtype).reshape(out.shape)
         assert as_text(torch.autograd.grad(out, rows, g)[0]) == [repr(float(e)) for e in both], (dtype, values)
+
+# ---------------------------------------------------------------- step 6d: views and indexing
+def counting(*shape):
+    return torch.arange(math.prod(shape), dtype=torch.float64).reshape(shape).clone().requires_grad_()
+
+
+def upstream(out):
+    return torch.arange(1, out.numel() + 1, dtype=torch.float64).reshape(out.shape)
+
+
+def first_chain(t):
+    """Node names along the first edges up to the leaf, like `chain` in autograd_views.rs."""
+    names, f = [], t.grad_fn
+    while f is not None and f.name() != "torch::autograd::AccumulateGrad":
+        names.append(f.name())
+        f = f.next_functions[0][0] if f.next_functions else None
+    return names
+
+
+# permute_and_transpose_send_each_gradient_element_back
+x = counting(2, 3, 4)
+for out, name in [
+    (x.permute(2, 0, 1), "PermuteBackward0"),
+    (x.permute(-1, -3, 1), "PermuteBackward0"),
+    (x.transpose(0, 2), "TransposeBackward0"),
+    (x.transpose(-1, 1), "TransposeBackward0"),
+    (x.transpose(1, 1), "TransposeBackward0"),
+]:
+    assert node(out) == (name, ["torch::autograd::AccumulateGrad"]), node(out)
+    g = upstream(out)
+    (gx,) = torch.autograd.grad(out, x, g)
+    picked = out.detach().flatten().long()
+    expected = torch.zeros(24, dtype=torch.float64).index_add(0, picked, g.flatten())
+    assert torch.equal(gx.flatten(), expected), name
+
+# squeezes_insert_the_removed_dimensions_back
+x = counting(2, 1, 3, 1)
+for out, name, shape in [
+    (x.squeeze(), "SqueezeBackward0", (2, 3)),
+    (x.squeeze(1), "SqueezeBackward1", (2, 3, 1)),
+    (x.squeeze(-1), "SqueezeBackward1", (2, 1, 3)),
+    (x.squeeze(0), "SqueezeBackward1", (2, 1, 3, 1)),
+    (x.squeeze((1,)), "SqueezeBackward2", (2, 3, 1)),
+    (x.squeeze((-1, 1)), "SqueezeBackward2", (2, 3)),
+    (x.squeeze((0, 2)), "SqueezeBackward2", (2, 1, 3, 1)),
+    (x.squeeze(()), "SqueezeBackward2", (2, 1, 3, 1)),
+    (x.unsqueeze(-1), "UnsqueezeBackward0", (2, 1, 3, 1, 1)),
+    (x.unsqueeze(2), "UnsqueezeBackward0", (2, 1, 1, 3, 1)),
+]:
+    assert tuple(out.shape) == shape and node(out) == (name, ["torch::autograd::AccumulateGrad"]), name
+    g = upstream(out)
+    (gx,) = torch.autograd.grad(out, x, g)
+    assert tuple(gx.shape) == (2, 1, 3, 1) and torch.equal(gx.flatten(), g.flatten()), name
+assert message(lambda: x.squeeze((1, -3))) == "dim 1 appears multiple times in the list of dims"
+
+# zero_dimensional_views
+s = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
+for out, name in [
+    (s.squeeze(), "SqueezeBackward0"),
+    (s.squeeze(0), "SqueezeBackward1"),
+    (s.squeeze(-1), "SqueezeBackward1"),
+    (s.squeeze((0,)), "SqueezeBackward2"),
+    (s.unsqueeze(0), "UnsqueezeBackward0"),
+    (s.unsqueeze(-1), "UnsqueezeBackward0"),
+    (s.transpose(0, -1), "TransposeBackward0"),
+    (s.permute(()), "PermuteBackward0"),
+]:
+    assert out.grad_fn.name() == name
+    (gs,) = torch.autograd.grad(out, s, torch.full(out.shape, 3.0, dtype=torch.float64))
+    assert gs.shape == () and gs.item() == 3.0, name
+
+# second_derivatives_go_through_the_inverse_views
+x = counting(2, 1, 3, 1)
+for op, expected in [
+    (lambda t: t.squeeze(), ["UnsqueezeBackward0", "UnsqueezeBackward0"]),
+    (lambda t: t.squeeze(1), ["UnsqueezeBackward0"]),
+    (lambda t: t.squeeze((1, 3)), ["UnsqueezeBackward0", "UnsqueezeBackward0"]),
+    (lambda t: t.unsqueeze(-1), ["SqueezeBackward1"]),
+    (lambda t: t.permute(2, 0, 3, 1), ["PermuteBackward0"]),
+    (lambda t: t.transpose(0, 2), ["TransposeBackward0"]),
+    (lambda t: t[:, :, :], []),
+]:
+    out = op(x)
+    g = upstream(out).requires_grad_()
+    (gx,) = torch.autograd.grad(out, x, g, create_graph=True)
+    assert first_chain(gx) == expected, (first_chain(gx), expected)
+    h = upstream(gx)
+    (gg,) = torch.autograd.grad(gx, g, h)
+    assert torch.equal(gg, op(h)), expected
+out = x.squeeze(0)
+g = upstream(out).requires_grad_()
+(gx,) = torch.autograd.grad(out, x, g, create_graph=True)
+assert gx is g
+
+# views_save_nothing_so_backward_passes_can_repeat
+x = counting(2, 1, 3)
+for out in [x.permute(2, 0, 1), x.transpose(0, 1), x.squeeze(), x.squeeze(1), x.squeeze((1,)), x.unsqueeze(0), x[:, :]]:
+    y = out.sum()
+    y.backward()
+    y.backward()
+assert x.grad.tolist() == [[[14.0] * 3]] * 2
+
+# indexing_skips_full_slices_like_pytorch
+x = counting(2, 3, 4)
+idx = torch.tensor([1, 0])
+INDEX = ["IndexBackward0"]  # homura: ["UnsafeViewBackward0", "IndexBackward0"]
+for name, out, expected in [
+    ("x[:]", x[:], ["SliceBackward0"]),
+    ("x[0:2]", x[0:2], ["SliceBackward0"]),
+    ("x[:, :]", x[:, :], ["AliasBackward0"]),
+    ("x[:, :, :]", x[:, :, :], ["AliasBackward0"]),
+    ("x[...]", x[...], ["AliasBackward0"]),
+    ("x[()]", x[()], ["AliasBackward0"]),
+    ("x[..., :]", x[..., :], ["AliasBackward0"]),
+    ("x[:, 0:100]", x[:, 0:100], ["AliasBackward0"]),
+    ("x[:, 0:3]", x[:, 0:3], ["AliasBackward0"]),
+    ("x[:, 0:3:1]", x[:, 0:3:1], ["AliasBackward0"]),
+    ("x[:, -3:]", x[:, -3:], ["SliceBackward0"]),
+    ("x[:, ::2]", x[:, ::2], ["SliceBackward0"]),
+    ("x[:, 0:2]", x[:, 0:2], ["SliceBackward0"]),
+    ("x[1:, :]", x[1:, :], ["SliceBackward0"]),
+    ("x[:, 1:]", x[:, 1:], ["SliceBackward0"]),
+    ("x[:, 1]", x[:, 1], ["SelectBackward0"]),
+    ("x[0, :]", x[0, :], ["SelectBackward0"]),
+    ("x[..., 1]", x[..., 1], ["SelectBackward0"]),
+    ("x[:, None]", x[:, None], ["UnsqueezeBackward0"]),
+    ("x[None, :]", x[None, :], ["UnsqueezeBackward0"]),
+    ("x[None]", x[None], ["UnsqueezeBackward0"]),
+    ("x[:, :, None, :]", x[:, :, None, :], ["UnsqueezeBackward0"]),
+    ("x[:, 1:, None]", x[:, 1:, None], ["UnsqueezeBackward0", "SliceBackward0"]),
+    ("x[:, idx]", x[:, idx], INDEX),
+    ("x[idx, :]", x[idx, :], INDEX),
+    ("x[idx]", x[idx], INDEX),
+    ("x[:, :, idx]", x[:, :, idx], INDEX),
+]:
+    assert first_chain(out) == expected, (name, first_chain(out))
+    assert out is not x, name
+    g = upstream(out)
+    (gx,) = torch.autograd.grad(out, x, g)
+    picked = out.detach().flatten().long()
+    assert torch.equal(gx.flatten(), torch.zeros(24, dtype=torch.float64).index_add(0, picked, g.flatten())), name
+# A 1-tuple goes through the several-items path in PyTorch.
+assert first_chain(x[(slice(None),)]) == ["AliasBackward0"]
+e = counting(2, 0)
+assert first_chain(e[:, 0:0]) == ["AliasBackward0"]
+assert first_chain(e[:, :]) == ["AliasBackward0"]
+assert first_chain(e[0:0, :]) == ["SliceBackward0"]
+s = torch.tensor(2.0, requires_grad=True)
+assert first_chain(s[...]) == ["AliasBackward0"]
+assert first_chain(s[None]) == ["UnsqueezeBackward0"]
+assert first_chain(s[()]) == ["AliasBackward0"]
+
+# skipped_slices_keep_the_gradients
+x = counting(2, 3)
+y = x * 2.0
+assert first_chain(y[:, :, None]) == ["UnsqueezeBackward0", "MulBackward0"]
+out = y[:, :]
+assert first_chain(out) == ["AliasBackward0", "MulBackward0"]
+out.sum().backward()
+assert x.grad.flatten().tolist() == [2.0] * 6
+(gx,) = torch.autograd.grad(x[:, torch.tensor([2, 2, 0])], x, torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float64))
+assert gx.flatten().tolist() == [3.0, 0.0, 3.0, 6.0, 0.0, 9.0]
+(gx,) = torch.autograd.grad(x[0:10, 1], x, torch.tensor([7.0, 8.0], dtype=torch.float64))
+assert gx.flatten().tolist() == [0.0, 7.0, 0.0, 0.0, 8.0, 0.0]
+
+
+# new_views_are_views_with_their_own_node and new_views_in_no_grad_mode_follow_their_base_but_drop_gradients
+def new_views(t):
+    return [t.permute(2, 0, 1), t.transpose(0, 2), t.squeeze(), t.squeeze(1), t.squeeze((1,)), t.unsqueeze(0), t[:, :], t[...]]
+
+
+x = counting(2, 1, 3)
+for v in new_views(x):
+    assert v is not x and v._base is x and v.requires_grad and not v.is_leaf
+    with torch.no_grad():
+        v[...].fill_(5.0)
+    assert (x == 5.0).all()
+    assert len(first_chain(v.unsqueeze(0))) == 2
+b = counting(2, 1, 3)
+recorded = new_views(b)
+b.requires_grad_(False)
+assert all(v.requires_grad and not v.is_leaf for v in recorded)
+x = counting(2, 1, 3)
+with torch.no_grad():
+    quiet = new_views(x)
+for v in quiet:
+    assert v.requires_grad and v.is_leaf and v.grad_fn is None and v._base is x
+    y = v * 2.0
+    assert y.requires_grad and node(y) == ("MulBackward0", [None, None])
+    y.sum().backward()
+    assert x.grad is None and v.grad is None
+    assert message(lambda: v.backward(torch.ones_like(v))) == "element 0 of tensors does not require grad and does not have a grad_fn"
+x.requires_grad_(False)
+assert not any(v.requires_grad for v in quiet)
+
+# gradients_of_views_on_meta_and_empty_inputs
+for device, shape in [("cpu", (0, 1, 3)), ("meta", (0, 1, 3)), ("meta", (1 << 40, 1, 3))]:
+    x = torch.zeros(shape, device=device, requires_grad=True)
+    for v in new_views(x):
+        (gx,) = torch.autograd.grad(v, x, torch.ones(v.shape, device=device), create_graph=True)
+        assert tuple(gx.shape) == shape and gx.device.type == device and gx.dtype == x.dtype
 
 print("check_m1_formulas: all reference checks passed")

@@ -27,7 +27,10 @@ pub(crate) use lerp::lerp;
 pub(crate) use misc::{deep_clone, to_copy};
 pub(crate) use reduce::{extremum, extremum_dim, mean, prod, sum, sum_dim, sum_to_size, var_std};
 pub(crate) use unary::unary;
-pub(crate) use view::{as_strided, expand, select, slice, unsafe_view, view};
+pub(crate) use view::{
+    Squeeze, alias, as_strided, expand, permute, select, slice, squeeze, transpose, unsafe_view,
+    unsqueeze, view,
+};
 
 use super::node::{ApplyContext, Node};
 use crate::Tensor;

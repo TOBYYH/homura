@@ -319,11 +319,22 @@ impl IntoShapeSpec for &Shape {
 pub trait Dims {
     /// Converts into a list of dimension indices.
     fn into_dims(self) -> Vec<i64>;
+
+    /// Whether this is a single dimension rather than a list. PyTorch records `squeeze(dim)` and
+    /// `squeeze(dims)` with different backward nodes, and so does homura.
+    #[doc(hidden)]
+    fn is_single(&self) -> bool {
+        false
+    }
 }
 
 impl Dims for i64 {
     fn into_dims(self) -> Vec<i64> {
         vec![self]
+    }
+
+    fn is_single(&self) -> bool {
+        true
     }
 }
 

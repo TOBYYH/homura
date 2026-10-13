@@ -831,10 +831,6 @@ fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
     let cases: Vec<(&str, Tensor)> = vec![
         ("matmul", x.matmul(&w)),
         ("softmax", x.softmax(-1)),
-        ("permute", x.permute([1, 0])),
-        ("transpose", x.transpose(0, 1)),
-        ("unsqueeze", x.unsqueeze(0)),
-        ("squeeze", x.unsqueeze(0).squeeze()),
         ("concat", homura::concat(&[&x, &w], 0)),
         ("flip", x.flip(0)),
         ("triu", x.triu(0)),

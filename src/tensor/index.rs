@@ -177,6 +177,13 @@ impl IndexItem for StepBy<RangeFrom<i64>> {
     }
 }
 
+/// Whether the slice `start:end:step` covers all of a dimension of `size`, judged like PyTorch
+/// by the bounds as given: starting at 0 (not at `-size`) and ending at or past the end, with a
+/// step of 1.
+fn covers(size: usize, start: Option<i64>, end: Option<i64>, step: i64) -> bool {
+    step == 1 && start.unwrap_or(0) == 0 && end.is_none_or(|end| end >= size as i64)
+}
+
 /// A full index expression: a single [`IndexItem`] or a tuple of them.
 pub trait IndexSpec {
     /// Converts into a list of [`TensorIndex`] items.
@@ -224,6 +231,12 @@ impl Tensor {
     /// The result is a view of `self`, except when a tensor index is used. Slices follow Python
     /// semantics: negative bounds count from the end and out-of-range bounds are clamped.
     ///
+    /// As in PyTorch, when there are several items, a slice that covers its whole dimension
+    /// (start 0 or omitted, end omitted or at least the size, step 1) is skipped instead of
+    /// recorded in the backward graph, and an expression that changes nothing, such as
+    /// `(.., ..)` or [`Ellipsis`], gives a new view of all of `self`. A lone slice is always
+    /// recorded; unlike Python, a one-item tuple counts as a lone item.
+    ///
     /// ```
     /// use homura::{Ellipsis, NewAxis};
     /// let x = homura::arange(24).view([2, 3, 4]);
@@ -255,6 +268,9 @@ impl Tensor {
         {
             panic!("an index can only have a single ellipsis ('...')");
         }
+        // As in PyTorch, among several items a slice that covers its whole dimension is skipped
+        // rather than recorded, while a lone slice is always a slice.
+        let lone = items.len() == 1;
         let mut result = self.clone();
         let mut dim = 0;
         let mut tensor_index = None;
@@ -262,7 +278,9 @@ impl Tensor {
             match item {
                 TensorIndex::Select(i) => result = result.select(dim as i64, i),
                 TensorIndex::Slice { start, end, step } => {
-                    result = result.slice(dim, start, end, step);
+                    if lone || !covers(result.shape()[dim], start, end, step) {
+                        result = result.slice(dim, start, end, step);
+                    }
                     dim += 1;
                 }
                 TensorIndex::NewAxis => {
@@ -280,6 +298,8 @@ impl Tensor {
             }
         }
         match tensor_index {
+            // Nothing applied, as with `x[...]` or `x[:, :]`: still a new view, like PyTorch's.
+            None if result.is_same(self) => self.alias(),
             None => result,
             Some((d, idx)) => result.take_along(d, &idx),
         }

@@ -7,7 +7,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
-use homura::{DType, Device, GeluApproximate, Tensor, where_};
+use homura::{DType, Device, GeluApproximate, NewAxis, Tensor, where_};
 
 /// A variable of `shape` with deterministic values of both signs, between 0.3 and 1.3 in
 /// magnitude, so that no element sits at a kink such as `sign`'s.
@@ -349,6 +349,51 @@ fn reduction_and_view_formulas() {
             x[0].index((1, ..2)),
         ]
     });
+    let y = var(&[2, 1, 3], 4);
+    check("permute", &[&y, &t], |x| {
+        vec![
+            x[0].permute([2, 0, 1]),
+            x[0].permute([-1, 1, -3]),
+            x[1].permute([1, 0]),
+        ]
+    });
+    check("transpose", &[&y, &t], |x| {
+        vec![
+            x[0].transpose(0, 2),
+            x[0].transpose(-1, 1),
+            x[1].transpose(0, 1),
+        ]
+    });
+    check("squeeze", &[&y], |x| {
+        vec![
+            x[0].squeeze(),
+            x[0].squeeze_dim(-2),
+            x[0].squeeze_dim([0, 1]),
+            x[0].squeeze_dim(0),
+        ]
+    });
+    check("unsqueeze", &[&t], |x| {
+        vec![x[0].unsqueeze(0), x[0].unsqueeze(-1), x[0].unsqueeze(1)]
+    });
+    check("skipped full slices", &[&y], |x| {
+        vec![
+            x[0].index((.., ..)),
+            x[0].index(homura::Ellipsis),
+            x[0].index((.., 0..5, NewAxis, 1..)),
+            x[0].index((.., .., &ints(&[2, 2, 0]))),
+        ]
+    });
+    let s = var(&[], 5);
+    check("zero-dimensional views", &[&s], |x| {
+        vec![
+            x[0].squeeze(),
+            x[0].squeeze_dim(0),
+            x[0].unsqueeze(-1),
+            x[0].transpose(0, -1),
+            x[0].permute(Vec::<i64>::new()),
+            x[0].index(homura::Ellipsis),
+        ]
+    });
     check("split", &[&x], |x| x[0].split(2, -1));
     check("chunk", &[&x], |x| x[0].chunk(2, 0));
     check("repeat", &[&v], |x| vec![x[0].repeat([2, 2])]);
@@ -429,7 +474,7 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
     let x = var(&[2, 3], 1);
     let none = Tensor::from_slice::<i64>(&[], [0]);
     type Op = (&'static str, fn(&Tensor, &Tensor, &Tensor) -> Tensor);
-    let ops: [Op; 13] = [
+    let ops: [Op; 18] = [
         ("exp", |e, _, _| e.exp()),
         ("relu", |e, _, _| e.relu()),
         ("div", |e, x, _| e / &x.narrow(0, 0, 1)),
@@ -445,6 +490,11 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
         ("index_select", |_, x, i| x.index_select(0, i)),
         ("index_add", |e, x, i| x.index_add(0, i, e)),
         ("slice", |_, x, _| x.index((.., 3..))),
+        ("permute", |e, _, _| e.permute([1, 0])),
+        ("transpose", |e, _, _| e.transpose(0, 1)),
+        ("unsqueeze", |e, _, _| e.unsqueeze(1)),
+        ("squeeze", |e, _, _| e.unsqueeze(1).squeeze_dim([1, 2])),
+        ("alias", |e, _, _| e.index((.., ..))),
     ];
     for (name, op) in ops {
         let y = op(&empty, &x, &none);

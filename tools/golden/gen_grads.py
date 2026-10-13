@@ -624,6 +624,40 @@ case(
 )
 case("special.prod_order_bf16", lambda x: x.prod(), x=f([1e30, 1e30, 1e-30, 0.0], dtype=torch.bfloat16), g=f(1.0, dtype=torch.bfloat16))
 
+# ---------------------------------------------------------------- step 6d
+# Views and indexing, appended after every earlier case so that those keep their inputs. Among
+# several index items, PyTorch skips slices that cover their dimension; the gradients are the same
+# either way, the node chains are checked in tests/autograd_views.rs.
+case("grad.permute", lambda x: x.permute(2, 0, 1), x=randn(2, 3, 4))
+case("grad.transpose", lambda x: x.transpose(-1, 0), x=randn(2, 3, 4))
+case("grad.squeeze", lambda x: x.squeeze(), x=randn(2, 1, 3, 1))
+case("grad.squeeze_dim", lambda x: x.squeeze(-1), x=randn(2, 1, 3, 1))
+case("grad.squeeze_dims", lambda x: x.squeeze((1, 3)), x=randn(2, 1, 3, 1))
+case("grad.squeeze_none", lambda x: x.squeeze(()), x=randn(2, 1, 3))
+case("grad.unsqueeze", lambda x: x.unsqueeze(1), x=randn(2, 3))
+case("grad.flatten", lambda x: x.flatten(1, 2), x=randn(2, 3, 4))
+case("grad.index_alias", lambda x: x[:, :], x=randn(2, 3))
+case("grad.index_mixed", lambda x: x[:, 1:, None, ::2], x=randn(2, 3, 4))
+case("grad.index_full_tensor", lambda x, idx: x[:, idx], x=randn(3, 4), idx=ints(3, 0, 3, -1))
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.permute", lambda x: x.permute(2, 0, 1), x=randn(2, 3, 4, dtype=dtype))
+    case(f"grad_{tag}.squeeze_dims", lambda x: x.squeeze((1, 3)), x=randn(2, 1, 3, 1, dtype=dtype))
+    case(f"grad_{tag}.index_mixed", lambda x: x[:, 1:, None, ::2], x=randn(2, 3, 4, dtype=dtype))
+# Views pass non-finite upstream gradients through unchanged.
+case(
+    "special.permute",
+    lambda x: x.permute(2, 0, 1),
+    x=f([[[1.0, 2.0], [3.0, 4.0]]]),
+    g=f([[[inf, nan]], [[-inf, -0.0]]]),
+)
+case("special.unsqueeze", lambda x: x.unsqueeze(0), x=f([inf, nan]), g=f([[nan, -inf]]))
+case(
+    "special.index_mixed",
+    lambda x: x[:, 1:, None, ::2],
+    x=f([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]),
+    g=f([[[[inf, -0.0]]]]),
+)
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

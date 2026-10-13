@@ -1,7 +1,7 @@
 //! Operations that return views sharing the storage of the input.
 
 use super::{Layout, Tensor};
-use crate::autograd::{formulas, record_unimplemented};
+use crate::autograd::formulas::{self, Squeeze};
 use crate::shape::{
     Dims, IntoShape, IntoShapeSpec, compute_view_strides, dims_mask, infer_size, normalize_dim,
 };
@@ -123,6 +123,7 @@ impl Tensor {
             );
         }
         let mut seen = vec![false; n];
+        let mut wrapped = vec![0; n];
         let mut shape = vec![0; n];
         let mut strides = vec![0; n];
         for (i, &d) in dims.iter().enumerate() {
@@ -131,6 +132,7 @@ impl Tensor {
                 panic!("permute(): duplicate dims are not allowed.");
             }
             seen[d] = true;
+            wrapped[i] = d;
             shape[i] = l.shape[d];
             strides[i] = l.strides[d];
         }
@@ -139,7 +141,7 @@ impl Tensor {
             strides: Strides::new(&strides),
             offset: l.offset,
         });
-        record_unimplemented("permute", &[Some(self)], &out);
+        formulas::permute(self, wrapped, &out);
         out
     }
 
@@ -156,7 +158,7 @@ impl Tensor {
             l.strides.swap(a, b);
         }
         let out = self.make_view(l);
-        record_unimplemented("transpose", &[Some(self)], &out);
+        formulas::transpose(self, dim0, dim1, &out);
         out
     }
 
@@ -201,27 +203,43 @@ impl Tensor {
     /// Removes all dimensions of size 1.
     pub fn squeeze(&self) -> Tensor {
         let l = self.layout();
-        let keep: Vec<usize> = (0..l.shape.len()).filter(|&d| l.shape[d] != 1).collect();
-        self.keep_dims("squeeze", &l, &keep)
+        let remove: Vec<bool> = l.shape.iter().map(|&size| size == 1).collect();
+        self.remove_dims(Squeeze::All, &l, &remove)
     }
 
     /// Removes the given dimensions if they have size 1 (others are left alone, like PyTorch).
+    /// An empty list removes none.
     pub fn squeeze_dim(&self, dims: impl Dims) -> Tensor {
+        let kind = if dims.is_single() {
+            Squeeze::Dim
+        } else {
+            Squeeze::Dims
+        };
+        let dims = dims.into_dims();
         let l = self.layout();
-        let mask = dims_mask(&dims.into_dims(), l.shape.len());
-        let keep: Vec<usize> = (0..l.shape.len())
-            .filter(|&d| !(mask[d] && l.shape[d] == 1))
+        // Unlike reductions, where it stands for all dimensions, PyTorch's empty list here
+        // squeezes nothing.
+        let mask = if dims.is_empty() {
+            vec![false; l.shape.len()]
+        } else {
+            dims_mask(&dims, l.shape.len())
+        };
+        let remove: Vec<bool> = (0..l.shape.len())
+            .map(|d| mask[d] && l.shape[d] == 1)
             .collect();
-        self.keep_dims("squeeze_dim", &l, &keep)
+        self.remove_dims(kind, &l, &remove)
     }
 
-    fn keep_dims(&self, op: &'static str, l: &Layout, keep: &[usize]) -> Tensor {
+    /// The view of `l` without the dimensions `d` where `remove[d]` holds.
+    fn remove_dims(&self, kind: Squeeze, l: &Layout, remove: &[bool]) -> Tensor {
+        let keep = || (0..l.shape.len()).filter(|&d| !remove[d]);
         let out = self.make_view(Layout {
-            shape: keep.iter().map(|&d| l.shape[d]).collect(),
-            strides: keep.iter().map(|&d| l.strides[d]).collect(),
+            shape: keep().map(|d| l.shape[d]).collect(),
+            strides: keep().map(|d| l.strides[d]).collect(),
             offset: l.offset,
         });
-        record_unimplemented(op, &[Some(self)], &out);
+        let removed = (0..l.shape.len()).filter(|&d| remove[d]).collect();
+        formulas::squeeze(self, kind, removed, &out);
         out
     }
 
@@ -230,7 +248,15 @@ impl Tensor {
         let l = self.layout();
         let d = normalize_dim(dim, l.shape.len() + 1);
         let out = self.make_view(l.unsqueeze(d));
-        record_unimplemented("unsqueeze", &[Some(self)], &out);
+        formulas::unsqueeze(self, d, &out);
+        out
+    }
+
+    /// A view of all of `self` with the same layout (PyTorch's `alias`): what indexing returns
+    /// when no index item changes anything, so that the result is still a new tensor.
+    pub(crate) fn alias(&self) -> Tensor {
+        let out = self.make_view(self.layout());
+        formulas::alias(self, &out);
         out
     }
 
@@ -349,7 +375,7 @@ impl Tensor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DType, Device, NewAxis, Tensor};
+    use crate::{DType, Device, Ellipsis, NewAxis, Tensor};
 
     /// Whether `t` is recorded as a view of the root `base`.
     fn is_view_of(t: &Tensor, base: &Tensor) -> bool {
@@ -436,6 +462,46 @@ mod tests {
                 .iter()
                 .all(|p| p.view_info().unwrap().base_history_gen == 1)
         );
+    }
+
+    #[test]
+    fn stale_permuted_squeezed_and_aliased_views_are_rejected() {
+        let x = crate::rand([2, 1, 3]);
+        x.requires_grad_(true);
+        let views = [
+            x.permute([2, 0, 1]),
+            x.transpose(0, 2),
+            x.squeeze(),
+            x.squeeze_dim(1),
+            x.squeeze_dim([1]),
+            x.unsqueeze(0),
+            x.index((.., ..)),
+            x.index(Ellipsis),
+            x.index((.., .., 1..)),
+        ];
+        let views_of_views: Vec<Tensor> = views.iter().map(|v| v.unsqueeze(0)).collect();
+        // Stands in for an in-place operation in grad mode, which rewrites the history of `x`.
+        x.autograd_meta()
+            .get_or_insert_with(Default::default)
+            .history_gen = 1;
+        let stale = |f: &dyn Fn()| {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_err();
+            let message = err
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| err.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            assert!(
+                message.starts_with("a view whose base was modified"),
+                "{message}"
+            );
+        };
+        for v in views.iter().chain(&views_of_views) {
+            assert!(is_view_of(v, &x));
+            stale(&|| drop(v * 2.0));
+            stale(&|| drop(v.transpose(0, -1)));
+            stale(&|| v.sum().backward());
+        }
     }
 
     #[test]

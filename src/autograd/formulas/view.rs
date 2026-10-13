@@ -26,6 +26,42 @@ pub(crate) fn expand(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |_| ExpandBackward0 { self_shape });
 }
 
+/// Records the backward node of `out = x.permute(dims)`, with `dims` already wrapped.
+pub(crate) fn permute(x: &Tensor, dims: Vec<usize>, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| PermuteBackward0 { dims });
+}
+
+/// Records the backward node of `out = x.transpose(dim0, dim1)`.
+pub(crate) fn transpose(x: &Tensor, dim0: i64, dim1: i64, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| TransposeBackward0 { dim0, dim1 });
+}
+
+/// Which squeeze made a view, for the name of its node: like PyTorch's overloads, `squeeze()`,
+/// `squeeze(dim)` and `squeeze(dims)` record `SqueezeBackward0`, `1` and `2`.
+#[derive(Clone, Copy)]
+pub(crate) enum Squeeze {
+    All,
+    Dim,
+    Dims,
+}
+
+/// Records the backward node of a squeeze of `x` that removed the dimensions `removed`, in
+/// increasing order.
+pub(crate) fn squeeze(x: &Tensor, kind: Squeeze, removed: Vec<usize>, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| SqueezeBackward { kind, removed });
+}
+
+/// Records the backward node of `out = x.unsqueeze(dim)`, with `dim` already wrapped.
+pub(crate) fn unsqueeze(x: &Tensor, dim: usize, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| UnsqueezeBackward0 { dim });
+}
+
+/// Records the backward node of `out`, a view of all of `x` (PyTorch's `alias`), which indexing
+/// returns when no index item changes anything.
+pub(crate) fn alias(x: &Tensor, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| AliasBackward0);
+}
+
 /// Records the backward node of `out = x.select(dim, index)`, with `index` already wrapped.
 pub(crate) fn select(x: &Tensor, dim: usize, index: usize, out: &Tensor) {
     record(&[Some(x)], &[out], |_| SelectBackward0 {
@@ -102,6 +138,93 @@ impl Node for ExpandBackward0 {
 
     fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
         vec![Some(only(grads).sum_to_size(&self.self_shape))]
+    }
+}
+
+/// `x.permute(dims)`: the gradient permuted back with the inverse permutation.
+struct PermuteBackward0 {
+    dims: Vec<usize>,
+}
+
+impl Node for PermuteBackward0 {
+    fn name(&self) -> &'static str {
+        "PermuteBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let mut inverse = vec![0; self.dims.len()];
+        for (i, &d) in self.dims.iter().enumerate() {
+            inverse[d] = i as i64;
+        }
+        vec![Some(only(grads).permute(inverse))]
+    }
+}
+
+/// `x.transpose(dim0, dim1)`: the gradient with the same dimensions swapped back.
+struct TransposeBackward0 {
+    dim0: i64,
+    dim1: i64,
+}
+
+impl Node for TransposeBackward0 {
+    fn name(&self) -> &'static str {
+        "TransposeBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        vec![Some(only(grads).transpose(self.dim0, self.dim1))]
+    }
+}
+
+/// A squeeze: the removed dimensions inserted back into the gradient, in increasing order so
+/// that each lands at its original position (PyTorch's `unsqueeze_to`).
+struct SqueezeBackward {
+    kind: Squeeze,
+    removed: Vec<usize>,
+}
+
+impl Node for SqueezeBackward {
+    fn name(&self) -> &'static str {
+        match self.kind {
+            Squeeze::All => "SqueezeBackward0",
+            Squeeze::Dim => "SqueezeBackward1",
+            Squeeze::Dims => "SqueezeBackward2",
+        }
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let g = only(grads);
+        vec![Some(
+            self.removed.iter().fold(g, |g, &d| g.unsqueeze(d as i64)),
+        )]
+    }
+}
+
+/// `x.unsqueeze(dim)`: the gradient with that dimension removed again.
+struct UnsqueezeBackward0 {
+    dim: usize,
+}
+
+impl Node for UnsqueezeBackward0 {
+    fn name(&self) -> &'static str {
+        "UnsqueezeBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        vec![Some(only(grads).squeeze_dim(self.dim as i64))]
+    }
+}
+
+/// A view of all of `x`: the gradient passes through unchanged.
+struct AliasBackward0;
+
+impl Node for AliasBackward0 {
+    fn name(&self) -> &'static str {
+        "AliasBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        vec![Some(only(grads))]
     }
 }
 

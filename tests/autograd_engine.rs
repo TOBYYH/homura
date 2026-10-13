@@ -826,12 +826,10 @@ fn chunks_have_independent_autograd_state() {
 fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
     let x = Tensor::from_slice(&[0.5f32, 1., 2., 3.], [2, 2]);
     x.requires_grad_(true);
-    let w = Tensor::from_slice(&[1f32, 2., 3., 4.], [2, 2]);
     let index = homura::tensor([1i64, 0]);
     let cases: Vec<(&str, Tensor)> = vec![
-        ("matmul", x.matmul(&w)),
         ("softmax", x.softmax(-1)),
-        ("addmm", x.addmm(&w, &w, 0.0, 1.0)),
+        ("log_softmax", x.log_softmax(-1)),
     ];
     for (op, out) in cases {
         assert!(out.requires_grad(), "{op}");

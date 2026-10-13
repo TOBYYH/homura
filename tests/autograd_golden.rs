@@ -14,7 +14,7 @@ use homura::{DType, GeluApproximate, NewAxis, Tensor, where_};
 
 /// The output of operation `op` of a case, from its inputs by name.
 fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
-    let (x, y) = (|| &t["x"], || &t["y"]);
+    let (x, y, z) = (|| &t["x"], || &t["y"], || &t["z"]);
     let idx = || &t["idx"];
     Some(match op {
         "neg" => x().neg(),
@@ -151,6 +151,16 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "triu" => x().triu(1),
         "tril" => x().tril(-1),
         "repeat" => x().repeat([2, 1, 2]),
+        op if op.starts_with("matmul_") => x().matmul(y()),
+        "addmm" => x().addmm(y(), z(), 2.0, -1.5),
+        "addmm_beta0" => x().addmm(y(), z(), 0, 1.5),
+        "addmm_alpha0" => x().addmm(y(), z(), 1, 0),
+        "addmm_alpha_large" => x().addmm(y(), z(), 1, 1e30),
+        "addmm_opmath_f16" => x().addmm(y(), z(), 1.0004, 1.0004),
+        "addmv" => x().addmv(y(), z(), -0.5, 2),
+        "addr" => x().addr(y(), z(), 1.5, 0.75),
+        "baddbmm" => x().baddbmm(y(), z(), 0.5, -1),
+        "addbmm" => x().addbmm(y(), z(), 0.25, 3),
         _ => return None,
     })
 }
@@ -206,7 +216,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 272, "only {} cases", cases.len());
+    assert!(cases.len() >= 298, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

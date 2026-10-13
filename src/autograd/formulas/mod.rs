@@ -11,6 +11,7 @@ mod binary;
 mod clamp;
 mod index;
 mod lerp;
+mod matmul;
 mod misc;
 mod pow;
 mod reduce;
@@ -25,6 +26,7 @@ pub(crate) use index::{
     gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
 };
 pub(crate) use lerp::lerp;
+pub(crate) use matmul::{ScaledProduct, matmul, scaled_product};
 pub(crate) use misc::{deep_clone, to_copy};
 pub(crate) use reduce::{extremum, extremum_dim, mean, prod, sum, sum_dim, sum_to_size, var_std};
 pub(crate) use shape::{concat, flip, triangle};

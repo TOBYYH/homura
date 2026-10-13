@@ -1,6 +1,6 @@
 """Check the reference behavior that tests/autograd_formulas.rs, tests/autograd_binary.rs,
 tests/autograd_reduce.rs, tests/autograd_views.rs, tests/autograd_copies.rs and tests/m1_ops.rs
-encode (M1 steps 4 and 6a-6e), and the review fixes that tests/m1_regressions.rs encodes; does
+encode (M1 steps 4 and 6a-6f), and the review fixes that tests/m1_regressions.rs encodes; does
 not write fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
@@ -19,6 +19,11 @@ whether a slice covers its dimension is judged on the slice an index item conver
 `stack` and `repeat` are composites in homura (`CatBackward0` over `UnsqueezeBackward0`s, and
 reshapes, `expand` and a copy) where PyTorch records `StackBackward0` and `RepeatBackward0`; the
 gradients are the same.
+`matmul` is one node in homura (named DotBackward0, MvBackward0 or MmBackward0 where PyTorch
+records that node alone, MatmulBackward0 otherwise) where PyTorch records views around mm, mv or
+bmm; the gradient of a 2-D operand times a batched one is a single mm in both, without PyTorch's
+final transpose for the left operand. PyTorch's backward rejects the mixed dtypes that `addr`
+promotes; homura records the conversions and differentiates them.
 """
 
 import math
@@ -1777,5 +1782,271 @@ for device, rows in [("cpu", 0), ("meta", 0), ("meta", 1 << 40)]:
                 assert name != "concat"
                 continue
             assert gt.shape == t.shape and gt.dtype == t.dtype and gt.device.type == device
+
+# ---------------------------------------------------------------- step 6f: matrix products
+
+
+def values(shape, seed):
+    n = math.prod(shape)
+    return torch.tensor([((i * 7 + seed * 5) % 11) / 4.0 - 1.25 for i in range(n)], dtype=torch.float64).reshape(shape)
+
+
+def leaf_of(t):
+    return t.detach().clone().requires_grad_()
+
+
+def reference_matmul(a, b):
+    a2 = a.unsqueeze(0) if a.dim() == 1 else a
+    b2 = b.unsqueeze(1) if b.dim() == 1 else b
+    out = (a2.unsqueeze(-1) * b2.unsqueeze(-3)).sum(-2)
+    if b.dim() == 1:
+        out = out.squeeze(-1)
+    if a.dim() == 1:
+        out = out.squeeze(-1 - (b.dim() > 1))
+    return out
+
+
+def close(x, y):
+    assert x.shape == y.shape and torch.allclose(x, y, rtol=1e-12, atol=1e-12), (x, y)
+
+
+SHAPES = [
+    ((3,), (3,)), ((2, 3), (3,)), ((3,), (3, 4)), ((2, 3), (3, 4)), ((5, 2, 3), (3, 4)),
+    ((2, 3), (5, 3, 4)), ((5, 2, 3), (5, 3, 4)), ((2, 1, 3, 4), (1, 5, 4, 6)), ((3,), (5, 3, 4)),
+    ((5, 2, 3), (3,)), ((2, 5, 2, 3), (5, 3, 4)), ((2, 2, 3), (3, 1)), ((1, 3), (2, 3, 4)),
+    ((0, 2, 3), (3, 4)), ((2, 0), (0, 3)), ((2, 3), (3, 0)), ((0,), (0,)),
+]
+
+# matmul_records_one_node_named_after_the_reference: PyTorch records DotBackward0, MvBackward0 or
+# MmBackward0 alone for 1-D x 1-D, 2-D x 1-D and 2-D x 2-D; for the other shapes it records views
+# around mm, mv or bmm (top nodes below), where homura records one MatmulBackward0.
+for sa, sb, top in [
+    ((3,), (3,), "DotBackward0"),
+    ((2, 3), (3,), "MvBackward0"),
+    ((2, 3), (3, 4), "MmBackward0"),
+    ((3,), (3, 4), "SqueezeBackward4"),
+    ((5, 2, 3), (3, 4), "UnsafeViewBackward0"),
+    ((2, 3), (5, 3, 4), "CloneBackward0"),
+    ((5, 2, 3), (5, 3, 4), "UnsafeViewBackward0"),
+    ((5, 2, 3), (3,), "UnsafeViewBackward0"),
+]:
+    a, b = leaf_of(values(sa, 0)), leaf_of(values(sb, 1))
+    out = a @ b
+    assert out.grad_fn.name() == top, (sa, sb, out.grad_fn.name())
+    if top in ("DotBackward0", "MvBackward0", "MmBackward0"):
+        assert node(out) == (top, [ACC, ACC])
+        assert node(a @ b.detach()) == (top, [ACC, None])
+i = torch.tensor([[1, 2], [3, 4]])
+assert not (i @ i).requires_grad
+
+# matmul_gradients_match_the_broadcast_product and matmul_differentiates_again
+for seed, (sa, sb) in enumerate(SHAPES):
+    a, b = leaf_of(values(sa, seed)), leaf_of(values(sb, seed + 1))
+    out, expected = a @ b, reference_matmul(a, b)
+    close(out, expected)
+    g = values(out.shape, seed + 2).requires_grad_()
+    first = torch.autograd.grad(out, [a, b], g, create_graph=True)
+    wanted = torch.autograd.grad(expected, [a, b], g, create_graph=True)
+    for x, y in zip(first, wanted):
+        close(x, y)
+    h = [values(t.shape, seed + 3 + k) for k, t in enumerate(first)]
+    dot = lambda gs: (gs[0] * h[0]).sum() + (gs[1] * h[1]).sum()  # noqa: E731
+    second = torch.autograd.grad(dot(first), [a, b, g], allow_unused=True)
+    wanted = torch.autograd.grad(dot(wanted), [a, b, g], allow_unused=True)
+    for t, x, y in zip([a, b, g], second, wanted):
+        close(torch.zeros_like(t) if x is None else x, torch.zeros_like(t) if y is None else y)
+
+# matmul_gradients_of_non_contiguous_operands
+a, b, e = leaf_of(values((5, 3), 0)), leaf_of(values((5, 10), 1)), leaf_of(values((1, 2, 3), 2))
+bs = b[:, ::2]
+for x, y in [(a.t(), bs), (e.expand(4, 2, 3), bs[:3])]:
+    out = x @ y
+    g = values(out.shape, 3).transpose(-1, -2).contiguous().transpose(-1, -2)
+    found = torch.autograd.grad(out, [a, b, e], g, allow_unused=True)
+    wanted = torch.autograd.grad(reference_matmul(x, y), [a, b, e], g, allow_unused=True)
+    for p, q in zip(found, wanted):
+        assert (p is None) == (q is None)
+        if p is not None:
+            close(p, q)
+
+# an_unbatched_operand_gets_one_folded_product: PyTorch folds [B, S, d] @ [d, e] into mm when the
+# weight requires grad, so the weight's gradient is one mm of the flattened tensors. For
+# [d, e] @ [B, e, f] it folds too, through transposes.
+x, w = leaf_of(values((2, 3, 4), 0)), leaf_of(values((4, 5), 1))
+out = x @ w
+g = values(out.shape, 2)
+(gw,) = torch.autograd.grad(out, w, g, create_graph=True)
+assert gw.grad_fn.name() == "MmBackward0"
+close(gw, x.detach().flatten(0, 1).t() @ g.flatten(0, 1))
+w, y = leaf_of(values((3, 4), 3)), leaf_of(values((2, 4, 5), 4))
+out = w @ y
+(gw,) = torch.autograd.grad(out, w, values(out.shape, 5), create_graph=True)
+# The reference transposes an mm of transposed operands (TBackward0 on top); homura multiplies in
+# the other order, so its gradient is the MmBackward0 itself.
+assert gw.grad_fn.name() == "TBackward0"
+
+# matmul_saves_each_operand_for_the_other
+a, b = leaf_of(values((2, 3), 0)), values((3, 4), 1)
+y = (a @ b).sum()
+with torch.no_grad():
+    b.add_(1.0)
+assert "modified by an inplace operation" in message(y.backward)
+b = values((3, 4), 1)
+y = (a @ b).sum()
+with torch.no_grad():
+    a.add_(1.0)
+y.backward()
+y = (a @ b).sum()
+y.backward()
+assert message(y.backward).startswith("Trying to backward through the graph a second time")
+
+# matmul_gradients_on_meta_and_empty_inputs
+for device in ["cpu", "meta"]:
+    pairs = [((2, 0, 3), (3, 4)), ((2, 3), (3, 0)), ((0,), (0,)), ((5, 0), (2, 0, 3))]
+    if device == "meta":
+        pairs.append(((1 << 40, 3), (3, 2)))
+    for sa, sb in pairs:
+        a = torch.zeros(sa, device=device, requires_grad=True)
+        b = torch.zeros(sb, device=device, requires_grad=True)
+        out = a @ b
+        g = torch.ones(out.shape, device=device, requires_grad=True)
+        for t, gt in zip([a, b], torch.autograd.grad(out, [a, b], g, create_graph=True)):
+            assert gt.shape == t.shape and gt.device.type == device
+            if device == "cpu":
+                assert (gt == 0).all()
+
+# scaled_products_record_their_own_nodes
+SCALED = [
+    ("addmm", torch.addmm, (3,), (2, 4), (4, 3)),
+    ("addmv", torch.addmv, (2,), (2, 4), (4,)),
+    ("addr", torch.addr, (1, 3), (2,), (3,)),
+    ("baddbmm", torch.baddbmm, (2, 3), (5, 2, 4), (5, 4, 3)),
+    ("addbmm", torch.addbmm, (2, 1), (5, 2, 4), (5, 4, 3)),
+]
+
+
+def reference_scaled(name, x, a, b, beta, alpha):
+    if name == "addr":
+        product = a.unsqueeze(1) * b.unsqueeze(0)
+    elif name == "addbmm":
+        product = reference_matmul(a, b).sum(0)
+    else:
+        product = reference_matmul(a, b)
+    return x * beta + product * alpha
+
+
+for name, op, sx, sa, sb in SCALED:
+    x, a, b = leaf_of(values(sx, 0)), leaf_of(values(sa, 1)), leaf_of(values(sb, 2))
+    expected = name[0].upper() + name[1:] + "Backward0"
+    assert node(op(x, a, b, beta=2, alpha=3)) == (expected, [ACC, ACC, ACC])
+    assert node(op(x.detach(), a, b.detach(), beta=2, alpha=3)) == (expected, [None, ACC, None])
+
+# scaled_product_gradients_match_their_composites
+for beta, alpha in [(1.0, 1.0), (2.0, 3.0), (-0.5, 1.0), (1.0, -0.25), (0.0, 2.0)]:
+    for seed, (name, op, sx, sa, sb) in enumerate(SCALED):
+        x, a, b = leaf_of(values(sx, seed)), leaf_of(values(sa, seed + 1)), leaf_of(values(sb, seed + 2))
+        out = op(x, a, b, beta=beta, alpha=alpha)
+        expected = reference_scaled(name, x, a, b, beta, alpha)
+        close(out, expected)
+        g = values(out.shape, seed + 3).requires_grad_()
+        first = torch.autograd.grad(out, [x, a, b], g, create_graph=True)
+        wanted = torch.autograd.grad(expected, [x, a, b], g, create_graph=True)
+        for p, q in zip(first, wanted):
+            close(p, q)
+        h = [values(t.shape, k) for k, t in enumerate(first)]
+        dot = lambda gs: sum((gs[k] * h[k]).sum() for k in range(3))  # noqa: E731
+        inputs = [x, a, b, g]
+        second = torch.autograd.grad(dot(first), inputs, allow_unused=True, retain_graph=True)
+        wanted = torch.autograd.grad(dot(wanted), inputs, allow_unused=True)
+        for t, p, q in zip(inputs, second, wanted):
+            close(torch.zeros_like(t) if p is None else p, torch.zeros_like(t) if q is None else q)
+
+# beta_zero_gives_the_input_the_upstream_gradient_times_zero
+x = leaf([math.nan, 1.0, 2.0])
+a, b = leaf([[1.0], [2.0]]), leaf([[3.0, 4.0, 5.0]])
+g = torch.tensor([[math.inf, 1.0, math.nan], [2.0, 3.0, 4.0]])
+for beta in [0.0, 0, False]:
+    out = torch.addmm(x, a, b, beta=beta)
+    assert out.flatten().tolist() == [3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    assert out.grad_fn.name() == "AddmmBackward0"
+    gx, ga, gb = torch.autograd.grad(out, [x, a, b], g)
+    assert exact(gx) == ["nan", "0.0", "nan"] and exact(ga) == ["nan", "38.0"] and exact(gb) == ["inf", "7.0", "nan"]
+for name, op, sx, sa, sb in SCALED:
+    x, a, b = leaf_of(values(sx, 0)), leaf_of(values(sa, 1)), leaf_of(values(sb, 2))
+    out = op(x, a, b, beta=0, alpha=1)
+    (gx,) = torch.autograd.grad(out, x, torch.full(out.shape, 2.0, dtype=torch.float64))
+    assert gx.shape == x.shape and (gx == 0).all()
+
+# alpha_scales_the_product_of_the_gradient
+g = torch.tensor([[1e10]])
+for v, alpha, expected in [(1e30, 0.0, "nan"), (1e30, 1e-30, "inf"), (1e-30, 1e30, "1e10")]:
+    x, a, b = leaf([[0.0]]), leaf([[v]]), leaf([[v]])
+    found = torch.autograd.grad(torch.addmm(x, a, b, alpha=alpha), [x, a, b], g)
+    assert exact(found[0]) == ["10000000000.0"]
+    for t in found[1:]:
+        value = t.item()
+        if expected == "nan":
+            assert math.isnan(value)
+        elif expected == "inf":
+            assert value == math.inf
+        else:
+            assert abs(value - 1e10) <= 1e4, value
+for name, op, sx, sa, sb in SCALED:
+    x, a, b = (torch.full(s, 1e30, requires_grad=True) for s in (sx, sa, sb))
+    out = op(x, a, b, beta=1, alpha=0)
+    for t in torch.autograd.grad(out, [a, b], torch.full(out.shape, 1e10)):
+        assert t.isnan().all(), name
+
+# half_precision_coefficients_scale_in_f32
+x = torch.zeros(1, 1, dtype=torch.float16, requires_grad=True)
+a = torch.ones(1, 1, dtype=torch.float16, requires_grad=True)
+b = torch.ones(1, 1, dtype=torch.float16)
+out = torch.addmm(x, a, b, beta=1.0004, alpha=1.0004)
+gx, ga = torch.autograd.grad(out, [x, a], torch.full((1, 1), 1000.0, dtype=torch.float16))
+assert gx.item() == 1000.5 and ga.item() == 1000.5
+
+# scaled_products_save_the_factors_for_each_other
+for name, op, sx, sa, sb in SCALED:
+    x, a, b = leaf_of(values(sx, 0)), values(sa, 1), values(sb, 2)
+    y = op(x, a, b, beta=2, alpha=3).sum()
+    with torch.no_grad():
+        a.add_(1.0)
+    y.backward()
+    y.backward()
+    a = leaf_of(values(sa, 1))
+    y = op(x, a, b, beta=2, alpha=3).sum()
+    with torch.no_grad():
+        a.add_(1.0)
+    y.backward()
+    y = op(x, a, b, beta=2, alpha=3).sum()
+    with torch.no_grad():
+        b.add_(1.0)
+    assert "modified by an inplace operation" in message(y.backward), name
+
+# addr_differentiates_promoted_inputs: PyTorch promotes in the forward but its backward rejects
+# mixed dtypes; homura records the conversions and differentiates (an extension).
+x = leaf_of(values((2, 3), 0))
+v1, v2 = leaf_of(values((2,), 1).float()), leaf_of(values((3,), 2).float())
+out = torch.addr(x, v1, v2, beta=2, alpha=3)
+assert out.dtype == torch.float64 and node(out) == ("AddrBackward0", [ACC, ACC, ACC])
+assert "must have the same dtype" in message(lambda: torch.autograd.grad(out, [x, v1, v2], values((2, 3), 3)))
+
+# scaled_product_gradients_on_meta_and_empty_inputs
+for device in ["cpu", "meta"]:
+    cases = [
+        (torch.addmm, (2, 3), (2, 0), (0, 3)),
+        (torch.addmv, (2,), (2, 0), (0,)),
+        (torch.addr, (0, 3), (0,), (3,)),
+        (torch.baddbmm, (0, 2, 3), (0, 2, 4), (0, 4, 3)),
+        (torch.addbmm, (2, 3), (0, 2, 4), (0, 4, 3)),
+    ]
+    if device == "meta":
+        cases.append((torch.addmm, (1 << 40,), (2, 3), (3, 1 << 40)))
+    for op, sx, sa, sb in cases:
+        x, a, b = (torch.ones(s, device=device, requires_grad=True) for s in (sx, sa, sb))
+        out = op(x, a, b, beta=2, alpha=3)
+        g = torch.ones(out.shape, device=device, requires_grad=True)
+        for t, gt in zip([x, a, b], torch.autograd.grad(out, [x, a, b], g, create_graph=True)):
+            assert gt.shape == t.shape and gt.device.type == device
 
 print("check_m1_formulas: all reference checks passed")

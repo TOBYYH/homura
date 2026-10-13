@@ -686,6 +686,66 @@ case("special.flip", lambda x: x.flip(0, 2), x=f([[[1.0, 2.0]], [[3.0, 4.0]]]), 
 case("special.triu", lambda x: x.triu(1), x=f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), g=f([[inf, nan, -0.0], [nan, -inf, nan]]))
 case("special.tril", lambda x: x.tril(-1), x=f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]), g=f([[inf, nan, -0.0], [nan, -inf, nan]]))
 
+# ---------------------------------------------------------------- step 6f
+# Matrix products. homura records one matmul node where PyTorch decomposes into dot, mv, mm or bmm
+# and views; the gradients are the same. The scaled products multiply the product of `g` with the
+# other factor by alpha, so a zero alpha turns an overflowing product into NaN and a huge alpha
+# keeps a tiny product finite; with beta = 0 the input still gets `g * 0`.
+for name, sx, sy in [
+    ("dot", (3,), (3,)),
+    ("mv", (2, 3), (3,)),
+    ("vm", (3,), (3, 4)),
+    ("mm", (2, 3), (3, 4)),
+    ("fold", (2, 3, 4), (4, 5)),
+    ("fold_left", (3, 4), (2, 4, 5)),
+    ("batch", (2, 1, 3, 4), (1, 2, 4, 5)),
+    ("vb", (3,), (2, 3, 4)),
+    ("bv", (2, 2, 3), (3,)),
+]:
+    case(f"grad.matmul_{name}", lambda x, y: x @ y, x=randn(*sx), y=randn(*sy))
+case("grad.addmm", lambda x, y, z: torch.addmm(x, y, z, beta=2.0, alpha=-1.5), x=randn(3), y=randn(2, 4), z=randn(4, 3))
+case("grad.addmm_beta0", lambda x, y, z: torch.addmm(x, y, z, beta=0, alpha=1.5), x=randn(2, 1), y=randn(2, 4), z=randn(4, 3))
+case("grad.addmv", lambda x, y, z: torch.addmv(x, y, z, beta=-0.5, alpha=2), x=randn(2), y=randn(2, 4), z=randn(4))
+case("grad.addr", lambda x, y, z: torch.addr(x, y, z, beta=1.5, alpha=0.75), x=randn(1, 3), y=randn(2), z=randn(3))
+case("grad.baddbmm", lambda x, y, z: torch.baddbmm(x, y, z, beta=0.5, alpha=-1), x=randn(2, 3), y=randn(5, 2, 4), z=randn(5, 4, 3))
+case("grad.addbmm", lambda x, y, z: torch.addbmm(x, y, z, beta=0.25, alpha=3), x=randn(2, 1), y=randn(5, 2, 4), z=randn(5, 4, 3))
+case(
+    "grad.addmm_alpha_large",
+    lambda x, y, z: torch.addmm(x, y, z, alpha=1e30),
+    x=f([[0.0]]),
+    y=f([[1e-30]]),
+    z=f([[1e-30]]),
+    g=f([[1e10]]),
+)
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.matmul_mm", lambda x, y: x @ y, x=randn(2, 3, dtype=dtype), y=randn(3, 4, dtype=dtype))
+    case(f"grad_{tag}.matmul_fold", lambda x, y: x @ y, x=randn(2, 3, 4, dtype=dtype), y=randn(4, 5, dtype=dtype))
+    case(
+        f"grad_{tag}.addmm",
+        lambda x, y, z: torch.addmm(x, y, z, beta=2.0, alpha=-1.5),
+        x=randn(3, dtype=dtype),
+        y=randn(2, 4, dtype=dtype),
+        z=randn(4, 3, dtype=dtype),
+    )
+case("special.matmul_mm", lambda x, y: x @ y, x=f([[1.0, 2.0], [3.0, 4.0]]), y=f([[0.0, 1.0], [2.0, 3.0]]), g=f([[inf, 1.0], [nan, 2.0]]))
+case(
+    "special.addmm_beta0",
+    lambda x, y, z: torch.addmm(x, y, z, beta=0, alpha=1.5),
+    x=f([nan, 1.0, 2.0]),
+    y=f([[1.0], [2.0]]),
+    z=f([[3.0, 4.0, 5.0]]),
+    g=f([[inf, 1.0, nan], [2.0, 3.0, 4.0]]),
+)
+case("special.addmm_alpha0", lambda x, y, z: torch.addmm(x, y, z, alpha=0), x=f([[0.0]]), y=f([[1e30]]), z=f([[1e30]]), g=f([[1e10]]))
+case(
+    "special.addmm_opmath_f16",
+    lambda x, y, z: torch.addmm(x, y, z, beta=1.0004, alpha=1.0004),
+    x=f([[0.0]], dtype=torch.float16),
+    y=f([[1.0]], dtype=torch.float16),
+    z=f([[1.0]], dtype=torch.float16),
+    g=f([[1000.0]], dtype=torch.float16),
+)
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

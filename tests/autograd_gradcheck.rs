@@ -511,6 +511,45 @@ fn copy_formulas() {
     });
 }
 
+#[test]
+fn matrix_formulas() {
+    let v = var(&[3], 0);
+    let m = transposed(2, 3, 1);
+    let w = var(&[3, 2], 2);
+    let b = var(&[2, 2, 3], 3);
+    let c = var(&[2, 3, 2], 4);
+    check("matmul", &[&v, &m, &w, &b, &c], |x| {
+        vec![
+            x[0].matmul(&x[0]),
+            x[1].matmul(&x[0]),
+            x[0].matmul(&x[2]),
+            x[1].matmul(&x[2]),
+            x[3].matmul(&x[2]),
+            x[1].matmul(&x[4]),
+            x[3].matmul(&x[4]),
+            x[0].matmul(&x[4]),
+            x[3].matmul(&x[0]),
+            // Batches that broadcast both ways.
+            x[3].unsqueeze(1).matmul(&x[4].unsqueeze(0)),
+        ]
+    });
+    let i = var(&[2], 5);
+    let t = var(&[2, 1], 6);
+    check("scaled products", &[&i, &t, &m, &w, &b, &c, &v], |x| {
+        let tt = x[1].transpose(0, 1);
+        vec![
+            x[0].addmm(&x[1], &x[0].unsqueeze(0), 2.0, -1.5),
+            x[1].addmm(&x[2], &x[3], 0, 0.5),
+            x[0].addmv(&x[2], &x[6], -0.5, 2),
+            x[2].addr(&x[1].squeeze(), &x[6], 1.5, 0.75),
+            x[1].baddbmm(&x[4], &x[5], 1, 1),
+            x[0].baddbmm(&x[4], &x[5], 0.0, -2.0),
+            x[1].addbmm(&x[4], &x[5], 0.25, 3),
+            tt.addbmm(&x[4], &x[5], 0, 1),
+        ]
+    });
+}
+
 // ---------------------------------------------------------------- empty inputs
 
 #[test]
@@ -521,7 +560,7 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
     let x = var(&[2, 3], 1);
     let none = Tensor::from_slice::<i64>(&[], [0]);
     type Op = (&'static str, fn(&Tensor, &Tensor, &Tensor) -> Tensor);
-    let ops: [Op; 24] = [
+    let ops: [Op; 27] = [
         ("exp", |e, _, _| e.exp()),
         ("relu", |e, _, _| e.relu()),
         ("div", |e, x, _| e / &x.narrow(0, 0, 1)),
@@ -552,6 +591,11 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
         ("flip", |e, _, _| e.flip([0, 1])),
         ("triu", |e, _, _| e.triu(1)),
         ("tril", |e, _, _| e.tril(0)),
+        ("matmul", |e, x, _| x.matmul(&e.transpose(0, 1))),
+        ("matmul over the empty dimension", |e, _, _| {
+            e.transpose(0, 1).matmul(e)
+        }),
+        ("addmm", |e, x, _| e.addmm(&e.narrow(1, 0, 2), x, 2.0, 3.0)),
     ];
     for (name, op) in ops {
         let y = op(&empty, &x, &none);

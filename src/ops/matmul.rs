@@ -78,7 +78,7 @@ impl Tensor {
         }
         // The result is contiguous, so this never copies.
         let out = Tensor::from_data(reshape_data(&out, Shape::new(&shape)));
-        crate::autograd::record_unimplemented("matmul", &[Some(self), Some(other)], &out);
+        crate::autograd::formulas::matmul(self, other, &out);
         out
     }
 }

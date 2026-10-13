@@ -1,6 +1,7 @@
 //! Operations defined in terms of other operations, plus softmax.
 
 use super::{Operand, common_device};
+use crate::autograd::formulas::ScaledProduct;
 use crate::backend::cpu;
 use crate::dtype::Kind;
 use crate::shape::normalize_dim;
@@ -95,10 +96,9 @@ fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scala
 /// do. `input` must still have the dtype and device of `product` and broadcast to its shape,
 /// whatever `beta` is. The coefficients are converted to the dtype first, see [`coefficient`].
 ///
-/// `op` names the operation for autograd: with `beta` zero, `input` still needs a zero gradient,
-/// which isn't implemented yet.
+/// Callers run it in no-grad mode and record the operation's own node: its gradients scale
+/// differently from those of the operations used here.
 fn scaled_sum(
-    op: &'static str,
     input: &Tensor,
     product: Tensor,
     beta: Scalar,
@@ -122,12 +122,6 @@ fn scaled_sum(
         product.mul(alpha)
     };
     if beta.to_f64() == 0.0 {
-        if crate::autograd::needs_grad(&[Some(input)]) {
-            // The value ignores `input`, but its gradient must be zeros rather than missing.
-            let out = Tensor::from_data(product.data());
-            crate::autograd::record_unimplemented(op, &[Some(input), Some(&product)], &out);
-            return out;
-        }
         return product;
     }
     let scaled = if beta.to_f64() == 1.0 {
@@ -136,6 +130,25 @@ fn scaled_sum(
         input.mul(beta)
     };
     scaled.add(&product)
+}
+
+/// Computes `beta * input + alpha * product(x, y)` with `forward` in no-grad mode and records
+/// the node of the scaled product.
+fn scaled_product(
+    product: ScaledProduct,
+    input: &Tensor,
+    x: &Tensor,
+    y: &Tensor,
+    beta: Scalar,
+    alpha: Scalar,
+    forward: impl FnOnce() -> Tensor,
+) -> Tensor {
+    let out = {
+        let _guard = crate::no_grad();
+        forward()
+    };
+    crate::autograd::formulas::scaled_product(product, input, x, y, beta, alpha, &out);
+    out
 }
 
 fn check_dims(t: &Tensor, n: usize, what: &str) {
@@ -177,14 +190,10 @@ impl Tensor {
     ) -> Tensor {
         check_dims(mat1, 2, "mat1");
         check_dims(mat2, 2, "mat2");
-        scaled_sum(
-            "addmm",
-            self,
-            mat1.matmul(mat2),
-            beta.into(),
-            alpha.into(),
-            Coefficients::Truncate,
-        )
+        let (beta, alpha) = (beta.into(), alpha.into());
+        scaled_product(ScaledProduct::Mm, self, mat1, mat2, beta, alpha, || {
+            scaled_sum(self, mat1.matmul(mat2), beta, alpha, Coefficients::Truncate)
+        })
     }
 
     /// `beta * self + alpha * (mat @ vec)` for a 2-D `mat` and a 1-D `vec`.
@@ -197,14 +206,10 @@ impl Tensor {
     ) -> Tensor {
         check_dims(mat, 2, "mat");
         check_dims(vec, 1, "vec");
-        scaled_sum(
-            "addmv",
-            self,
-            mat.matmul(vec),
-            beta.into(),
-            alpha.into(),
-            Coefficients::Truncate,
-        )
+        let (beta, alpha) = (beta.into(), alpha.into());
+        scaled_product(ScaledProduct::Mv, self, mat, vec, beta, alpha, || {
+            scaled_sum(self, mat.matmul(vec), beta, alpha, Coefficients::Truncate)
+        })
     }
 
     /// `beta * self + alpha * outer(vec1, vec2)` for 1-D `vec1` and `vec2`.
@@ -231,18 +236,16 @@ impl Tensor {
             crate::promote_types(inputs[0].dtype, inputs[1].dtype),
             inputs[2].dtype,
         );
-        let input = self.to(dtype);
-        // A broadcast product rather than a matmul, which doesn't support bool.
-        // Cast before multiplication so a wider self also widens the product computation.
-        let outer = vec1.to(dtype).unsqueeze(1).mul(vec2.to(dtype).unsqueeze(0));
-        scaled_sum(
-            "addr",
-            &input,
-            outer,
-            beta.into(),
-            alpha.into(),
-            Coefficients::Strict,
-        )
+        // The conversions are recorded, so that each input gets its gradient in its own dtype
+        // (PyTorch's backward rejects mixed dtypes).
+        let (input, v1, v2) = (self.to(dtype), vec1.to(dtype), vec2.to(dtype));
+        let (beta, alpha) = (beta.into(), alpha.into());
+        scaled_product(ScaledProduct::Outer, &input, &v1, &v2, beta, alpha, || {
+            // A broadcast product rather than a matmul, which doesn't support bool.
+            // Cast before multiplication so a wider self also widens the product computation.
+            let outer = v1.unsqueeze(1).mul(v2.unsqueeze(0));
+            scaled_sum(&input, outer, beta, alpha, Coefficients::Strict)
+        })
     }
 
     /// `beta * self + alpha * (batch1 @ batch2)` for 3-D `batch1` and `batch2`.
@@ -262,13 +265,23 @@ impl Tensor {
                 batch2.size(0)
             );
         }
-        scaled_sum(
-            "baddbmm",
+        let (beta, alpha) = (beta.into(), alpha.into());
+        scaled_product(
+            ScaledProduct::Bmm,
             self,
-            batch1.matmul(batch2),
-            beta.into(),
-            alpha.into(),
-            Coefficients::Truncate,
+            batch1,
+            batch2,
+            beta,
+            alpha,
+            || {
+                scaled_sum(
+                    self,
+                    batch1.matmul(batch2),
+                    beta,
+                    alpha,
+                    Coefficients::Truncate,
+                )
+            },
         )
     }
 
@@ -289,16 +302,20 @@ impl Tensor {
                 batch2.size(0)
             );
         }
-        // Integer sums are computed in `I64`; casting back wraps exactly like accumulating in the
-        // input dtype would.
-        let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
-        scaled_sum(
-            "addbmm",
+        let (beta, alpha) = (beta.into(), alpha.into());
+        scaled_product(
+            ScaledProduct::SumBmm,
             self,
-            product,
-            beta.into(),
-            alpha.into(),
-            Coefficients::Truncate,
+            batch1,
+            batch2,
+            beta,
+            alpha,
+            || {
+                // Integer sums are computed in `I64`; casting back wraps exactly like accumulating
+                // in the input dtype would.
+                let product = batch1.matmul(batch2).sum_dim(0, false).to(batch1.dtype());
+                scaled_sum(self, product, beta, alpha, Coefficients::Truncate)
+            },
         )
     }
 

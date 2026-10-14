@@ -749,8 +749,8 @@ case(
 
 # ---------------------------------------------------------------- step 6g
 # Softmax and log-softmax, one node each that saves the result, along the last dimension and
-# another one (the reference has a kernel for each). Half precision is computed in f32 and rounded
-# once. Masked (-inf) positions of a row with a finite element get -0.0 from softmax and g from
+# another one (the reference has a kernel for each). Half precision products are computed in f32
+# and each gradient is rounded once (homura's sums accumulate in f64). Masked (-inf) positions of a row with a finite element get -0.0 from softmax and g from
 # log-softmax; a row without one, or with an infinite or NaN sum, is NaN. The special inputs are
 # chosen so that every result is exact.
 #

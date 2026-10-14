@@ -1,12 +1,18 @@
 //! Gradients of `softmax` and `log_softmax`: one node each that saves only the result (pinned
 //! PyTorch names, edges and saved-tensor checks), first and second derivatives against the
 //! composite `exp(x - max) / sum` for every dimension, non-contiguous inputs and upstream
-//! gradients, rows with infinite and NaN values, half precision computed in `f32` like the
-//! reference's kernels, and zero-dimensional, empty and metadata-only inputs. Run in debug and
+//! gradients, rows with infinite and NaN values, half precision products in `f32` like the
+//! reference's kernels, and zero-dimensional, empty and metadata-only inputs. The first
+//! derivative is a node of its own, as in PyTorch, whose derivatives follow the reference's order
+//! of operations: second derivatives against the pinned PyTorch (`second_grads.safetensors`),
+//! including large finite upstream gradients, and that node's saved tensors. Run in debug and
 //! release profiles.
+
+mod common;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use common::{Case, Golden, assert_close_tol, tolerance};
 use homura::autograd::{self, GradFn, GradOptions};
 use homura::{DType, Device, Tensor};
 
@@ -294,8 +300,9 @@ fn rows_with_infinities_and_nan_follow_the_reference() {
 #[test]
 fn half_precision_is_computed_in_f32_and_rounded_once() {
     // Measured on the pinned PyTorch, whose kernels convert to `f32`, sum there and round each
-    // gradient once. Rounding the sum to the dtype first would give -128 (F16) or -16 (BF16)
-    // for softmax and -4 for log-softmax.
+    // gradient once; homura's sums accumulate in `f64` and are rounded to `f32`, which is exact
+    // here. Rounding the sum to the dtype first would give -128 (F16) or -16 (BF16) for softmax
+    // and -4 for log-softmax.
     let cases = [
         (DType::F16, 2048., [383.75, -127.9375, -127.9375, -127.9375]),
         (DType::BF16, 256., [47.75, -15.9375, -15.9375, -15.9375]),
@@ -364,5 +371,203 @@ fn empty_and_metadata_only_inputs() {
         let g = homura::ones_with([3, 1 << 40], Device::Meta).to(DType::F16);
         let gx = grads(&softmax(&x, 0, log), &[&x], &g, false).remove(0);
         assert_eq!((gx.shape(), gx.dtype()), ([3, 1 << 40].into(), DType::F16));
+    }
+}
+
+// ---------------------------------------------------------------- second derivatives
+
+/// The first derivative of `softmax(x, dim)` (or `log_softmax`) for upstream gradient `g`, with
+/// its graph.
+fn first(x: &Tensor, dim: i64, log: bool, g: &Tensor) -> Tensor {
+    grads(&softmax(x, dim, log), &[x], g, true).remove(0)
+}
+
+/// `t` with the same values in a non-contiguous (column-major) layout.
+fn scattered(t: &Tensor) -> Tensor {
+    t.transpose(0, 1).contiguous().transpose(0, 1)
+}
+
+#[test]
+fn second_derivatives_match_pytorch() {
+    // Each case requests the second derivatives with respect to the input x, the result y and
+    // the upstream gradient g of the first pass, with non-contiguous g and r; "large" cases have
+    // finite g near the top of the dtype's range, where the order of operations decides between
+    // NaN, infinities and finite values (review round 26, R40).
+    let golden = Golden::load("second_grads.safetensors");
+    let cases = golden.cases();
+    assert_eq!(cases.len(), 32);
+    for name in &cases {
+        let c = Case::new(&golden, name);
+        let op = name.split_once('.').unwrap().1;
+        let log = op.starts_with("log_softmax");
+        let dim = if op.contains("_last_") { -1 } else { 0 };
+        let x = leaf_of(c.input("x"));
+        let g = leaf_of(scattered(&c.input("g")));
+        let r = scattered(&c.input("r"));
+        assert!(!g.is_contiguous() && !r.is_contiguous());
+        let y = softmax(&x, dim, log);
+        let a = grads(&y, &[&x], &g, true).remove(0);
+        let (rtol, atol) = match x.dtype() {
+            DType::F32 => (1e-5, 1e-5),
+            DType::F64 => (1e-10, 1e-10),
+            dtype => tolerance(dtype),
+        };
+        let [dx, dy, dg] = <[_; 3]>::try_from(grads(&a, &[&x, &y, &g], &r, false)).unwrap();
+        for (what, actual) in [("a", &a), ("dx", &dx), ("dy", &dy), ("dg", &dg)] {
+            c.check_with(what, actual, |actual, expected| {
+                assert_close_tol(actual, expected, rtol, atol, &format!("{name}/{what}"))
+            });
+        }
+        c.assert_all_used();
+    }
+}
+
+#[test]
+fn second_derivatives_follow_the_reference_order() {
+    // Measured on the pinned PyTorch with x = [0, 0] and equal finite elements of g; the first
+    // derivative is zero. Softmax's derivative with respect to its result is
+    // `g * r - sum(y * g) * r - g * sum(y * r)`, which overflows to NaN where `r` is nonzero;
+    // log-softmax's is `-sum(g) * exp(y) * r`, finite although `r * sum(g)` would overflow.
+    for (dtype, big) in [
+        (DType::F16, 60000.),
+        (DType::BF16, 3e38),
+        (DType::F32, 3e38),
+        (DType::F64, 1e308),
+    ] {
+        let x = leaf_of(homura::zeros([2]).to(dtype));
+        let g = leaf_of(Tensor::from_slice(&[big, big], [2]).to(dtype));
+        let big = g.to(DType::F64).to_vec::<f64>()[0];
+        let y = x.softmax(0);
+        let a = grads(&y, &[&x], &g, true).remove(0);
+        assert_eq!(exact(&a), exact(&homura::zeros([2])), "{dtype}");
+        let r = Tensor::from_slice(&[0., 2.], [2]).to(dtype);
+        let [dx, dy, dg] = <[_; 3]>::try_from(grads(&a, &[&x, &y, &g], &r, false)).unwrap();
+        let expected = |v: [f64; 2]| exact(&Tensor::from_slice(&v, [2]));
+        assert_eq!(exact(&dx), expected([NAN, NAN]), "{dtype}");
+        assert_eq!(exact(&dy), expected([-big, NAN]), "{dtype}");
+        assert_eq!(exact(&dg), expected([-0.5, 0.5]), "{dtype}");
+    }
+    for (dtype, big) in [
+        (DType::F16, 30000.),
+        (DType::BF16, 1e38),
+        (DType::F32, 1e38),
+        (DType::F64, 5e307),
+    ] {
+        let x = leaf_of(homura::zeros([2]).to(dtype));
+        let g = leaf_of(Tensor::from_slice(&[big, big], [2]).to(dtype));
+        let big = g.to(DType::F64).to_vec::<f64>()[0];
+        let y = x.log_softmax(0);
+        let a = grads(&y, &[&x], &g, true).remove(0);
+        let r = Tensor::from_slice(&[2., 0.], [2]).to(dtype);
+        let [dx, dy, dg] = <[_; 3]>::try_from(grads(&a, &[&x, &y, &g], &r, false)).unwrap();
+        let expected = |v: [f64; 2]| exact(&Tensor::from_slice(&v, [2]));
+        assert_eq!(exact(&dx), expected([-big, big]), "{dtype}");
+        assert_eq!(exact(&dy), expected([-2. * big, -0.0]), "{dtype}");
+        assert_eq!(exact(&dg), expected([1., -1.]), "{dtype}");
+    }
+}
+
+#[test]
+fn the_first_derivative_saves_the_upstream_gradient_and_the_result() {
+    // Measured on the pinned PyTorch: `SoftmaxBackwardDataBackward0` (or
+    // `LogSoftmaxBackwardDataBackward0`) with an edge to g and one to the softmax node, through
+    // the result, saves both whichever gradients are requested later.
+    for (log, name, forward) in [
+        (false, "SoftmaxBackwardDataBackward0", "SoftmaxBackward0"),
+        (
+            true,
+            "LogSoftmaxBackwardDataBackward0",
+            "LogSoftmaxBackward0",
+        ),
+    ] {
+        let x = leaf_of(Tensor::from_slice(&[0f32, 0.], [2]));
+        let g = leaf_of(Tensor::from_slice(&[1f32, 1.], [2]));
+        let a = first(&x, 0, log, &g);
+        let f = a.grad_fn().unwrap();
+        assert_eq!(f.name(), name);
+        assert_eq!(edge_names(&f), [Some("AccumulateGrad"), Some(forward)]);
+        // The third pass: softmax's gradient of g is the same node again, log-softmax's a
+        // difference; the gradient of x goes through the first derivative's node.
+        let r = leaf_of(Tensor::from_slice(&[0f32, 2.], [2]));
+        let options = GradOptions {
+            grad_outputs: vec![Some(r.clone())],
+            create_graph: true,
+            ..Default::default()
+        };
+        let second = autograd::grad(&[&a], &[&x, &g], options);
+        let second_names: Vec<_> = second
+            .iter()
+            .map(|t| t.as_ref().unwrap().grad_fn().unwrap().name())
+            .collect();
+        let dg_name = if log { "SubBackward0" } else { name };
+        assert_eq!(second_names, [name, dg_name]);
+        let constant = first(&x, 0, log, &g.detach());
+        assert_eq!(
+            edge_names(&constant.grad_fn().unwrap()),
+            [None, Some(forward)]
+        );
+        // Without create_graph, nothing is recorded.
+        let plain = grads(&softmax(&x, 0, log), &[&x], &g, false).remove(0);
+        assert!(plain.grad_fn().is_none() && !plain.requires_grad());
+        // Modifying g fails the second pass, even when only the gradient of g is requested.
+        let r = Tensor::from_slice(&[0f32, 2.], [2]);
+        for request in ["x", "g"] {
+            let g = leaf_of(Tensor::from_slice(&[1f32, 1.], [2]));
+            let a = first(&x, 0, log, &g);
+            {
+                let _no_grad = homura::no_grad();
+                g.mul_(2.0);
+            }
+            let message = panic_message(|| {
+                grads(&a, &[if request == "x" { &x } else { &g }], &r, false);
+            });
+            assert!(
+                message.contains("[f32 [2]] is at version 1; expected version 0 instead."),
+                "{message}"
+            );
+        }
+        // Without retain_graph, the second pass frees what the node saved.
+        let a = first(&x, 0, log, &g);
+        grads(&a, &[&g], &r, false);
+        let message = panic_message(|| {
+            grads(&a, &[&g], &r, false);
+        });
+        assert!(
+            message.starts_with("Trying to backward through the graph a second time"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn the_second_pass_runs_only_what_the_requested_gradients_need() {
+    // The input of softmax is a product whose saved factor is then modified: the gradient of g
+    // doesn't need the softmax node or what lies behind it, the gradient of x does.
+    for log in [false, true] {
+        let x = leaf_of(Tensor::from_slice(&[0f64, 0.], [2]));
+        let c = Tensor::from_slice(&[1f64, 1.], [2]);
+        let z = &x * &c;
+        let g = leaf_of(Tensor::from_slice(&[1f64, 3.], [2]));
+        let a = grads(&softmax(&z, 0, log), &[&z], &g, true).remove(0);
+        {
+            let _no_grad = homura::no_grad();
+            c.add_(1.0);
+        }
+        let r = Tensor::from_slice(&[0f64, 2.], [2]);
+        let retain = GradOptions {
+            grad_outputs: vec![Some(r.clone())],
+            retain_graph: Some(true),
+            ..Default::default()
+        };
+        let dg = autograd::grad(&[&a], &[&g], retain).remove(0).unwrap();
+        let expected: [f64; 2] = if log { [-1., 1.] } else { [-0.5, 0.5] };
+        assert_eq!(dg.to_vec::<f64>(), expected);
+        let message = panic_message(|| {
+            grads(&a, &[&x], &r, false);
+        });
+        assert!(
+            message.contains("modified by an inplace operation"),
+            "{message}"
+        );
     }
 }

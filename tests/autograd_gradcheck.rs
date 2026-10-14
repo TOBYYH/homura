@@ -570,6 +570,26 @@ fn softmax_formulas() {
             x[1].softmax(0).mul(x[1].log_softmax(0)),
         ]
     });
+    // The first derivatives are nodes of their own: check their first and second derivatives
+    // (the third derivatives of softmax) with respect to the input and the upstream gradient.
+    let g = var(&[2, 3, 4], 3);
+    let gt = transposed(3, 2, 4);
+    check("softmax first derivatives", &[&a, &g, &t, &gt], |x| {
+        let first = |y: Tensor, input: &Tensor, g: &Tensor| {
+            let options = GradOptions {
+                grad_outputs: vec![Some(g.clone())],
+                create_graph: true,
+                ..Default::default()
+            };
+            autograd::grad(&[&y], &[input], options).remove(0).unwrap()
+        };
+        vec![
+            first(x[0].softmax(1), &x[0], &x[1]),
+            first(x[0].log_softmax(-1), &x[0], &x[1]),
+            first(x[2].softmax(0), &x[2], &x[3]),
+            first(x[2].log_softmax(1), &x[2], &x[3]),
+        ]
+    });
 }
 
 // ---------------------------------------------------------------- empty inputs

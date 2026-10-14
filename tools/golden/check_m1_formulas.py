@@ -26,7 +26,8 @@ bmm; the gradient of a 2-D operand times a batched one is a single mm in both, w
 final transpose for the left operand. PyTorch's backward rejects the mixed dtypes that `addr`
 promotes; homura records the conversions and differentiates them.
 homura's half precision softmax forward computes in f64 and rounds once (M0), the reference's in
-f32; the half precision gradients below are checked on results where both agree.
+f32; the half precision gradients below are checked on results where both agree. The softmax
+backward sums accumulate in f64 like homura's other CPU reductions.
 """
 
 import math
@@ -2310,5 +2311,67 @@ for log in [False, True]:
     x = torch.zeros(2**40, 3, device="meta", requires_grad=True)
     gx = torch.autograd.grad(softmax_of(x, 1, log), x, torch.ones(2**40, 3, device="meta"))[0]
     assert (gx.shape, gx.dtype, gx.device.type) == ((2**40, 3), torch.float32, "meta")
+
+# ---------------------------------------------------------------- review round 26 (R40)
+# The first derivative is a node of its own (tests/autograd_softmax.rs; second_grads.safetensors
+# holds the larger cases): its derivatives follow derivatives.yaml's order of operations.
+# second_derivatives_follow_the_reference_order
+for log, cases, r in [
+    (False, [(torch.float16, 60000.0), (torch.bfloat16, 3e38), (torch.float32, 3e38), (torch.float64, 1e308)], [0.0, 2.0]),
+    (True, [(torch.float16, 30000.0), (torch.bfloat16, 1e38), (torch.float32, 1e38), (torch.float64, 5e307)], [2.0, 0.0]),
+]:
+    for dtype, big in cases:
+        x = torch.zeros(2, dtype=dtype, requires_grad=True)
+        g = torch.full((2,), big, dtype=dtype, requires_grad=True)
+        big = g[0].item()
+        y = softmax_of(x, 0, log)
+        (a,) = torch.autograd.grad(y, x, g, create_graph=True)
+        dx, dy, dg = torch.autograd.grad(a, [x, y, g], torch.tensor(r, dtype=dtype))
+        if log:
+            expected = [[-big, big], [-2 * big, -0.0], [1.0, -1.0]]
+        else:
+            assert a.tolist() == [0.0, 0.0]
+            expected = [[nan, nan], [-big, nan], [-0.5, 0.5]]
+        for t, e in zip([dx, dy, dg], expected):
+            assert [repr(v) for v in t.tolist()] == [repr(float(v)) for v in e], (dtype, log, t, e)
+
+# the_first_derivative_saves_the_upstream_gradient_and_the_result
+for log, name, forward in [
+    (False, "SoftmaxBackwardDataBackward0", "SoftmaxBackward0"),
+    (True, "LogSoftmaxBackwardDataBackward0", "LogSoftmaxBackward0"),
+]:
+    x = leaf([0.0, 0.0])
+    g = leaf([1.0, 1.0])
+    (a,) = torch.autograd.grad(softmax_of(x, 0, log), x, g, create_graph=True)
+    assert node(a) == (name, [ACC, forward])
+    r = torch.tensor([0.0, 2.0], requires_grad=True)
+    dx, dg = torch.autograd.grad(a, [x, g], r, create_graph=True)
+    assert (dx.grad_fn.name(), dg.grad_fn.name()) == (name, "SubBackward0" if log else name)
+    (a,) = torch.autograd.grad(softmax_of(x, 0, log), x, g.detach(), create_graph=True)
+    assert node(a) == (name, [None, forward])
+    (plain,) = torch.autograd.grad(softmax_of(x, 0, log), x, g)
+    assert plain.grad_fn is None
+    for request in ["x", "g"]:
+        g = leaf([1.0, 1.0])
+        (a,) = torch.autograd.grad(softmax_of(x, 0, log), x, g, create_graph=True)
+        with torch.no_grad():
+            g.mul_(2.0)
+        version_error(lambda: torch.autograd.grad(a, x if request == "x" else g, r.detach()), "[torch.FloatTensor [2]]")
+    (a,) = torch.autograd.grad(softmax_of(x, 0, log), x, g, create_graph=True)
+    torch.autograd.grad(a, g, r.detach())
+    assert message(lambda: torch.autograd.grad(a, g, r.detach())).startswith("Trying to backward through the graph a second time")
+
+# the_second_pass_runs_only_what_the_requested_gradients_need
+for log, expected in [(False, [-0.5, 0.5]), (True, [-1.0, 1.0])]:
+    x = torch.zeros(2, dtype=torch.float64, requires_grad=True)
+    c = torch.ones(2, dtype=torch.float64)
+    z = x * c
+    g = torch.tensor([1.0, 3.0], dtype=torch.float64, requires_grad=True)
+    (a,) = torch.autograd.grad(softmax_of(z, 0, log), z, g, create_graph=True)
+    with torch.no_grad():
+        c.add_(1.0)
+    r = torch.tensor([0.0, 2.0], dtype=torch.float64)
+    assert torch.autograd.grad(a, g, r, retain_graph=True)[0].tolist() == expected
+    assert "modified by an inplace operation" in message(lambda: torch.autograd.grad(a, x, r))
 
 print("check_m1_formulas: all reference checks passed")

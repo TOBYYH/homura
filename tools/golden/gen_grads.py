@@ -747,6 +747,59 @@ case(
     g=f([[1000.0]], dtype=torch.float16),
 )
 
+# ---------------------------------------------------------------- step 6g
+# Softmax and log-softmax, one node each that saves the result, along the last dimension and
+# another one (the reference has a kernel for each). Half precision is computed in f32 and rounded
+# once. Masked (-inf) positions of a row with a finite element get -0.0 from softmax and g from
+# log-softmax; a row without one, or with an infinite or NaN sum, is NaN. The special inputs are
+# chosen so that every result is exact.
+#
+# homura's forward computes half precision in f64 and rounds once (M0), where the reference
+# computes in f32, so a few results differ by one rounding step, which the gradients amplify
+# beyond the half precision tolerance. The random half precision cases therefore run the
+# reference's backward kernels on the result homura's forward computes.
+class F64Softmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, dim, log):
+        y = (x.double().log_softmax(dim) if log else x.double().softmax(dim)).to(x.dtype)
+        ctx.save_for_backward(y)
+        ctx.dim, ctx.log = dim, log
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        (y,) = ctx.saved_tensors
+        kernel = torch._log_softmax_backward_data if ctx.log else torch._softmax_backward_data
+        return kernel(g, y, ctx.dim, y.dtype), None, None
+
+
+case("grad.softmax_dim1", lambda x: x.softmax(1), x=randn(2, 3, 4))
+case("grad.softmax_last", lambda x: x.softmax(-1), x=randn(3, 5))
+case("grad.log_softmax_dim0", lambda x: x.log_softmax(0), x=randn(2, 3, 4))
+case("grad.log_softmax_last", lambda x: x.log_softmax(-1), x=randn(3, 5))
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.softmax_dim1", lambda x: F64Softmax.apply(x, 1, False), x=randn(2, 3, 4, dtype=dtype))
+    case(f"grad_{tag}.log_softmax_last", lambda x: F64Softmax.apply(x, -1, True), x=randn(3, 5, dtype=dtype))
+case(
+    "special.softmax_masked",
+    lambda x: x.softmax(-1),
+    x=f([[-inf, 0.0, 0.0], [-inf, -inf, -inf], [-inf, 0.0, 0.0], [-inf, 0.0, 0.0]]),
+    g=f([[1.0, 2.0, 4.0], [1.0, 2.0, 4.0], [1.0, inf, 2.0], [nan, 1.0, 2.0]]),
+)
+case(
+    "special.log_softmax_masked",
+    lambda x: x.log_softmax(-1),
+    x=f([[-inf, 0.0, -inf], [0.0, -inf, -inf], [nan, 0.0, -inf], [-inf, 0.0, -inf]]),
+    g=f([[1.0, 2.0, 4.0], [inf, 1.0, 2.0], [1.0, 2.0, 4.0], [1.0, -inf, 2.0]]),
+)
+case("special.softmax_opmath_f16", lambda x: x.softmax(-1), x=f([0.0] * 4, dtype=torch.float16), g=f([2048.0, 1.0, 1.0, 1.0], dtype=torch.float16))
+case(
+    "special.log_softmax_opmath_bf16",
+    lambda x: x.log_softmax(-1),
+    x=f([0.0, -inf, -inf, -inf], dtype=torch.bfloat16),
+    g=f([256.0, 1.0, 1.0, 1.0], dtype=torch.bfloat16),
+)
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

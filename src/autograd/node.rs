@@ -387,8 +387,6 @@ pub struct GradFn(pub(crate) NodeRef);
 
 impl GradFn {
     /// The name PyTorch gives this kind of node, such as `"MulBackward0"` or `"AccumulateGrad"`.
-    /// Operations whose derivative is not implemented yet record a `"NotImplemented"` node,
-    /// which fails when a backward pass runs it.
     pub fn name(&self) -> &'static str {
         self.0.name()
     }

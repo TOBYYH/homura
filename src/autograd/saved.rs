@@ -191,7 +191,7 @@ mod tests {
         for (node, operation) in [
             ("MulBackward0", "Mul"),
             ("SumBackward1", "Sum1"),
-            ("NotImplemented", "NotImplemented"),
+            ("AccumulateGrad", "AccumulateGrad"),
         ] {
             assert_eq!(super::operation_name(node), operation);
         }

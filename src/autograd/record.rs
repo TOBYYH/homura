@@ -3,7 +3,6 @@
 use std::sync::atomic::Ordering;
 
 use super::accumulate::grad_accumulator;
-use super::formulas::NotImplemented;
 use super::node::{Edge, InputMeta, Node, NodeBuilder, NodeRef};
 use super::{is_grad_enabled, meta};
 use crate::Tensor;
@@ -40,13 +39,6 @@ pub(crate) fn record<N: Node>(
     for (output_nr, t) in outputs.iter().enumerate() {
         set_history(t, node.clone(), output_nr as u32);
     }
-}
-
-/// [`record`] for a differentiable operation whose derivative isn't implemented yet: the outputs
-/// require grad as they should, and a backward pass that reaches the node fails with PyTorch's
-/// "the derivative for 'op' is not implemented." instead of dropping the gradients silently.
-pub(crate) fn record_unimplemented(op: &'static str, inputs: &[Option<&Tensor>], output: &Tensor) {
-    record(inputs, &[output], |_| NotImplemented { op });
 }
 
 /// Checks an in-place operation on `target` with the tensor inputs `inputs` before anything is

@@ -1,7 +1,6 @@
 //! The backward engine and the public autograd API (M1 step 3): first- and second-order
 //! gradients through the operations that have formulas, graph release, grad mode, view
-//! properties, operations whose derivative isn't implemented yet, the in-place guard and the
-//! error messages. `tools/golden/check_m1_engine.py` checks the same cases against the reference
+//! properties, operations that record nothing, the in-place guard and the error messages. `tools/golden/check_m1_engine.py` checks the same cases against the reference
 //! PyTorch build. Run in debug and release profiles.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -231,12 +230,21 @@ fn grad_returns_gradients_without_writing_them() {
 fn grad_runs_only_the_part_of_the_graph_it_needs() {
     let x = leaf(&[1., 2.]);
     let w = leaf(&[3., 4.]);
-    // `softmax` has no formula yet, but `w` doesn't need it.
-    let y = (x.softmax(0) + &w).sum();
+    // The saved factor `c` is modified, so the product can't be differentiated, but `w` doesn't
+    // need it.
+    let c = Tensor::from_slice(&[2f32, 2.], [2]);
+    let y = (&x * &c + &w).sum();
+    {
+        let _no_grad = homura::no_grad();
+        c.add_(1.0);
+    }
     let g = grad(&[&y], &[&w], GradOptions::default());
     assert_eq!(vals(&g[0]), [1., 1.]);
     let message = panic_message(|| y.backward());
-    assert_eq!(message, "the derivative for 'softmax' is not implemented.");
+    assert!(
+        message.contains("modified by an inplace operation"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -386,11 +394,6 @@ fn check_double_backward(
     };
     let g = grad(&[&y], &[x], options).remove(0);
     assert!(g.requires_grad(), "{name}");
-    // For `add` and the like, the gradient is `u` itself, a leaf.
-    if let Some(f) = g.grad_fn() {
-        let names = graph_names(&f);
-        assert!(!names.contains(&"NotImplemented"), "{name}: {names:?}");
-    }
     let r = Tensor::from_vec(
         (0..g.num_elements()).map(|i| 0.5 + i as f32).collect(),
         g.shape(),
@@ -820,33 +823,7 @@ fn chunks_have_independent_autograd_state() {
     }
 }
 
-// ---------------------------------------------------------------- not implemented yet
-
-#[test]
-fn operations_without_formulas_fail_when_the_backward_pass_reaches_them() {
-    let x = Tensor::from_slice(&[0.5f32, 1., 2., 3.], [2, 2]);
-    x.requires_grad_(true);
-    let index = homura::tensor([1i64, 0]);
-    let cases: Vec<(&str, Tensor)> = vec![
-        ("softmax", x.softmax(-1)),
-        ("log_softmax", x.log_softmax(-1)),
-    ];
-    for (op, out) in cases {
-        assert!(out.requires_grad(), "{op}");
-        let message = panic_message(|| out.sum().backward());
-        assert_eq!(
-            message,
-            format!("the derivative for '{op}' is not implemented."),
-            "{op}"
-        );
-    }
-    assert_eq!(x.softmax(-1).grad_fn().unwrap().name(), "NotImplemented");
-    // The integer-indexed result is reshaped by a recorded `unsafe_view` first.
-    assert_eq!(
-        x.index((&index,)).grad_fn().unwrap().name(),
-        "UnsafeViewBackward0"
-    );
-}
+// ---------------------------------------------------------------- operations without a node
 
 #[test]
 fn non_differentiable_operations_record_nothing() {

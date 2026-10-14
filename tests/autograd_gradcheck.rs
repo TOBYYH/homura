@@ -550,6 +550,28 @@ fn matrix_formulas() {
     });
 }
 
+#[test]
+fn softmax_formulas() {
+    let a = var(&[2, 3, 4], 0);
+    let t = transposed(3, 2, 1);
+    let s = var(&[], 2);
+    check("softmax", &[&a, &t, &s], |x| {
+        vec![
+            x[0].softmax(0),
+            x[0].softmax(-1),
+            x[0].log_softmax(1),
+            x[0].log_softmax(-1),
+            x[1].softmax(1),
+            x[1].log_softmax(0),
+            x[2].softmax(0),
+            x[2].log_softmax(-1),
+            // A dimension of size one, and a function of both results.
+            x[0].narrow(1, 0, 1).softmax(1),
+            x[1].softmax(0).mul(x[1].log_softmax(0)),
+        ]
+    });
+}
+
 // ---------------------------------------------------------------- empty inputs
 
 #[test]
@@ -560,7 +582,7 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
     let x = var(&[2, 3], 1);
     let none = Tensor::from_slice::<i64>(&[], [0]);
     type Op = (&'static str, fn(&Tensor, &Tensor, &Tensor) -> Tensor);
-    let ops: [Op; 27] = [
+    let ops: [Op; 31] = [
         ("exp", |e, _, _| e.exp()),
         ("relu", |e, _, _| e.relu()),
         ("div", |e, x, _| e / &x.narrow(0, 0, 1)),
@@ -596,6 +618,12 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
             e.transpose(0, 1).matmul(e)
         }),
         ("addmm", |e, x, _| e.addmm(&e.narrow(1, 0, 2), x, 2.0, 3.0)),
+        ("softmax", |e, _, _| e.softmax(1)),
+        ("softmax along the empty dimension", |e, _, _| e.softmax(0)),
+        ("log_softmax", |e, _, _| e.log_softmax(-1)),
+        ("log_softmax along the empty dimension", |_, x, _| {
+            x.narrow(1, 0, 0).log_softmax(1)
+        }),
     ];
     for (name, op) in ops {
         let y = op(&empty, &x, &none);

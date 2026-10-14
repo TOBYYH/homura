@@ -1,6 +1,7 @@
 """Check the reference behavior that tests/autograd_formulas.rs, tests/autograd_binary.rs,
-tests/autograd_reduce.rs, tests/autograd_views.rs, tests/autograd_copies.rs and tests/m1_ops.rs
-encode (M1 steps 4 and 6a-6f), and the review fixes that tests/m1_regressions.rs encodes; does
+tests/autograd_reduce.rs, tests/autograd_views.rs, tests/autograd_copies.rs,
+tests/autograd_matmul.rs, tests/autograd_softmax.rs and tests/m1_ops.rs encode (M1 steps 4 and
+6a-6g), and the review fixes that tests/m1_regressions.rs encodes; does
 not write fixtures.
 
 Each block mirrors a test there. Where homura deliberately differs, the PyTorch behavior is
@@ -24,6 +25,8 @@ records that node alone, MatmulBackward0 otherwise) where PyTorch records views 
 bmm; the gradient of a 2-D operand times a batched one is a single mm in both, without PyTorch's
 final transpose for the left operand. PyTorch's backward rejects the mixed dtypes that `addr`
 promotes; homura records the conversions and differentiates them.
+homura's half precision softmax forward computes in f64 and rounds once (M0), the reference's in
+f32; the half precision gradients below are checked on results where both agree.
 """
 
 import math
@@ -2199,5 +2202,113 @@ for dtype in [torch.float16, torch.bfloat16, torch.float32]:
         assert op(math.inf).isinf().all()
 o = lambda *shape: torch.ones(shape, dtype=torch.float64)  # noqa: E731
 assert torch.addmm(o(1, 1), o(1, 1), o(1, 1), alpha=1.7976931348623157e308).item() == 1.7976931348623157e308
+
+# ---------------------------------------------------------------- step 6g: softmax
+def softmax_of(x, dim, log):
+    return x.log_softmax(dim) if log else x.softmax(dim)
+
+
+# nodes_save_only_the_result_under_pytorch_names
+x = leaf([[0.5, -1.0, 0.25], [1.0, 0.0, -0.5]])
+assert node(x.softmax(1)) == ("SoftmaxBackward0", [ACC])
+assert node((x * 2).log_softmax(-1)) == ("LogSoftmaxBackward0", ["MulBackward0"])
+assert x.softmax(1).grad_fn._saved_result is not None
+assert not hasattr(x.softmax(1).grad_fn, "_saved_self")
+assert x.detach().softmax(0).grad_fn is None
+with torch.no_grad():
+    assert x.log_softmax(0).grad_fn is None
+for log, expected in [(False, [-0.5, 0.5]), (True, [-1.0, 1.0])]:
+    x = leaf([0.0, 0.0])
+    y = softmax_of(x, 0, log)
+    with torch.no_grad():
+        x.add_(5.0)
+    assert grad(y, x, [1.0, 3.0])[0].tolist() == expected
+
+# the_saved_result_is_checked
+for log, operation in [(False, "Softmax"), (True, "LogSoftmax")]:
+    x = leaf([1.0, 2.0])
+    y = softmax_of(x, 0, log)
+    with torch.no_grad():
+        y.mul_(2.0)
+    version_error(lambda: y.sum().backward(), f"[torch.FloatTensor [2]], which is output 0 of {operation},")
+    s = softmax_of(x, 0, log).sum()
+    s.backward()
+    assert message(s.backward).startswith("Trying to backward through the graph a second time")
+
+
+# first_derivatives_match_the_composite, second_derivatives_match_the_composite
+def softmax_composite(x, dim, log):
+    shifted = x - x.amax(dim, keepdim=True).detach()
+    e = shifted.exp()
+    return shifted - e.sum(dim, keepdim=True).log() if log else e / e.sum(dim, keepdim=True)
+
+
+for shape, dim in [((5,), 0), ((2, 3), 1), ((2, 3), 0), ((2, 3, 4), -2), ((3, 1, 2), 1)]:
+    for log in [False, True]:
+        x = torch.randn(shape, dtype=torch.float64, requires_grad=True)
+        g = torch.randn(shape, dtype=torch.float64, requires_grad=True)
+        r = torch.randn(shape, dtype=torch.float64)
+        results = []
+        for f in [softmax_of, softmax_composite]:
+            (first,) = torch.autograd.grad(f(x, dim, log), x, g, create_graph=True)
+            results.append([first, *torch.autograd.grad(first, [x, g], r)])
+        for a, b in zip(*results):
+            assert torch.allclose(a, b, rtol=1e-12, atol=1e-12), (shape, dim, log)
+
+# rows_with_infinities_and_nan_follow_the_reference
+G = [[1.0, 2.0, 4.0], [1.0, inf, 2.0], [inf, 1.0, 2.0], [nan, 1.0, 2.0], [1.0, -inf, 2.0]]
+NAN_ROWS = [[nan] * 3] * 5
+SOFT_MASKED = [[-0.0, -0.5, 0.5], [nan, nan, -inf], [nan] * 3, [nan] * 3, [nan, nan, inf]]
+LOG_MIDDLE = [[1.0, -5.0, 4.0], [nan] * 3, [nan, -inf, nan], [nan] * 3, [nan] * 3]
+LOG_FIRST = [[-6.0, 2.0, 4.0], [-inf, nan, nan], [nan] * 3, [nan] * 3, [inf, nan, nan]]
+for dtype in [torch.float32, torch.float64]:
+    for log, row, expected in [
+        (False, [-inf, -inf, -inf], NAN_ROWS),
+        (False, [-inf, 0.0, 0.0], SOFT_MASKED),
+        (False, [inf, 0.0, 0.0], NAN_ROWS),
+        (False, [nan, 0.0, 0.0], NAN_ROWS),
+        (True, [-inf, -inf, -inf], NAN_ROWS),
+        (True, [-inf, 0.0, -inf], LOG_MIDDLE),
+        (True, [inf, 0.0, -inf], NAN_ROWS),
+        (True, [0.0, -inf, -inf], LOG_FIRST),
+    ]:
+        x = torch.tensor([row] * 5, dtype=dtype, requires_grad=True)
+        (actual,) = torch.autograd.grad(softmax_of(x, 1, log), x, torch.tensor(G, dtype=dtype))
+        assert [[repr(v) for v in r] for r in actual.tolist()] == [[repr(v) for v in r] for r in expected], (dtype, log, row)
+        xt = x.detach().t().clone().requires_grad_()
+        (actual,) = torch.autograd.grad(softmax_of(xt, 0, log), xt, torch.tensor(G, dtype=dtype).t())
+        assert [[repr(v) for v in r] for r in actual.t().tolist()] == [[repr(v) for v in r] for r in expected], (dtype, log, row)
+
+# half_precision_is_computed_in_f32_and_rounded_once
+for dtype, big, expected in [
+    (torch.float16, 2048.0, [383.75, -127.9375, -127.9375, -127.9375]),
+    (torch.bfloat16, 256.0, [47.75, -15.9375, -15.9375, -15.9375]),
+]:
+    g = torch.tensor([big, 1.0, 1.0, 1.0], dtype=dtype)
+    x = torch.zeros(4, dtype=dtype, requires_grad=True)
+    assert torch.autograd.grad(x.softmax(0), x, g)[0].tolist() == expected
+    x = torch.tensor([0.0, -inf, -inf, -inf], dtype=dtype, requires_grad=True)
+    assert torch.autograd.grad(x.log_softmax(0), x, g)[0].tolist() == [-3.0, 1.0, 1.0, 1.0]
+    x = torch.zeros(4, 2, dtype=dtype, requires_grad=True)
+    g = torch.tensor([[big, 1.0], [1.0, big], [1.0, 1.0], [1.0, 1.0]], dtype=dtype)
+    a, b = expected[:2]
+    assert torch.autograd.grad(x.softmax(0), x, g)[0].flatten().tolist() == [a, b, b, a, b, b, b, b]
+
+# zero_dimensional_inputs_get_a_zero_gradient
+for log, dim in [(False, 0), (False, -1), (True, 0), (True, -1)]:
+    x = leaf(2.5)
+    y = softmax_of(x, dim, log)
+    assert y.shape == ()
+    assert torch.autograd.grad(y, x, torch.tensor(3.0))[0].tolist() == 0.0
+
+# empty_and_metadata_only_inputs
+for log in [False, True]:
+    for shape, dim in [((2, 0), 1), ((0, 3), 1), ((0, 3), 0)]:
+        x = torch.zeros(shape, requires_grad=True)
+        y = softmax_of(x, dim, log)
+        assert torch.autograd.grad(y, x, torch.ones(shape))[0].shape == shape
+    x = torch.zeros(2**40, 3, device="meta", requires_grad=True)
+    gx = torch.autograd.grad(softmax_of(x, 1, log), x, torch.ones(2**40, 3, device="meta"))[0]
+    assert (gx.shape, gx.dtype, gx.device.type) == ((2**40, 3), torch.float32, "meta")
 
 print("check_m1_formulas: all reference checks passed")

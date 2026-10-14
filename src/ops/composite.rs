@@ -21,8 +21,7 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     if src.device() == Device::Cpu {
         cpu::softmax(&out.data(), &src, dim, log);
     }
-    let name = if log { "log_softmax" } else { "softmax" };
-    crate::autograd::record_unimplemented(name, &[Some(x)], &out);
+    crate::autograd::formulas::softmax(x, dim, log, &out);
     out
 }
 

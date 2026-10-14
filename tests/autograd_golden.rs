@@ -161,6 +161,12 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "addr" => x().addr(y(), z(), 1.5, 0.75),
         "baddbmm" => x().baddbmm(y(), z(), 0.5, -1),
         "addbmm" => x().addbmm(y(), z(), 0.25, 3),
+        "softmax_dim1" => x().softmax(1),
+        "softmax_last" | "softmax_masked" | "softmax_opmath_f16" => x().softmax(-1),
+        "log_softmax_dim0" => x().log_softmax(0),
+        "log_softmax_last" | "log_softmax_masked" | "log_softmax_opmath_bf16" => {
+            x().log_softmax(-1)
+        }
         _ => return None,
     })
 }
@@ -216,7 +222,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 298, "only {} cases", cases.len());
+    assert!(cases.len() >= 310, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

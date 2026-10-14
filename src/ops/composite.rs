@@ -132,26 +132,31 @@ fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> T
     scale(input.clone(), beta).add(&product)
 }
 
-/// A floating point coefficient rounded to `dtype`, as kernels that take it in the tensor's own
-/// type see it.
-fn rounded(s: Scalar, dtype: DType) -> Scalar {
-    match s {
-        Scalar::Float(_) => {
-            let t = Tensor::from_data(scalar_data(s, dtype, Device::Cpu));
-            Scalar::Float(t.to(DType::F64).item())
-        }
-        _ => s,
+/// The coefficient `name` converted to the floating point type `ty` that a kernel takes it in,
+/// as PyTorch's checked conversion does: rounded to `ty` whatever kind of scalar it is, and
+/// rejected if it is finite but out of the range of `ty` (infinities and NaN pass).
+///
+/// # Panics
+///
+/// Panics if the value doesn't fit in `ty`.
+fn converted(s: Scalar, ty: DType, name: &str) -> Scalar {
+    let v = s.to_f64();
+    if v.is_finite() && v.abs() > ty.float_max() {
+        panic!("{name}={s} cannot be converted to {ty} without overflow");
     }
+    let t = Tensor::from_data(scalar_data(s, ty, Device::Cpu));
+    Scalar::Float(t.to(DType::F64).item())
 }
 
 /// The CPU kernel PyTorch computes a matrix product scaled by `alpha` with.
 #[derive(Clone, Copy, PartialEq)]
 enum Kernel {
     /// `addmm`, `baddbmm` and `addbmm`: BLAS `gemm`, or for half precision a product
-    /// accumulated in f32 and combined with the coefficients in f32 before rounding once.
+    /// accumulated in f32 and combined with the coefficients in f32 before rounding once. The
+    /// coefficients are converted to f32 (`F64` for `F64`).
     Gemm,
-    /// `addmv`: BLAS `gemv`, or for half precision the same, except that it takes the
-    /// coefficients rounded to the dtype.
+    /// `addmv`: BLAS `gemv`, or for half precision the same. The coefficients are converted
+    /// to the dtype.
     Gemv,
 }
 
@@ -188,6 +193,17 @@ fn scaled_matrix_product(
     let shape = product(&meta(x), &meta(y)).shape();
     let dtype = x.dtype();
     let (beta, alpha) = check_input(input, x, &shape, coefficients, Coefficients::Truncate);
+    let (beta, alpha) = if dtype.is_floating_point() {
+        // `gemm` takes the coefficients in its accumulation type, `gemv` in the dtype.
+        let ty = match kernel {
+            Kernel::Gemm if dtype == DType::F64 => DType::F64,
+            Kernel::Gemm => DType::F32,
+            Kernel::Gemv => dtype,
+        };
+        (converted(beta, ty, "beta"), converted(alpha, ty, "alpha"))
+    } else {
+        (beta, alpha)
+    };
     match dtype {
         DType::F32 | DType::F64 if alpha.to_f64() == 0.0 => {
             if beta.to_f64() == 0.0 {
@@ -197,10 +213,6 @@ fn scaled_matrix_product(
             }
         }
         DType::F16 | DType::BF16 => {
-            let (beta, alpha) = match kernel {
-                Kernel::Gemm => (beta, alpha),
-                Kernel::Gemv => (rounded(beta, dtype), rounded(alpha, dtype)),
-            };
             let p = product(&x.to(DType::F32), &y.to(DType::F32));
             scaled_sum(&input.to(DType::F32), p, beta, alpha).to(dtype)
         }
@@ -223,7 +235,10 @@ fn addr_value(input: &Tensor, v1: &Tensor, v2: &Tensor, beta: Scalar, alpha: Sca
     if !dtype.is_floating_point() {
         return scaled_sum(input, outer(v1.clone()), beta, alpha);
     }
-    let (beta, alpha) = (rounded(beta, dtype), rounded(alpha, dtype));
+    let (beta, alpha) = (
+        converted(beta, dtype, "beta"),
+        converted(alpha, dtype, "alpha"),
+    );
     let product = outer(scale(v1.clone(), alpha));
     if beta.to_f64() == 0.0 {
         return product;
@@ -282,7 +297,10 @@ impl Tensor {
     ///
     /// # Panics
     ///
-    /// Panics if a coefficient doesn't fit in an integer input dtype.
+    /// Panics if a coefficient doesn't fit in an integer input dtype, or is finite and doesn't
+    /// fit in the type the coefficients are taken in for floating point inputs, as PyTorch's
+    /// kernels do: f32 for `F16`, `BF16` and `F32` (`F64` for `F64`) in `addmm`, `baddbmm` and
+    /// `addbmm`, the input dtype itself in `addmv`.
     pub fn addmm(
         &self,
         mat1: &Tensor,

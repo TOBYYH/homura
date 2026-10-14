@@ -2161,4 +2161,43 @@ for mat, vec in [((0, 2), (2,)), ((2, 0), (0,))]:
     assert out.shape == ()
     assert "Expected 1-D argument self" in message(lambda: torch.autograd.grad(out.sum(), [x, m, v]))
 
+# ---------------------------------------------------------------- review round 24 (R39)
+# coefficients_are_rounded_to_the_kernels_type_whatever_their_kind
+for dtype, c, t in [(torch.float16, 2049, 3072.0), (torch.bfloat16, 257, 384.0)]:
+    m = lambda v, dtype=dtype: torch.tensor(v, dtype=dtype)  # noqa: E731
+    for coefficient in [c, float(c)]:
+        for out in [
+            torch.addmv(m([-t, -t]), m([[1.5, 0.0], [1.5, 0.0]]), m([1.0, 0.0]), beta=1, alpha=coefficient),
+            torch.addr(m([[-t]]), m([1.5]), m([1.0]), beta=1, alpha=coefficient),
+            torch.addmv(m([1.5, 1.5]), m([[-t, 0.0], [-t, 0.0]]), m([1.0, 0.0]), beta=coefficient, alpha=1),
+            torch.addr(m([[1.5]]), m([-t]), m([1.0]), beta=coefficient, alpha=1),
+        ]:
+            assert (out == 0).all(), (dtype, coefficient, out)
+out = torch.addmv(torch.full((2,), -16777216.0), torch.full((2, 2), 0.5), torch.ones(2), beta=1, alpha=16777217)
+assert out.tolist() == [0.0, 0.0]
+
+# coefficients_must_fit_the_type_the_kernel_takes_them_in
+h = lambda *shape: torch.ones(shape, dtype=torch.float16)  # noqa: E731
+for big in [65505, 65505.0]:
+    for f in [
+        lambda: torch.addmv(h(2), h(2, 2), h(2), alpha=big),
+        lambda: torch.addmv(h(2), h(2, 2), h(2), beta=big),
+        lambda: torch.addr(h(1, 1), h(1), h(1), alpha=big),
+    ]:
+        assert "without overflow" in message(f)
+    assert torch.addmm(torch.zeros(1, 1, dtype=torch.float16), h(1, 1), h(1, 1), alpha=big).item() == 65504.0
+    assert torch.addbmm(torch.zeros(1, 1, dtype=torch.float16), h(1, 1, 1), h(1, 1, 1), alpha=big).item() == 65504.0
+assert torch.addmv(torch.zeros(2, dtype=torch.float16), h(2, 2), h(2), alpha=32752.0).tolist() == [65504.0, 65504.0]
+for dtype in [torch.float16, torch.bfloat16, torch.float32]:
+    o = lambda *shape, dtype=dtype: torch.ones(shape, dtype=dtype)  # noqa: E731
+    for op in [
+        lambda alpha: torch.addmm(o(1, 1), o(1, 1), o(1, 1), alpha=alpha),
+        lambda alpha: torch.baddbmm(o(1, 1, 1), o(1, 1, 1), o(1, 1, 1), alpha=alpha),
+        lambda alpha: torch.addmv(o(1), o(1, 1), o(1), alpha=alpha),
+    ]:
+        assert "without overflow" in message(lambda: op(1e39))
+        assert op(math.inf).isinf().all()
+o = lambda *shape: torch.ones(shape, dtype=torch.float64)  # noqa: E731
+assert torch.addmm(o(1, 1), o(1, 1), o(1, 1), alpha=1.7976931348623157e308).item() == 1.7976931348623157e308
+
 print("check_m1_formulas: all reference checks passed")

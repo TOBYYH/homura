@@ -1023,3 +1023,93 @@ fn empty_addmv_gives_the_mathematical_shape() {
         }
     }
 }
+
+// ---------------------------------------------------------------- R39: coefficient conversion
+
+#[test]
+fn coefficients_are_rounded_to_the_kernels_type_whatever_their_kind() {
+    // Review round 24: addmv and addr take their coefficients in the dtype, so 2049 is 2048 in
+    // F16 (257 is 256 in BF16) whether it is an integer or a float, and the results below are
+    // exactly zero in the pinned PyTorch. An integer coefficient was kept in f32 and left a
+    // residue (1.5 or 2).
+    for (dtype, c, t) in [(DType::F16, 2049, 3072.0), (DType::BF16, 257, 384.0)] {
+        let m = |v: &[f32], shape: &[usize]| Tensor::from_slice(v, shape).to(dtype);
+        for coefficient in [homura::Scalar::Int(c), homura::Scalar::Float(c as f64)] {
+            let one = homura::Scalar::Int(1);
+            let cases = [
+                // alpha: c * 1.5 - t
+                m(&[-t as f32; 2], &[2]).addmv(
+                    &m(&[1.5, 0.0, 1.5, 0.0], &[2, 2]),
+                    &m(&[1.0, 0.0], &[2]),
+                    one,
+                    coefficient,
+                ),
+                m(&[-t as f32], &[1, 1]).addr(&m(&[1.5], &[1]), &m(&[1.0], &[1]), one, coefficient),
+                // beta: c * 1.5 - t
+                m(&[1.5; 2], &[2]).addmv(
+                    &m(&[-t as f32, 0.0, -t as f32, 0.0], &[2, 2]),
+                    &m(&[1.0, 0.0], &[2]),
+                    coefficient,
+                    one,
+                ),
+                m(&[1.5], &[1, 1]).addr(&m(&[-t as f32], &[1]), &m(&[1.0], &[1]), coefficient, one),
+            ];
+            for (i, out) in cases.iter().enumerate() {
+                assert!(
+                    out.to_vec::<f32>().iter().all(|&v| v == 0.0),
+                    "{dtype} {coefficient:?} case {i}: {out:?}"
+                );
+            }
+        }
+    }
+    // F32 rounds an integer coefficient too: 2^24 + 1 is 2^24.
+    let ones = |shape: &[usize], v: f64| homura::full_with(shape, v, DType::F32);
+    let out = ones(&[2], -16777216.0).addmv(&ones(&[2, 2], 0.5), &ones(&[2], 1.0), 1, 16777217);
+    assert_eq!(out.to_vec::<f32>(), [0.0, 0.0]);
+}
+
+#[test]
+fn coefficients_must_fit_the_type_the_kernel_takes_them_in() {
+    // Pinned PyTorch: a finite coefficient out of the range of that type is rejected, whether it
+    // is an integer or a float; infinities pass. F16 addmv and addr take them in F16, so 65505 is
+    // rejected and 65504 accepted; addmm, baddbmm and addbmm take them in f32, so F16 accepts
+    // 65505 (the result rounds to 65504) while F32 and F16 reject 1e39.
+    let rejects = |f: &dyn Fn()| catch_unwind(AssertUnwindSafe(f)).is_err();
+    let h = |shape: &[usize]| homura::ones_with(shape, DType::F16);
+    for big in [homura::Scalar::Int(65505), homura::Scalar::Float(65505.0)] {
+        assert!(rejects(&|| {
+            h(&[2]).addmv(&h(&[2, 2]), &h(&[2]), 1, big);
+        }));
+        assert!(rejects(&|| {
+            h(&[2]).addmv(&h(&[2, 2]), &h(&[2]), big, 1);
+        }));
+        assert!(rejects(&|| {
+            h(&[1, 1]).addr(&h(&[1]), &h(&[1]), 1, big);
+        }));
+        let out = homura::zeros_with([1, 1], DType::F16).addmm(&h(&[1, 1]), &h(&[1, 1]), 1, big);
+        assert_eq!(out.to_vec::<f32>(), [65504.0]);
+        let out =
+            homura::zeros_with([1, 1], DType::F16).addbmm(&h(&[1, 1, 1]), &h(&[1, 1, 1]), 1, big);
+        assert_eq!(out.to_vec::<f32>(), [65504.0]);
+    }
+    let out = homura::zeros_with([2], DType::F16).addmv(&h(&[2, 2]), &h(&[2]), 1, 32752.0);
+    assert_eq!(out.to_vec::<f32>(), [65504.0; 2]);
+    let scaled = |op: &str, dtype: DType, alpha: f64| {
+        let o = |shape: &[usize]| homura::ones_with(shape, dtype);
+        match op {
+            "addmm" => o(&[1, 1]).addmm(&o(&[1, 1]), &o(&[1, 1]), 1, alpha),
+            "baddbmm" => o(&[1, 1, 1]).baddbmm(&o(&[1, 1, 1]), &o(&[1, 1, 1]), 1, alpha),
+            _ => o(&[1]).addmv(&o(&[1, 1]), &o(&[1]), 1, alpha),
+        }
+    };
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        for op in ["addmm", "baddbmm", "addmv"] {
+            assert!(rejects(&|| drop(scaled(op, dtype, 1e39))), "{op} {dtype}");
+            assert!(scaled(op, dtype, f64::INFINITY).to_vec::<f32>()[0].is_infinite());
+        }
+    }
+    // F64 takes any F64 value.
+    let o = |shape: &[usize]| homura::ones_with(shape, DType::F64);
+    let out = o(&[1, 1]).addmm(&o(&[1, 1]), &o(&[1, 1]), 1, f64::MAX);
+    assert_eq!(out.to_vec::<f64>(), [f64::MAX]);
+}

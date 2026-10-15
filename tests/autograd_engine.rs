@@ -915,39 +915,40 @@ fn in_place_operations_on_leaves_that_require_grad_are_rejected() {
     for (_, op) in &ops {
         assert_rejected(&x, LEAF, || op(&x));
     }
-    // Writing into a tensor that doesn't require grad from one that does is recorded in
-    // PyTorch; here it is rejected until in-place operations record.
-    for (_, op) in &ops[..1] {
+    // Copying and filling aren't recorded yet (M1 step 7b): rejected before anything is written
+    // into a non-leaf, or into a tensor that doesn't require grad from one that does. The other
+    // in-place operations are recorded, see tests/autograd_inplace.rs.
+    for (name, op) in &ops[7..12] {
         let y = &x * 2.0;
         assert_rejected(&y, RECORDED, || op(&y));
+        assert!(name.ends_with('_'));
     }
-    assert_rejected(&o, RECORDED, || {
-        o.add_(&x);
-    });
     assert_rejected(&o, RECORDED, || {
         o.copy_(&x);
     });
-    assert_rejected(&o, RECORDED, || {
-        o.masked_fill_(&homura::tensor([true, false]), x.sum());
-    });
-    assert_rejected(&o, RECORDED, || {
-        o.clamp_(&x, 2.0);
-    });
 }
+
+const VIEW_OF_LEAF: &str =
+    "a view of a leaf Variable that requires grad is being used in an in-place operation.";
 
 #[test]
 fn in_place_operations_on_views_are_rejected_when_they_need_recording() {
     let x = leaf(&[1., 2.]);
     let v = x.view([2]);
-    assert_rejected(&v, VIEW, || {
+    assert_rejected(&v, VIEW_OF_LEAF, || {
         v.add_(1.0);
     });
     let quiet = {
         let _no_grad = homura::no_grad();
         x.view([2])
     };
-    assert_rejected(&quiet, VIEW, || {
+    assert_rejected(&quiet, VIEW_OF_LEAF, || {
         quiet.mul_(2.0);
+    });
+    let y = &x * 2.0;
+    let yv = y.view([2]);
+    assert_rejected(&yv, VIEW, || {
+        yv.mul_(2.0);
     });
     let plain = homura::zeros([2]);
     let pv = plain.view([2]);

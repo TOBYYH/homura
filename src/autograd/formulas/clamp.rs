@@ -15,12 +15,14 @@ fn tensor(o: Option<&Operand>) -> Option<&Tensor> {
 }
 
 /// Records scalar bounds with strict inequalities, tensor bounds with tie splitting. Mixed
-/// bounds use the tensor rule, rounding the scalar at its corresponding forward stage.
+/// bounds use the tensor rule, rounding the scalar at its corresponding forward stage: `dtypes`
+/// are the dtypes that the `min` and `max` steps computed in. They are passed in rather than
+/// taken from `out`, which `clamp_` makes the target of the write, whose dtype can be narrower.
 pub(crate) fn clamp(
     x: &Tensor,
     min: Option<&Operand>,
     max: Option<&Operand>,
-    min_dtype: DType,
+    dtypes: [DType; 2],
     out: &Tensor,
 ) {
     let bounds = [min, max];
@@ -54,7 +56,7 @@ pub(crate) fn clamp(
             Some(Operand::Scalar(s)) => Some(*s),
             _ => None,
         }),
-        dtypes: [min_dtype, out.dtype()],
+        dtypes,
         shapes: [
             x.shape(),
             tensor(min).map_or_else(Shape::scalar, Tensor::shape),

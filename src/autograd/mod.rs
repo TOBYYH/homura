@@ -39,10 +39,38 @@
 //! The gradient of `prod` for an input that contains zeros can't be differentiated again yet: a
 //! backward pass with `create_graph` that computes it panics.
 //!
-//! In-place operations are allowed in no-grad mode, which is how optimizers update parameters.
-//! In grad mode, an in-place operation whose target or inputs require grad panics before
-//! writing anything: on a leaf that requires grad with PyTorch's error, and otherwise because
-//! recording in-place operations is not implemented yet.
+//! # In-place operations
+//!
+//! In grad mode, an in-place operation whose target or inputs require grad is recorded like the
+//! out-of-place operation, with the target as its output: the target gets the operation's node
+//! as its new history, whose first edge leads to the old one, as in PyTorch. A formula that needs
+//! the target's value from before the write (`mul_` for the other factor's gradient, `pow_`,
+//! `clamp_`, `lerp_` with a tensor weight) saves a copy of it, with its old history. A tensor
+//! that doesn't require grad becomes part of the graph when it is written from one that does.
+//!
+//! ```
+//! let x = homura::tensor([1.0, 2.0]);
+//! x.requires_grad_(true);
+//! let y = &x * 3.0;
+//! y.mul_(&x);
+//! assert_eq!(y.grad_fn().unwrap().name(), "MulBackward0");
+//! y.sum().backward();
+//! assert_eq!(x.grad().unwrap().to_vec::<f32>(), [6.0, 12.0]);
+//! ```
+//!
+//! Recorded writes are rejected before anything is written, so that the data, version and
+//! history of the target don't change: on a leaf that requires grad and on a view of one, with
+//! PyTorch's errors, and on any other view, which homura doesn't support yet. `copy_`, `fill_`,
+//! `zero_`, `uniform_` and `normal_` can't be recorded yet either. In no-grad mode every in-place
+//! operation is allowed, which is how optimizers update parameters; the history doesn't change.
+//!
+//! Every in-place operation bumps the version of the target's storage once. A backward pass that
+//! needs a tensor saved before a write panics with PyTorch's error, naming the tensor's current
+//! history. A view created before a recorded write into its base (or from such a view) is stale:
+//! using its history (as an input to a recorded operation, a root or requested input of a
+//! backward pass, the parent of a new view, or through [`Tensor::grad_fn`]) panics, while
+//! no-grad operations on its data work. PyTorch replays such views on the new history; create
+//! the view again after the write instead.
 //!
 //! # Views
 //!
@@ -62,6 +90,12 @@
 //! `backward` with `create_graph` stores gradients that have a graph which usually reaches the
 //! leaf again: the leaf and its gradient then keep each other alive until the gradient is
 //! cleared with `set_grad(None)`, as in PyTorch. [`grad`] never writes `.grad`.
+//!
+//! A tensor that doesn't require grad and joins the graph through an in-place operation can form
+//! another cycle, with or without a backward pass, when a node of its new history saved the
+//! tensor itself as an input: `b.addcmul_(&b, &z, 1.0)`, or `let y = &b * &z; b.add_(&y)`, whose
+//! earlier product saved `b`. Clearing `.grad` or using [`grad`] doesn't help here: the tensor and
+//! its history then live until [`Tensor::detach_`] removes the history, as in PyTorch.
 //!
 //! Backward passes run on the calling thread. Passes on different threads may share leaves:
 //! accumulating into the same `.grad` is serialized and loses nothing.
@@ -101,6 +135,8 @@ pub(crate) mod formulas;
 mod gradcheck;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod inplace_tests;
 mod meta;
 mod node;
 mod record;
@@ -109,7 +145,9 @@ mod saved;
 pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
 pub(crate) use meta::{AutogradMeta, ViewInfo, view_of};
 pub use node::GradFn;
-pub(crate) use record::check_inplace;
+pub(crate) use record::{
+    check_in_place, check_unrecorded_in_place, original_value, record_in_place,
+};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };

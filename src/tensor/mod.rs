@@ -46,11 +46,11 @@ struct TensorImpl {
     view: Option<ViewInfo>,
 }
 
-/// A weak handle to a tensor, for tests that check when tensors are destroyed.
-#[cfg(test)]
+/// A weak handle to a tensor: it doesn't keep the tensor alive. Saved tensors use it to describe
+/// the original in error messages, and tests to check when tensors are destroyed.
+#[derive(Clone)]
 pub(crate) struct WeakTensor(std::sync::Weak<TensorImpl>);
 
-#[cfg(test)]
 impl WeakTensor {
     pub(crate) fn upgrade(&self) -> Option<Tensor> {
         self.0.upgrade().map(Tensor)
@@ -476,7 +476,6 @@ impl Tensor {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    #[cfg(test)]
     pub(crate) fn downgrade(&self) -> WeakTensor {
         WeakTensor(Arc::downgrade(&self.0))
     }

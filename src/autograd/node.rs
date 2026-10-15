@@ -336,6 +336,16 @@ impl NodeBuilder {
         self.push(SavedTensor::output(t, output_nr))
     }
 
+    /// Moves the saved copies of output `output_nr` to `version`, the version after an in-place
+    /// operation that is being recorded has written that output, which saved them before the
+    /// write. Saved inputs keep their versions, so an input that shares the target's storage
+    /// (`y.mul_(&y)`) is detected as modified.
+    pub fn refresh_output(&mut self, output_nr: u32, version: u64) {
+        for saved in &mut self.saved {
+            saved.refresh_output(output_nr, version);
+        }
+    }
+
     fn push(&mut self, saved: SavedTensor) -> SavedId {
         self.saved.push(saved);
         SavedId(self.saved.len() - 1)

@@ -175,10 +175,22 @@ impl Tensor {
 
     fn binary_(&self, op: BinaryOp, other: impl Into<Operand>) -> &Self {
         let other = other.into();
-        crate::autograd::check_inplace(self, &[tensor_of(&other)]);
-        let result = self.binary(op, other);
-        self.assign_result(&result);
-        self
+        let other_tensor = tensor_of(&other);
+        // Products and quotients save `self` for the gradient of a tensor `other`, powers always.
+        let saves_self = match op {
+            BinaryOp::Mul | BinaryOp::Div => other_tensor.is_some_and(Tensor::requires_grad),
+            BinaryOp::Pow => true,
+            _ => false,
+        };
+        self.in_place(
+            &[other_tensor],
+            saves_self,
+            || (self.binary(op, other.clone()), ()),
+            |original, ()| {
+                let lhs = Operand::Tensor(original.clone());
+                crate::autograd::formulas::binary(op, &lhs, &other, self)
+            },
+        )
     }
 
     /// `self + other`, with broadcasting and type promotion.
@@ -290,14 +302,21 @@ impl Tensor {
     pub fn clamp(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> Tensor {
         let (min, max) = (min.into(), max.into());
         // Computed without recording the two steps: clamp gets a node of its own.
-        let (out, min_dtype) = {
+        let (out, dtypes) = {
             let _no_grad = crate::no_grad();
-            let lower = self.maximum(min.clone());
-            let dtype = lower.dtype();
-            (lower.minimum(max.clone()), dtype)
+            self.clamp_values(&min, &max)
         };
-        crate::autograd::formulas::clamp(self, Some(&min), Some(&max), min_dtype, &out);
+        crate::autograd::formulas::clamp(self, Some(&min), Some(&max), dtypes, &out);
         out
+    }
+
+    /// `self.maximum(min).minimum(max)` and the dtypes the two steps compute in, which the
+    /// gradient of mixed scalar and tensor bounds depends on.
+    fn clamp_values(&self, min: &Operand, max: &Operand) -> (Tensor, [DType; 2]) {
+        let lower = self.maximum(min.clone());
+        let out = lower.minimum(max.clone());
+        let dtypes = [lower.dtype(), out.dtype()];
+        (out, dtypes)
     }
 
     /// Clamps every element to at least `min`.
@@ -307,7 +326,7 @@ impl Tensor {
             let _no_grad = crate::no_grad();
             self.maximum(min.clone())
         };
-        crate::autograd::formulas::clamp(self, Some(&min), None, out.dtype(), &out);
+        crate::autograd::formulas::clamp(self, Some(&min), None, [out.dtype(); 2], &out);
         out
     }
 
@@ -318,27 +337,38 @@ impl Tensor {
             let _no_grad = crate::no_grad();
             self.minimum(max.clone())
         };
-        crate::autograd::formulas::clamp(self, None, Some(&max), out.dtype(), &out);
+        crate::autograd::formulas::clamp(self, None, Some(&max), [out.dtype(); 2], &out);
         out
     }
 
     /// In-place [`clamp`](Tensor::clamp).
     pub fn clamp_(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> &Self {
         let (min, max) = (min.into(), max.into());
-        crate::autograd::check_inplace(self, &[tensor_of(&min), tensor_of(&max)]);
-        let result = self.clamp(min, max);
-        self.assign_result(&result);
-        self
+        // The formula computes in the dtypes of the computation, not in the dtype of `self`.
+        self.in_place(
+            &[tensor_of(&min), tensor_of(&max)],
+            true,
+            || self.clamp_values(&min, &max),
+            |original, dtypes| {
+                crate::autograd::formulas::clamp(original, Some(&min), Some(&max), dtypes, self)
+            },
+        )
     }
 
     /// A copy of `self` with `value` written where `mask` is true. `value` must be a scalar or a
     /// zero-dimensional tensor; the result keeps the dtype of `self`.
     pub fn masked_fill(&self, mask: &Tensor, value: impl Into<Operand>) -> Tensor {
+        where_(mask, self.masked_fill_value(mask, value.into()), self)
+    }
+
+    /// Checks the arguments of [`masked_fill`](Tensor::masked_fill) and returns `value` as a
+    /// zero-dimensional tensor of the dtype of `self`, converted with a recorded `to`.
+    fn masked_fill_value(&self, mask: &Tensor, value: Operand) -> Tensor {
         let m = mask.dtype();
         if m != DType::Bool {
             panic!("masked_fill only supports boolean masks, but got mask with dtype {m}");
         }
-        let value = match value.into() {
+        match value {
             Operand::Scalar(s) => Tensor::from_data(scalar_data(s, self.dtype(), self.device())),
             Operand::Tensor(t) => {
                 if t.num_dims() != 0 {
@@ -350,17 +380,22 @@ impl Tensor {
                 }
                 t.to(self.dtype())
             }
-        };
-        where_(mask, &value, self)
+        }
     }
 
     /// In-place [`masked_fill`](Tensor::masked_fill).
     pub fn masked_fill_(&self, mask: &Tensor, value: impl Into<Operand>) -> &Self {
         let value = value.into();
-        crate::autograd::check_inplace(self, &[Some(mask), tensor_of(&value)]);
-        let result = self.masked_fill(mask, value);
-        self.assign_result(&result);
-        self
+        self.in_place(
+            &[Some(mask), tensor_of(&value)],
+            false,
+            || (self.masked_fill(mask, value.clone()), ()),
+            |original, ()| {
+                let value = Operand::Tensor(self.masked_fill_value(mask, value.clone()));
+                let original = Operand::Tensor(original.clone());
+                crate::autograd::formulas::where_(mask, &value, &original, self)
+            },
+        )
     }
 
     /// Copies the elements of `src` into `self`, broadcasting `src` and converting its dtype.
@@ -371,21 +406,21 @@ impl Tensor {
     /// be proven to occupy distinct memory (an expanded tensor, for example), or if `src` is a
     /// meta tensor and `self` is not.
     pub fn copy_(&self, src: &Tensor) -> &Self {
-        crate::autograd::check_inplace(self, &[Some(src)]);
+        crate::autograd::check_unrecorded_in_place(self, &[Some(src)]);
         self.write_copy(src);
         self
     }
 
     /// Sets every element to `value`.
     pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
-        crate::autograd::check_inplace(self, &[]);
+        crate::autograd::check_unrecorded_in_place(self, &[]);
         self.write_fill(value.into());
         self
     }
 
     /// Sets every element to zero.
     pub fn zero_(&self) -> &Self {
-        crate::autograd::check_inplace(self, &[]);
+        crate::autograd::check_unrecorded_in_place(self, &[]);
         self.write_fill(0.into());
         self
     }

@@ -258,7 +258,15 @@ impl Tensor {
     }
 
     /// The node that computed this tensor, PyTorch's `grad_fn`; `None` for leaves.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a view whose base had its history rewritten by an in-place operation in grad
+    /// mode after the view was created: the view's node no longer describes how it depends on
+    /// the base's new history (PyTorch replays the view on it, which homura doesn't support
+    /// yet).
     pub fn grad_fn(&self) -> Option<GradFn> {
+        record::check_not_stale(self);
         grad_fn(self).map(|(node, _)| GradFn(node))
     }
 

@@ -800,6 +800,55 @@ case(
     g=f([256.0, 1.0, 1.0, 1.0], dtype=torch.bfloat16),
 )
 
+# ---------------------------------------------------------------- step 7a
+# In-place operations, appended after every earlier case so that those keep their inputs. Each
+# writes into a clone of x, which records its own node like the out-of-place operation, with the
+# edge of self leading to the clone's history; formulas that need self save its value before the
+# write. A mixed dtype keeps the dtype of self and gives each input its gradient in its own dtype;
+# half precision self with an f32 operand computes in f32 and rounds the result, and the upstream
+# gradient has the dtype of self. masked_fill is where_ in homura (WhereBackward0, accepted in
+# 12.3.5); the gradients are the same.
+case("grad.add_", lambda x, y: x.clone().add_(y), x=randn(3, 4), y=randn(4))
+case("grad.add_scalar_", lambda x: x.clone().add_(2.5), x=randn(3, 4))
+case("grad.add_self_", lambda x: (c := x.clone()).add_(c), x=randn(3, 4))
+case("grad.sub_", lambda x, y: x.clone().sub_(y), x=randn(3, 4), y=randn(3, 1))
+case("grad.mul_", lambda x, y: x.clone().mul_(y), x=randn(3, 4), y=randn(3, 1))
+case("grad.mul_scalar_", lambda x: x.clone().mul_(-1.7), x=randn(3, 4))
+case("grad.div_", lambda x, y: x.clone().div_(y), x=randn(3, 4), y=positive(4))
+case("grad.pow_", lambda x, y: x.clone().pow_(y), x=positive(3, 4), y=randn(3, 4))
+case("grad.pow_scalar_", lambda x: x.clone().pow_(2.5), x=positive(3, 4))
+case("grad.clamp_", lambda x, lo, hi: x.clone().clamp_(lo, hi), x=randn(3, 4), lo=randn(4) - 0.5, hi=randn(3, 1) + 0.5)
+case("grad.clamp_scalar_", lambda x: x.clone().clamp_(-0.5, 0.5), x=randn(3, 4))
+case("grad.masked_fill_", lambda x, cond, value: x.clone().masked_fill_(cond, value), x=randn(3, 4), cond=torch.tensor([True, False, False, True]), value=randn())
+case("grad.addcmul_", lambda x, y, z: x.clone().addcmul_(y, z, value=1.7), x=randn(3, 4), y=randn(4), z=randn(3, 1))
+case("grad.addcdiv_", lambda x, y, z: x.clone().addcdiv_(y, z, value=-0.3), x=randn(3, 4), y=randn(3, 4), z=positive(4))
+case("grad.lerp_", lambda x, y, z: x.clone().lerp_(y, z), x=randn(3, 4), y=randn(4), z=torch.rand(3, 4))
+case("grad.lerp_scalar_", lambda x, y: x.clone().lerp_(y, 0.3), x=randn(3, 4), y=randn(3, 4))
+case("grad.index_add_", lambda x, source, idx: x.clone().index_add_(0, idx, source), x=randn(4, 3), source=randn(3, 3), idx=ints(2, 0, 2))
+case("grad.scatter_add_", lambda x, src, idx: x.clone().scatter_add_(0, idx, src), x=randn(3, 4), src=randn(2, 4), idx=torch.tensor([[2, 0, 1, 2], [0, 0, 2, 1]]))
+case("grad.chain_", lambda x, y: x.clone().add_(y).mul_(y).div_(y.exp()).pow_(2.0), x=randn(3, 4), y=randn(4))
+# The f64 gradient of the f64 operand is computed in f32 (the dtype of the upstream gradient and
+# of self); summing it over a broadcast dimension would differ by an f32 rounding step under
+# homura's f64 sums, which the f64 tolerance can't absorb, so these don't broadcast.
+case("grad.mul_promote_", lambda x, y: x.clone().mul_(y), x=randn(3, 4), y=randn(3, 4, dtype=torch.float64))
+case("grad.add_promote_", lambda x, y: x.clone().add_(y), x=randn(3, 4), y=randn(3, 4, dtype=torch.float64))
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.add_", lambda x, y: x.clone().add_(y), x=randn(3, 4, dtype=dtype), y=randn(4, dtype=dtype))
+    case(f"grad_{tag}.mul_", lambda x, y: x.clone().mul_(y), x=randn(3, 4, dtype=dtype), y=randn(3, 4, dtype=dtype))
+    # No reduction: gradients reduced in half precision differ by a rounding step.
+    case(f"grad_{tag}.mul_promote_", lambda x, y: x.clone().mul_(y), x=randn(3, 4, dtype=dtype), y=randn(3, 4))
+    case(f"grad_{tag}.clamp_scalar_", lambda x: x.clone().clamp_(-0.5, 0.5), x=randn(3, 4, dtype=dtype))
+# Review round 28 (R41): the scalar bound 1 + 2^-30 of homura's mixed clamp_ is computed in f64,
+# where x = 1 is between the bounds; the reference gets the same with an explicit f64 bound.
+case(
+    "special.clamp_promoted_",
+    lambda x, lo: x.clone().clamp_(lo, torch.tensor(1 + 2**-30, dtype=torch.float64)),
+    x=f(1.0),
+    lo=f(0.0, dtype=torch.float64),
+    g=f(1.0),
+)
+case("special.mul_", lambda x, y: x.clone().mul_(y), x=f([inf, nan, 1.0, -0.0]), y=f([0.0, 1.0, inf, 2.0]), g=f([1.0, 1.0, -inf, nan]))
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

@@ -167,8 +167,37 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "log_softmax_last" | "log_softmax_masked" | "log_softmax_opmath_bf16" => {
             x().log_softmax(-1)
         }
+        "add_" | "add_promote_" => in_place(x(), |c| _ = c.add_(y())),
+        "add_scalar_" => in_place(x(), |c| _ = c.add_(2.5)),
+        "add_self_" => in_place(x(), |c| _ = c.add_(c)),
+        "sub_" => in_place(x(), |c| _ = c.sub_(y())),
+        "mul_" | "mul_promote_" => in_place(x(), |c| _ = c.mul_(y())),
+        "mul_scalar_" => in_place(x(), |c| _ = c.mul_(-1.7)),
+        "div_" => in_place(x(), |c| _ = c.div_(y())),
+        "pow_" => in_place(x(), |c| _ = c.pow_(y())),
+        "pow_scalar_" => in_place(x(), |c| _ = c.pow_(2.5)),
+        "clamp_" => in_place(x(), |c| _ = c.clamp_(&t["lo"], &t["hi"])),
+        "clamp_scalar_" => in_place(x(), |c| _ = c.clamp_(-0.5, 0.5)),
+        "clamp_promoted_" => in_place(x(), |c| _ = c.clamp_(&t["lo"], 1.0 + 2f64.powi(-30))),
+        "masked_fill_" => in_place(x(), |c| _ = c.masked_fill_(&t["cond"], &t["value"])),
+        "addcmul_" => in_place(x(), |c| _ = c.addcmul_(y(), z(), 1.7)),
+        "addcdiv_" => in_place(x(), |c| _ = c.addcdiv_(y(), z(), -0.3)),
+        "lerp_" => in_place(x(), |c| _ = c.lerp_(y(), z())),
+        "lerp_scalar_" => in_place(x(), |c| _ = c.lerp_(y(), 0.3)),
+        "index_add_" => in_place(x(), |c| _ = c.index_add_(0, idx(), &t["source"])),
+        "scatter_add_" => in_place(x(), |c| _ = c.scatter_add_(0, idx(), &t["src"])),
+        "chain_" => in_place(x(), |c| {
+            c.add_(y()).mul_(y()).div_(y().exp()).pow_(2.0);
+        }),
         _ => return None,
     })
+}
+
+/// `f` applied in place to a copy of `x` with the history of `x` (PyTorch's `x.clone()`).
+fn in_place(x: &Tensor, f: impl FnOnce(&Tensor)) -> Tensor {
+    let c = x.deep_clone();
+    f(&c);
+    c
 }
 
 /// Runs one case and checks its gradients. Returns `false` if there is no handler for it.
@@ -222,7 +251,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 310, "only {} cases", cases.len());
+    assert!(cases.len() >= 340, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

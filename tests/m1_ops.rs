@@ -517,13 +517,13 @@ fn in_place_index_add_and_scatter_add() {
         message,
         "a leaf Variable that requires grad is being used in an in-place operation."
     );
+    // A tensor that doesn't require grad joins the graph.
     let source = homura::ones([1]);
     source.requires_grad_(true);
-    let message = panic_message(|| {
-        homura::zeros([3]).scatter_add_(0, &ints(&[0]), &source);
-        homura::zeros([1])
-    });
-    assert!(message.starts_with("in-place operations that need to be recorded"));
+    let buffer = homura::zeros([3]);
+    buffer.scatter_add_(0, &ints(&[0]), &source);
+    assert_eq!(buffer.grad_fn().unwrap().name(), "ScatterAddBackward0");
+    assert_eq!(vals(&buffer), [1., 0., 0.]);
     // In no-grad mode, as optimizers update parameters.
     {
         let _no_grad = homura::no_grad();

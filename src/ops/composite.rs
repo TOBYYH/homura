@@ -510,18 +510,28 @@ impl Tensor {
 
     /// In-place [`addcmul`](Tensor::addcmul).
     pub fn addcmul_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
-        crate::autograd::check_inplace(self, &[Some(tensor1), Some(tensor2)]);
-        let result = self.addcmul(tensor1, tensor2, value);
-        self.assign_result(&result);
-        self
+        let value = value.into();
+        self.in_place(
+            &[Some(tensor1), Some(tensor2)],
+            false,
+            || (self.addcmul(tensor1, tensor2, value), ()),
+            |original, ()| {
+                crate::autograd::formulas::addcmul(original, tensor1, tensor2, value, self)
+            },
+        )
     }
 
     /// In-place [`addcdiv`](Tensor::addcdiv).
     pub fn addcdiv_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
-        crate::autograd::check_inplace(self, &[Some(tensor1), Some(tensor2)]);
-        let result = self.addcdiv(tensor1, tensor2, value);
-        self.assign_result(&result);
-        self
+        let value = value.into();
+        self.in_place(
+            &[Some(tensor1), Some(tensor2)],
+            false,
+            || (self.addcdiv(tensor1, tensor2, value), ()),
+            |original, ()| {
+                crate::autograd::formulas::addcdiv(original, tensor1, tensor2, value, self)
+            },
+        )
     }
 
     /// In-place [`lerp`](Tensor::lerp).
@@ -531,9 +541,13 @@ impl Tensor {
             Operand::Tensor(w) => Some(w),
             Operand::Scalar(_) => None,
         };
-        crate::autograd::check_inplace(self, &[Some(end), weight_tensor]);
-        let result = self.lerp(end, weight);
-        self.assign_result(&result);
-        self
+        // A tensor weight saves both endpoints for its own gradient.
+        let saves_self = weight_tensor.is_some_and(Tensor::requires_grad);
+        self.in_place(
+            &[Some(end), weight_tensor],
+            saves_self,
+            || (self.lerp(end, weight.clone()), ()),
+            |original, ()| crate::autograd::formulas::lerp(original, end, &weight, self),
+        )
     }
 }

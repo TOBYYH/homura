@@ -128,10 +128,15 @@ impl Tensor {
 
     /// In-place [`index_add`](Tensor::index_add).
     pub fn index_add_(&self, dim: i64, index: &Tensor, source: &Tensor) -> &Self {
-        crate::autograd::check_inplace(self, &[Some(source)]);
-        let result = self.index_add(dim, index, source);
-        self.assign_result(&result);
-        self
+        self.in_place(
+            &[Some(source)],
+            false,
+            || (self.index_add(dim, index, source), ()),
+            |original, ()| {
+                let d = normalize_dim(dim, self.num_dims());
+                formulas::index_add(original, d, index, source, self)
+            },
+        )
     }
 
     /// Picks the elements along `dim` at the positions in `index` (`torch.gather`): for
@@ -236,10 +241,15 @@ impl Tensor {
 
     /// In-place [`scatter_add`](Tensor::scatter_add).
     pub fn scatter_add_(&self, dim: i64, index: &Tensor, src: &Tensor) -> &Self {
-        crate::autograd::check_inplace(self, &[Some(src)]);
-        let result = self.scatter_add(dim, index, src);
-        self.assign_result(&result);
-        self
+        self.in_place(
+            &[Some(src)],
+            false,
+            || (self.scatter_add(dim, index, src), ()),
+            |original, ()| {
+                let d = normalize_dim(dim, self.num_dims());
+                formulas::scatter_add(original, d, index, src, self)
+            },
+        )
     }
 
     /// A copy of `self` with the slice that `self.select(dim, index)` views replaced by `src`

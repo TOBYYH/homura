@@ -211,10 +211,56 @@ pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> Tensor
 }
 
 impl Tensor {
-    /// Writes the result of an in-place operation into `self` with
-    /// [`write_copy`](Tensor::write_copy), after checking that it has the shape of `self` and that
-    /// its dtype may be cast to the dtype of `self`.
-    pub(crate) fn assign_result(&self, result: &Tensor) {
+    /// The flow that the in-place operations recorded for autograd share; `inputs` are their
+    /// tensor inputs other than `self`.
+    ///
+    /// 1. [`check_in_place`](crate::autograd::check_in_place) rejects writes that autograd
+    ///    doesn't allow and tells whether this one is recorded.
+    /// 2. `compute` runs the out-of-place operation in no-grad mode, which checks the arguments.
+    ///    It returns the result and whatever else `record` needs from the computation.
+    /// 3. The result has to fit `self`, see [`check_result`](Tensor::check_result).
+    /// 4. Unless the write is recorded, the result is written into `self`. Otherwise `record`
+    ///    records the operation's node with `self` as its output and `original` in the place of
+    ///    `self` as an input, and the write happens in that recording (see
+    ///    [`record_in_place`](crate::autograd::record_in_place)). With `saves_self`, which must
+    ///    hold whenever the operation's formula saves that input, `original` is the value of
+    ///    `self` before the write, with its history; otherwise it is `self`.
+    ///
+    /// Every check runs before the write, so a call that panics changes neither the data, the
+    /// version nor the history of `self`. The version is bumped exactly once.
+    pub(crate) fn in_place<C>(
+        &self,
+        inputs: &[Option<&Tensor>],
+        saves_self: bool,
+        compute: impl FnOnce() -> (Tensor, C),
+        record: impl FnOnce(&Tensor, C),
+    ) -> &Self {
+        let recorded = crate::autograd::check_in_place(self, inputs);
+        let (result, computed) = {
+            let _no_grad = crate::no_grad();
+            compute()
+        };
+        self.check_result(&result);
+        if !recorded {
+            self.write_copy(&result);
+            return self;
+        }
+        let original = if saves_self {
+            crate::autograd::original_value(self)
+        } else {
+            self.clone()
+        };
+        let target = self.clone();
+        let write = Box::new(move || target.write_copy(&result));
+        crate::autograd::record_in_place(self, write, || record(&original, computed));
+        self
+    }
+
+    /// Checks that the result of an in-place operation can be written into `self` with
+    /// [`write_copy`](Tensor::write_copy), which then can't fail: it has the shape of `self`, its
+    /// dtype may be cast to the dtype of `self`, and the elements of `self` are distinct memory
+    /// locations. The result is on the device of `self`, which computed it.
+    fn check_result(&self, result: &Tensor) {
         let (dst, src) = (self.data(), result.data());
         if dst.layout.shape != src.layout.shape {
             panic!(
@@ -228,7 +274,8 @@ impl Tensor {
                 src.dtype, dst.dtype
             );
         }
-        self.write_copy(result);
+        binary::check_writable(&dst);
+        debug_assert_eq!(dst.device(), src.device());
     }
 }
 

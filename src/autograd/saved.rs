@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use super::meta;
 use super::node::NodeRef;
 use crate::Tensor;
-use crate::tensor::TensorData;
+use crate::tensor::{TensorData, WeakTensor};
 
 /// The index of a saved tensor in its node, handed out by `NodeBuilder::save`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,13 +31,15 @@ enum Packed {
     Leaf { tensor: Tensor, version: u64 },
     /// An input with a history: a snapshot of its data without autograd state, its history, and
     /// the flag that `detach_` sets on the original. Not holding the original tensor lets graph
-    /// destruction reach `grad_fn` without recursion.
+    /// destruction reach `grad_fn` without recursion. The weak handle to the original only names
+    /// its current history when the version check fails, as PyTorch's message does.
     NonLeaf {
         data: TensorData,
         version: u64,
         grad_fn: NodeRef,
         output_nr: u32,
         detached: Arc<AtomicBool>,
+        original: WeakTensor,
     },
     /// Output `output_nr` of the node that owns this saved tensor. Referencing that node would
     /// be a cycle, so the running node supplies itself when unpacking.
@@ -63,6 +65,7 @@ impl SavedTensor {
                 grad_fn,
                 output_nr,
                 detached,
+                original: t.downgrade(),
             },
         };
         SavedTensor::new(packed)
@@ -104,8 +107,7 @@ impl SavedTensor {
                  access saved tensors after calling backward."
             ),
             Some(Packed::Leaf { tensor, version }) => {
-                let history = meta::grad_fn(&tensor);
-                check_version(&tensor.data(), version, history.as_ref());
+                check_version(&tensor.data(), version, || meta::grad_fn(&tensor));
                 tensor
             }
             Some(Packed::NonLeaf {
@@ -114,6 +116,7 @@ impl SavedTensor {
                 grad_fn,
                 output_nr,
                 detached,
+                original,
             }) => {
                 if detached.load(Ordering::Acquire) {
                     panic!(
@@ -122,19 +125,34 @@ impl SavedTensor {
                          instead"
                     );
                 }
-                let history = (grad_fn, output_nr);
-                check_version(&data, version, Some(&history));
-                meta::with_saved_history(data, history.0, output_nr, detached)
+                // An in-place operation that modified the original since may have given it a new
+                // history, which PyTorch's message names.
+                check_version(&data, version, || {
+                    let current = original.upgrade().and_then(|t| meta::grad_fn(&t));
+                    current.or_else(|| Some((grad_fn.clone(), output_nr)))
+                });
+                meta::with_saved_history(data, grad_fn, output_nr, detached)
             }
             Some(Packed::Output {
                 data,
                 version,
                 output_nr,
             }) => {
-                let history = (owner.clone(), output_nr);
-                check_version(&data, version, Some(&history));
-                meta::with_history(data, history.0, output_nr)
+                check_version(&data, version, || Some((owner.clone(), output_nr)));
+                meta::with_history(data, owner.clone(), output_nr)
             }
+        }
+    }
+
+    /// Sets the version of a saved copy of output `output_nr` (see `NodeBuilder::refresh_output`).
+    pub(super) fn refresh_output(&mut self, nr: u32, new_version: u64) {
+        let slot = self.slot.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(Packed::Output {
+            version, output_nr, ..
+        }) = slot
+            && *output_nr == nr
+        {
+            *version = new_version;
         }
     }
 
@@ -156,11 +174,15 @@ impl SavedTensor {
 }
 
 /// Panics with PyTorch's message unless the storage of `data` is still at `version`. A tensor
-/// with a history is described as an output of the operation that computed it.
-fn check_version(data: &TensorData, version: u64, history: Option<&(NodeRef, u32)>) {
+/// with a `history` is described as an output of the operation that computed it.
+fn check_version(
+    data: &TensorData,
+    version: u64,
+    history: impl FnOnce() -> Option<(NodeRef, u32)>,
+) {
     let current = data.storage.version();
     if current != version {
-        let output = history.map_or(String::new(), |(grad_fn, output_nr)| {
+        let output = history().map_or(String::new(), |(grad_fn, output_nr)| {
             let operation = operation_name(grad_fn.name());
             format!(", which is output {output_nr} of {operation},")
         });

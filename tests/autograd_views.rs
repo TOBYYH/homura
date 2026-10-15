@@ -431,12 +431,12 @@ fn new_views_are_views_with_their_own_node() {
             v.index(Ellipsis).fill_(5.0);
         }
         assert!(x.to_vec::<f64>().iter().all(|&e| e == 5.0), "{name}");
-        // In-place operations on views that require grad are rejected until D7's second stage.
-        assert!(
+        // In-place operations on views of a leaf that requires grad are rejected, as in PyTorch.
+        assert_eq!(
             panic_message(|| {
                 v.add_(1.0);
-            })
-            .starts_with("in-place operations on a view")
+            }),
+            "a view of a leaf Variable that requires grad is being used in an in-place operation."
         );
         // Views of these views reach `x` through both nodes.
         let w = v.unsqueeze(0);

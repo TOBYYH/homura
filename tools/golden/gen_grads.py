@@ -849,6 +849,27 @@ case(
 )
 case("special.mul_", lambda x, y: x.clone().mul_(y), x=f([inf, nan, 1.0, -0.0]), y=f([0.0, 1.0, inf, 2.0]), g=f([1.0, 1.0, -inf, nan]))
 
+# ---------------------------------------------------------------- step 7b
+# Copies and fills, appended after the step 7a cases. The overwritten value gets a zero gradient,
+# also where the upstream gradient isn't finite. copy_ converts the gradient of src to its dtype
+# before summing it to its shape, so a wider src is summed in its own dtype, as in the reference.
+# uniform_ and normal_ draw other numbers than the reference, and their node is fill_'s.
+case("grad.copy_", lambda x, y: x.clone().copy_(y), x=randn(3, 4), y=randn(4))
+case("grad.copy_promote_", lambda x, y: x.clone().copy_(y), x=randn(3, 4), y=randn(3, 1, dtype=torch.float64))
+case("grad.copy_int_", lambda x, y: x.clone().copy_(y), x=randn(3, 4), y=torch.randint(-3, 4, (4,)))
+case("grad.fill_", lambda x: x.clone().fill_(2.5), x=randn(3, 4))
+case("grad.zero_", lambda x: x.clone().zero_(), x=randn(3, 4))
+# Review round 30: a wider operand broadcast over self. Its gradient is computed and summed in
+# f32, the dtype of self and of the upstream gradient, then converted: homura sums in f64 and
+# rounds once, the reference sums in f32, so the f64 gradients agree to f32 precision only.
+case("grad.mul_promote_bcast_", lambda x, y: x.clone().mul_(y), x=randn(3, 4), y=randn(4, dtype=torch.float64))
+case("grad.add_promote_bcast_", lambda x, y: x.clone().add_(y), x=randn(3, 4), y=randn(3, 1, dtype=torch.float64))
+for tag, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16)]:
+    case(f"grad_{tag}.copy_", lambda x, y: x.clone().copy_(y), x=randn(3, 4, dtype=dtype), y=randn(4))
+    case(f"grad_{tag}.copy_promote_", lambda x, y: x.clone().copy_(y), x=randn(3, 4), y=randn(3, 4, dtype=dtype))
+case("special.copy_", lambda x, y: x.clone().copy_(y), x=f([1.0, 2.0, 3.0, 4.0]), y=f([inf, nan, -0.0, 1.0]), g=f([nan, inf, -inf, -0.0]))
+case("special.fill_", lambda x: x.clone().fill_(2.5), x=f([1.0, inf, nan, -0.0]), g=f([nan, inf, -inf, 1.0]))
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 save_file(data, str(OUT), metadata=reference.metadata())
 print(f"wrote {len(data)} tensors to {OUT} ({OUT.stat().st_size} bytes)")

@@ -866,9 +866,6 @@ fn assert_rejected(target: &Tensor, message: &str, op: impl FnOnce()) {
 }
 
 const LEAF: &str = "a leaf Variable that requires grad is being used in an in-place operation.";
-const RECORDED: &str = "in-place operations that need to be recorded for autograd are not \
-                        supported yet: the tensor written to or one of the inputs requires grad; \
-                        use the out-of-place operation";
 const VIEW: &str = "in-place operations on a view are not supported yet when the view or one of \
                     the inputs requires grad; use the out-of-place operation, or deep_clone() the \
                     view first";
@@ -915,17 +912,10 @@ fn in_place_operations_on_leaves_that_require_grad_are_rejected() {
     for (_, op) in &ops {
         assert_rejected(&x, LEAF, || op(&x));
     }
-    // Copying and filling aren't recorded yet (M1 step 7b): rejected before anything is written
-    // into a non-leaf, or into a tensor that doesn't require grad from one that does. The other
-    // in-place operations are recorded, see tests/autograd_inplace.rs.
-    for (name, op) in &ops[7..12] {
-        let y = &x * 2.0;
-        assert_rejected(&y, RECORDED, || op(&y));
-        assert!(name.ends_with('_'));
-    }
-    assert_rejected(&o, RECORDED, || {
-        o.copy_(&x);
-    });
+    // Writes into non-leaves and into tensors that don't require grad are recorded, see
+    // tests/autograd_inplace.rs.
+    o.copy_(&x);
+    assert_eq!(o.grad_fn().unwrap().name(), "CopyBackwards");
 }
 
 const VIEW_OF_LEAF: &str =

@@ -2,7 +2,8 @@
 
 Each block mirrors a test there, in the same order. Where homura deliberately differs (masked_fill
 recorded as where_, homura's messages for views it doesn't support yet, mixed scalar and tensor
-clamp bounds), the PyTorch behavior is asserted and the difference is noted.
+clamp bounds, namespaces in node names), the PyTorch behavior is asserted and the difference is
+noted.
 """
 
 import math
@@ -32,6 +33,10 @@ def chain(t):
         return f.name().removeprefix("torch::autograd::") if f is not None else None
 
     return name(t.grad_fn), [name(f) for f, _ in t.grad_fn.next_functions]
+
+
+def grads_with(out, g, *inputs, **options):
+    return [t.tolist() for t in torch.autograd.grad(out, inputs, g, **options)]
 
 
 def grads(out, *inputs):
@@ -116,6 +121,19 @@ assert not d.is_contiguous() and d._base is None
 d.mul_(o)
 assert chain(d) == ("MulBackward0", [None, ACC]) and d.flatten().tolist() == [1, 3, 2, 4]
 assert torch.autograd.grad(d.sum(), [o])[0].flatten().tolist() == [1, 3, 2, 4]
+base = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+n = base.t().narrow(0, 1, 2).detach()
+w4 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+assert n._base is None and n.storage_offset() == 1
+n.add_(w4)
+n.mul_(w4)
+assert chain(n) == ("MulBackward0", ["AddBackward0", ACC])
+assert n.flatten().tolist() == [3, 14, 18, 40] and base.flatten().tolist() == [1, 3, 18, 4, 14, 40]
+assert torch.autograd.grad(n.sum(), [w4])[0].flatten().tolist() == [4, 9, 9, 14]
+v4 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+n.copy_(v4.sum(0, keepdim=True))
+assert base.flatten().tolist() == [1, 4, 4, 4, 6, 6]
+assert torch.autograd.grad(n.sum(), [v4])[0].flatten().tolist() == [2, 2, 2, 2]
 
 # mixed_dtypes_keep_the_dtype_of_self_and_return_gradients_in_their_own
 z64 = leaf(3.0, 4.0, dtype=torch.float64)
@@ -272,22 +290,195 @@ for recorded in [True, False]:
         "unsupported operation: more than one element of the written-to tensor refers to a single memory location."
     )
     assert y._version == version and y.grad_fn is grad_fn and y.tolist() == [1, 2]
+    # Copies and fills. homura's broadcast message names the tensors the other way round (M0).
+    src = torch.tensor([1.0, 2.0, 3.0], requires_grad=recorded)
+    assert message(lambda: y.copy_(src)) == "The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 0"
+    assert message(lambda: e.copy_(z if recorded else torch.ones(2))).startswith("unsupported operation: more than one element")
+    # The reference fills an expanded tensor; homura rejects every write into one (M0).
+    e.fill_(1.0)
+    target = y * 1 if recorded else y
+    assert message(lambda: target.uniform_(2.0, 1.0)) == "uniform_ expects to return a [from, to) range, but found from=2 > to=1"
+    assert y._version == version and y.grad_fn is grad_fn and y.tolist() == [1, 2]
+y = x * 1
+version, grad_fn = y._version, y.grad_fn
+with torch.no_grad():
+    assert message(lambda: y.mul_(torch.ones(2, 2))) == "output with shape [2] doesn't match the broadcast shape [2, 2]"
+    assert message(lambda: y.index_add_(0, torch.tensor([2]), torch.ones(1))) == "index out of range in self"
+    e = (x * 1).expand(2, 2).detach()
+    for op in [lambda e: e.add_(1.0), lambda e: e.copy_(z)]:
+        assert message(lambda: op(e)).startswith("unsupported operation: more than one element")
+    # The reference fills an expanded tensor; homura rejects every write into one (M0).
+    e.fill_(1.0)
+    assert message(lambda: y.copy_(torch.ones(2, device="meta"))) == "Cannot copy out of meta tensor; no data!"
+assert y._version == version and y.grad_fn is grad_fn and y.tolist() == [1, 2]
+assert message(lambda: x.uniform_(2.0, 1.0)) == LEAF
 n = torch.zeros(2, dtype=torch.int64)
 assert message(lambda: n.add_(x)) == "result type Float can't be cast to the desired output type Long"
 assert n._version == 0
 
-# copies_and_fills_are_not_recorded_yet: recorded by the reference (CopyBackwards, FillBackward2,
-# ZeroBackward0, UniformBackward0, NormalBackward0), in homura from M1 step 7b on.
-for op, node in [
-    (lambda y: y.copy_(x), "CopyBackwards"),
-    (lambda y: y.fill_(1.0), "FillBackward2"),
-    (lambda y: y.zero_(), "ZeroBackward0"),
-    (lambda y: y.uniform_(0.0, 1.0), "UniformBackward0"),
-    (lambda y: y.normal_(0.0, 1.0), "NormalBackward0"),
+# promoted_and_broadcast_operands_get_gradients_summed_where_they_were_computed (review round 30)
+e30 = 2.0**-30
+x30 = leaf(1.0, e30)
+for name, g, expected in [
+    ("add_", [1, e30], 1.0),
+    ("sub_", [1, e30], -1.0),
+    ("mul_", [1, 1], 1.0),
+    ("copy_", [1, e30], 1 + e30),
 ]:
+    o = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
+    y = x30 * 1
+    getattr(y, name)(o)
+    (go,) = torch.autograd.grad(y, [o], torch.tensor(g))
+    assert y.dtype == torch.float32 and go.dtype == torch.float64 and go.tolist() == [expected], name
+
+# ---------------------------------------------------------------- copies and fills
+# copies_and_fills_give_the_overwritten_value_a_zero_gradient. The reference names CopyBackwards
+# with its namespace, in version errors too; homura leaves it out, as for AccumulateGrad.
+x, z = leaf(1.0, 2.0), leaf(3.0, 5.0)
+overwrites = [
+    ("copy_", lambda y: y.copy_(z), "CopyBackwards", [ACC], [3, 5], [[0, 0], [1, 1]], "torch::autograd::CopyBackwards"),
+    ("copy_ self", lambda y: y.copy_(y), "CopyBackwards", [MUL], [1, 2], [[1, 1]], "torch::autograd::CopyBackwards"),
+    ("fill_", lambda y: y.fill_(7.0), "FillBackward2", [], [7, 7], [[0, 0]], "Fill2"),
+    ("zero_", lambda y: y.zero_(), "ZeroBackward0", [], [0, 0], [[0, 0]], "Zero"),
+    ("uniform_", lambda y: y.uniform_(0.0, 1.0), "UniformBackward0", [], None, [[0, 0]], "Uniform"),
+    ("normal_", lambda y: y.normal_(0.0, 1.0), "NormalBackward0", [], None, [[0, 0]], "Normal"),
+]
+for name, op, node, edges, value, expected, operation in overwrites:
     y = x * 1
+    old, version = y.grad_fn, y._version
     op(y)
-    assert chain(y)[0] == node, node
+    assert y._version == version + 1 and chain(y) == (node, [MUL, *edges]), name
+    assert y.grad_fn.next_functions[0][0] is old and y.requires_grad and not y.is_leaf, name
+    assert value is None or y.tolist() == value, name
+    if name != "copy_ self":
+        nan_inf = torch.tensor([math.nan, math.inf])
+        assert grads_with(y, nan_inf, x, retain_graph=True) == [[0, 0]], name
+    assert grads(y, *[x, z][: len(expected)]) == expected, name
+    w = y * y
+    with torch.no_grad():
+        y.add_(1.0)
+    assert message(lambda: w.sum().backward()) == version_error("[2]", f", which is output 0 of {operation},", 2, 1), name
+for name, op, *_ in overwrites:
+    b = torch.zeros(2)
+    z_plain = torch.tensor([3.0, 5.0])
+    (b.copy_(z_plain) if name == "copy_" else op(b))
+    assert b.is_leaf and not b.requires_grad, name
+
+# copy_converts_the_gradient_of_src_and_sums_it_to_its_shape
+s1 = leaf(0.5)
+y = x * 1
+y.copy_(s1)
+assert y.tolist() == [0.5, 0.5] and grads_with(y, torch.tensor([1.0, 2.0]), s1) == [[3]]
+b = torch.zeros(3, 2)
+d = leaf(1.0, 2.0, dtype=torch.float64)
+b.copy_(d)
+assert b.requires_grad and not b.is_leaf and chain(b) == ("CopyBackwards", [None, ACC])
+(gd,) = torch.autograd.grad(b.sum(), [d])
+assert gd.dtype == torch.float64 and gd.tolist() == [3, 3]
+y = x * 1
+y.copy_(torch.tensor([7, 8]))
+assert chain(y) == ("CopyBackwards", [MUL, None]) and y.tolist() == [7, 8] and grads(y, x) == [[0, 0]]
+n = torch.zeros(2, dtype=torch.int64)
+n.copy_(x)
+assert n.tolist() == [1, 2] and n.grad_fn is None and not n.requires_grad
+m = torch.zeros(2, device="meta")
+m.copy_(x)
+assert chain(m) == ("CopyBackwards", [None, ACC])
+assert message(lambda: torch.autograd.grad(m.sum(), [x])) == "Cannot copy out of meta tensor; no data!"
+mo = torch.ones(2, device="meta", requires_grad=True)
+m = torch.zeros(3, 2, device="meta")
+m.copy_(mo)
+(g,) = torch.autograd.grad(m.sum(), [mo])
+assert g.device.type == "meta" and g.shape == (2,)
+mm = torch.ones(2, device="meta", requires_grad=True)
+m = mm * 1
+m.copy_(x)
+(g,) = torch.autograd.grad(m.sum(), [mm])
+assert g.device.type == "meta" and g.shape == (2,)
+y = x * 1
+assert message(lambda: y.copy_(mo)) == "Cannot copy out of meta tensor; no data!"
+assert y._version == 0 and y.tolist() == [1, 2]
+s0 = torch.tensor(2.0, requires_grad=True)
+y = s0 * 1
+y.copy_(x.sum())
+assert grads(y, s0, x) == [0, [1, 1]]
+e = torch.zeros(0, 2, requires_grad=True)
+y = e * 1
+y.fill_(1.0)
+y.copy_(x)
+assert torch.autograd.grad(y.sum(), [e])[0].shape == (0, 2)
+
+# gradients_through_copies_and_fills_can_be_differentiated_again
+y = x * x
+y.copy_(z * z)
+gx, gz = torch.autograd.grad(y.sum(), [x, z], create_graph=True)
+assert gx.tolist() == [0, 0] and gz.tolist() == [6, 10]
+assert [t.tolist() for t in torch.autograd.grad(gz.sum(), [z], retain_graph=True)] == [[2, 2]]
+assert [t.tolist() for t in torch.autograd.grad(gx.sum(), [x], retain_graph=True)] == [[0, 0]]
+y = x * x
+y.zero_()
+assert torch.autograd.grad(y.sum(), [x], create_graph=True)[0].tolist() == [0, 0]
+y = x * 1
+y.copy_(z)
+y.mul_(z)
+assert chain(y) == ("MulBackward0", ["CopyBackwards", ACC]) and grads(y, x, z) == [[0, 0], [6, 10]]
+y = x * 2
+y.copy_(z * x)
+gy, gz = torch.autograd.grad((y * y).sum(), [y, z], create_graph=True)
+assert gy.tolist() == [6, 20] and gz.tolist() == [6, 40]
+assert [t.tolist() for t in torch.autograd.grad(gz.sum(), [y, x, z], retain_graph=True)] == [[2, 4], [12, 40], [2, 8]]
+assert [t.tolist() for t in torch.autograd.grad(gy.sum(), [x, z], retain_graph=True)] == [[6, 10], [2, 4]]
+
+# copies_and_fills_into_leaves_and_views_are_rejected: as for the other in-place operations, the
+# reference records views of non-leaves (CopySlices) and has a message of its own for views
+# created in no-grad mode; homura rejects them (D7).
+for name, op, *_ in overwrites:
+    assert message(lambda: op(x)) == LEAF, name
+    v = x.view(2)
+    assert message(lambda: op(v)) == VIEW_OF_LEAF, name
+    b = torch.zeros(2)
+    early = b.view(2)
+    b.requires_grad_()
+    assert message(lambda: op(early)) == VIEW_OF_LEAF, name
+    with torch.no_grad():
+        quiet = x.view(2)
+    assert message(lambda: op(quiet)).startswith(NO_GRAD_VIEW), name
+    y = x * 1
+    yv = y.view(2)
+    op(yv)
+    assert chain(y)[0] == "CopySlices", name
+    y = x * 1
+    with torch.no_grad():
+        quiet = y.view(2)
+    assert message(lambda: op(quiet)).startswith(NO_GRAD_VIEW), name
+    for no_grad in [False, True]:
+        b = torch.zeros(2)
+        with torch.set_grad_enabled(not no_grad):
+            own = b.view(2)
+        own.requires_grad_()
+        expected = NO_GRAD_VIEW if no_grad else VIEW_OF_LEAF
+        assert message(lambda: op(own)).startswith(expected), (name, no_grad)
+    y = x * 1
+    yv = y.view(2)
+    with torch.no_grad():
+        op(v)
+        op(yv)
+    assert chain(y) == (MUL, [ACC, None]), name
+x = leaf(1.0, 2.0)
+pv = torch.zeros(2).view(2)
+pv.copy_(x)
+assert chain(pv)[0] == "AsStridedBackward0"
+pv = torch.zeros(2).view(2)
+pv.copy_(torch.tensor([1.0, 2.0]))
+assert pv.tolist() == [1, 2]
+
+# views_of_a_copied_or_filled_tensor_are_stale: replayed by the reference, rejected by homura.
+for name, op, node, edges, value, expected, operation in overwrites:
+    y = x * 1
+    v = y.view(2)
+    op(y)
+    assert v.grad_fn.name() == "AsStridedBackward0", name
+    assert grads(y.view(2), x) == expected[:1], name
 
 # ---------------------------------------------------------------- edge cases
 # zero_dimensional_empty_and_meta_targets

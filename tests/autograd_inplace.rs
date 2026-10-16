@@ -1,7 +1,7 @@
-//! In-place operations recorded for autograd (M1 step 7a): the target becomes the output of the
+//! In-place operations recorded for autograd (M1 step 7): the target becomes the output of the
 //! operation's node, which replaces its history; the value before the write is saved where the
-//! formula needs it; leaves and views are rejected; failed calls change nothing; views of a
-//! rewritten history become stale. tools/golden/check_m1_inplace.py checks the reference
+//! formula needs it; copies and fills give the overwritten value a zero gradient; leaves and
+//! views are rejected; failed calls change nothing; views of a rewritten history become stale. tools/golden/check_m1_inplace.py checks the reference
 //! behavior that these tests encode.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -87,9 +87,6 @@ const VIEW_OF_LEAF: &str =
 const VIEW: &str = "in-place operations on a view are not supported yet when the view or one of \
                     the inputs requires grad; use the out-of-place operation, or deep_clone() the \
                     view first";
-const UNRECORDED: &str = "in-place operations that need to be recorded for autograd are not \
-                          supported yet: the tensor written to or one of the inputs requires \
-                          grad; use the out-of-place operation";
 const STALE: &str = "a view whose base was modified by an in-place operation in grad mode after \
                      the view was created can't be used for gradient computation yet; create the \
                      view again after the in-place operation";
@@ -407,6 +404,27 @@ fn tensors_that_do_not_require_grad_join_the_graph() {
     assert_eq!(chain(&d), names("MulBackward0", &[None, ACC]));
     assert_eq!(vals(&d), [1., 3., 2., 4.]);
     assert_eq!(grad_vals(&d, &[&o]), [[1., 3., 2., 4.]]);
+    // With an offset too: a narrowed transposed tensor, detached, that shares its storage.
+    let base = Tensor::from_slice(&[1.0f32, 2., 3., 4., 5., 6.], [2, 3]);
+    let n = base.transpose(0, 1).narrow(0, 1, 2).detach();
+    let w = Tensor::from_slice(&[1.0f32, 2., 3., 4.], [2, 2]);
+    w.requires_grad_(true);
+    n.add_(&w);
+    n.mul_(&w);
+    assert_eq!(
+        chain(&n),
+        names("MulBackward0", &[Some("AddBackward0"), ACC])
+    );
+    assert_eq!(vals(&n), [3., 14., 18., 40.]);
+    assert_eq!(vals(&base), [1., 3., 18., 4., 14., 40.]);
+    // d/dw of (n + w) * w = n + 2w, with n before the writes.
+    assert_eq!(grad_vals(&n, &[&w]), [[4., 9., 9., 14.]]);
+    // A fresh source: the backward pass above freed what the old history saved.
+    let v = Tensor::from_slice(&[1.0f32, 2., 3., 4.], [2, 2]);
+    v.requires_grad_(true);
+    n.copy_(&v.sum_dim(0, true));
+    assert_eq!(vals(&base), [1., 4., 4., 4., 6., 6.]);
+    assert_eq!(grad_vals(&n, &[&v]), [[2., 2., 2., 2.]]);
 }
 
 #[test]
@@ -743,6 +761,28 @@ fn failed_writes_change_nothing() {
         assert_unchanged(&e, overlap, || {
             e.add_(homura::ones([2]).mul(if state == "recorded" { &z } else { operand }));
         });
+        // Copies and fills check what their writes need, with their own rules (copy_
+        // broadcasts and converts any dtype), and the arguments of the distribution.
+        let src = t(&[1., 2., 3.]);
+        src.requires_grad_(state == "recorded");
+        let broadcast = panic_message(|| {
+            y.detach().copy_(&src);
+        });
+        assert!(broadcast.contains("must match"), "{broadcast}");
+        assert_unchanged(&y, &broadcast, || {
+            y.copy_(&src);
+        });
+        assert_unchanged(&e, overlap, || {
+            e.copy_(operand);
+        });
+        // A target that may overlap can't require grad without being a view: never recorded.
+        assert_unchanged(&e, overlap, || {
+            e.fill_(1.0);
+        });
+        let range = "uniform_ expects to return a [from, to) range, but found from=2 > to=1";
+        assert_unchanged(&y, range, || {
+            y.uniform_(2.0, 1.0);
+        });
     }
     let y = &x * 1.0;
     {
@@ -750,7 +790,31 @@ fn failed_writes_change_nothing() {
         assert_unchanged(&y, shape, || {
             y.mul_(homura::ones([2, 2]));
         });
+        // Review round 30: operator arguments and overlapping targets in no-grad mode too.
+        let message = panic_message(|| {
+            y.index_add_(0, &ints(&[2]), &homura::ones([1]));
+        });
+        assert!(message.contains(index), "{message}");
+        assert_unchanged(&y, &message, || {
+            y.index_add_(0, &ints(&[2]), &homura::ones([1]));
+        });
+        let e = (&x * 1.0).expand([2, 2]).detach();
+        for op in [
+            Box::new(|e: &Tensor| _ = e.add_(1.0)) as Box<dyn Fn(&Tensor)>,
+            Box::new(|e: &Tensor| _ = e.copy_(&z)),
+            Box::new(|e: &Tensor| _ = e.fill_(1.0)),
+        ] {
+            assert_unchanged(&e, overlap, || op(&e));
+        }
+        assert_unchanged(&y, "Cannot copy out of meta tensor; no data!", || {
+            y.copy_(&homura::ones_with([2], Device::Meta));
+        });
     }
+    // The checks of a recorded write come first: a leaf with invalid arguments is rejected as a
+    // leaf, before the generator runs.
+    assert_unchanged(&x, LEAF, || {
+        x.uniform_(2.0, 1.0);
+    });
     // Integer targets are never recorded; a float result doesn't fit.
     let n = homura::zeros_with([2], DType::I64);
     let message = "result type f32 can't be cast to the desired output type i64";
@@ -773,35 +837,371 @@ fn failed_writes_change_nothing() {
 }
 
 #[test]
-fn copies_and_fills_are_not_recorded_yet() {
-    // M1 step 7b records these; until then, writes that would need recording are rejected.
-    let x = leaf(&[1., 2.]);
+fn promoted_and_broadcast_operands_get_gradients_summed_where_they_were_computed() {
+    // Review round 30: the gradient of a wider operand that was broadcast is computed in the
+    // dtype of self and of the upstream gradient (F32), summed there, then converted, as in
+    // PyTorch: 1 + 2^-30 is rounded to 1. homura sums in f64 and rounds once, PyTorch sums in
+    // f32, so other sums may differ by an F32 rounding step, which F64 tolerances can't absorb.
+    // copy_ converts the gradient first and sums it in F64, as PyTorch does.
+    let e = 2f32.powi(-30);
+    let x = leaf(&[1., e]);
     type Op = fn(&Tensor, &Tensor);
-    let ops: [(&str, Op); 6] = [
-        ("copy_", |y, x| _ = y.copy_(x)),
-        ("copy_ self", |y, _| _ = y.copy_(y)),
-        ("fill_", |y, _| _ = y.fill_(1.0)),
-        ("zero_", |y, _| _ = y.zero_()),
-        ("uniform_", |y, _| _ = y.uniform_(0.0, 1.0)),
-        ("normal_", |y, _| _ = y.normal_(0.0, 1.0)),
+    let cases: [(&str, Op, [f32; 2], f64); 4] = [
+        ("add_", |y, o| _ = y.add_(o), [1., e], 1.0),
+        ("sub_", |y, o| _ = y.sub_(o), [1., e], -1.0),
+        ("mul_", |y, o| _ = y.mul_(o), [1., 1.], 1.0),
+        (
+            "copy_",
+            |y, o| _ = y.copy_(o),
+            [1., e],
+            1.0 + 2f64.powi(-30),
+        ),
     ];
-    for (name, op) in ops {
+    for (name, op, g, expected) in cases {
+        let o = Tensor::from_slice(&[1.0f64], [1]);
+        o.requires_grad_(true);
         let y = &x * 1.0;
-        assert_unchanged(&y, UNRECORDED, || op(&y, &x));
-        assert_eq!(y.grad_fn().unwrap().name(), "MulBackward0", "{name}");
-        // In no-grad mode, written once.
+        op(&y, &o);
+        assert_eq!(y.dtype(), DType::F32);
+        let options = GradOptions {
+            grad_outputs: vec![Some(t(&g))],
+            ..Default::default()
+        };
+        let go = autograd::grad(&[&y], &[&o], options).remove(0).unwrap();
+        assert_eq!(
+            (go.dtype(), go.to_vec::<f64>()),
+            (DType::F64, vec![expected]),
+            "{name}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- copies and fills
+
+/// The writes that replace the value of `x * 1` (with the operand `z`), with the values expected
+/// after them: the node, the edges after the one of self, the value (`None` for random values),
+/// the gradients of x and, for `copy_`, of z, and the operation that version errors name.
+struct Overwrite {
+    name: &'static str,
+    op: fn(&Tensor, &Tensor),
+    node: &'static str,
+    edges: Vec<Option<&'static str>>,
+    value: Option<Vec<f32>>,
+    grads: Vec<Vec<f32>>,
+    operation: &'static str,
+}
+
+fn overwrites() -> Vec<Overwrite> {
+    vec![
+        Overwrite {
+            name: "copy_",
+            op: |y, z| _ = y.copy_(z),
+            node: "CopyBackwards",
+            edges: vec![ACC],
+            value: Some(vec![3., 5.]),
+            grads: vec![vec![0., 0.], vec![1., 1.]],
+            operation: "CopyBackwards",
+        },
+        Overwrite {
+            name: "copy_ self",
+            op: |y, _| _ = y.copy_(y),
+            node: "CopyBackwards",
+            edges: vec![MUL],
+            value: Some(vec![1., 2.]),
+            grads: vec![vec![1., 1.]],
+            operation: "CopyBackwards",
+        },
+        Overwrite {
+            name: "fill_",
+            op: |y, _| _ = y.fill_(7.0),
+            node: "FillBackward2",
+            edges: vec![],
+            value: Some(vec![7., 7.]),
+            grads: vec![vec![0., 0.]],
+            operation: "Fill2",
+        },
+        Overwrite {
+            name: "zero_",
+            op: |y, _| _ = y.zero_(),
+            node: "ZeroBackward0",
+            edges: vec![],
+            value: Some(vec![0., 0.]),
+            grads: vec![vec![0., 0.]],
+            operation: "Zero",
+        },
+        Overwrite {
+            name: "uniform_",
+            op: |y, _| _ = y.uniform_(0.0, 1.0),
+            node: "UniformBackward0",
+            edges: vec![],
+            value: None,
+            grads: vec![vec![0., 0.]],
+            operation: "Uniform",
+        },
+        Overwrite {
+            name: "normal_",
+            op: |y, _| _ = y.normal_(0.0, 1.0),
+            node: "NormalBackward0",
+            edges: vec![],
+            value: None,
+            grads: vec![vec![0., 0.]],
+            operation: "Normal",
+        },
+    ]
+}
+
+#[test]
+fn copies_and_fills_give_the_overwritten_value_a_zero_gradient() {
+    let x = leaf(&[1., 2.]);
+    let z = leaf(&[3., 5.]);
+    for case in overwrites() {
+        let name = case.name;
+        let y = &x * 1.0;
+        let old = y.grad_fn().unwrap();
         let watch = VersionWatch::new(&y);
+        (case.op)(&y, &z);
+        assert_eq!(watch.bumps(), 1, "{name}");
+        let mut next = vec![MUL];
+        next.extend(&case.edges);
+        assert_eq!(chain(&y), names(case.node, &next), "{name}");
+        let (first, _) = y.grad_fn().unwrap().next_functions()[0].clone().unwrap();
+        assert!(first.is_same(&old), "{name}");
+        assert!(y.requires_grad() && !y.is_leaf(), "{name}");
+        if let Some(value) = &case.value {
+            assert_eq!(&vals(&y), value, "{name}");
+        }
+        // Zeros, not the upstream gradient times zero.
+        if case.name != "copy_ self" {
+            let options = GradOptions {
+                grad_outputs: vec![Some(t(&[f32::NAN, f32::INFINITY]))],
+                retain_graph: Some(true),
+                ..Default::default()
+            };
+            let g = autograd::grad(&[&y], &[&x], options).remove(0).unwrap();
+            assert_eq!(vals(&g), [0., 0.], "{name}");
+        }
+        let inputs: Vec<&Tensor> = [&x, &z][..case.grads.len()].to_vec();
+        assert_eq!(grad_vals(&y, &inputs), case.grads, "{name}");
+        // Version errors name the operation like PyTorch.
+        let w = &y * &y;
         {
             let _no_grad = homura::no_grad();
-            op(&y, &x);
+            y.add_(1.0);
         }
-        assert_eq!(watch.bumps(), 1, "{name}");
+        let output = format!(", which is output 0 of {},", case.operation);
+        assert_eq!(
+            panic_message(|| w.sum().backward()),
+            version_error("[2]", &output, 2, 1),
+            "{name}"
+        );
     }
-    let b = homura::zeros([2]);
-    assert_unchanged(&b, UNRECORDED, || {
-        b.copy_(&x);
+    // A tensor that doesn't require grad is recorded only when written from one that does.
+    for case in overwrites() {
+        let b = homura::zeros([2]);
+        (case.op)(&b, &t(&[3., 5.]));
+        assert!(b.is_leaf() && !b.requires_grad(), "{}", case.name);
+    }
+}
+
+#[test]
+fn copy_converts_the_gradient_of_src_and_sums_it_to_its_shape() {
+    let x = leaf(&[1., 2.]);
+    // Broadcast from [1]: the gradient is the sum of the upstream gradient, 3 = 1 + 2.
+    let s = leaf(&[0.5]);
+    let y = &x * 1.0;
+    y.copy_(&s);
+    assert_eq!(vals(&y), [0.5, 0.5]);
+    let options = GradOptions {
+        grad_outputs: vec![Some(t(&[1., 2.]))],
+        ..Default::default()
+    };
+    assert_eq!(
+        vals(&autograd::grad(&[&y], &[&s], options)[0].clone().unwrap()),
+        [3.]
+    );
+    // Into a tensor that doesn't require grad, from F64: the tensor joins the graph, and the
+    // gradient of src is F64.
+    let b = homura::zeros([3, 2]);
+    let d = Tensor::from_slice(&[1.0f64, 2.], [2]);
+    d.requires_grad_(true);
+    b.copy_(&d);
+    assert!(b.requires_grad() && !b.is_leaf());
+    assert_eq!(chain(&b), names("CopyBackwards", &[None, ACC]));
+    let gd = grads(&b, &[&d]).remove(0).unwrap();
+    assert_eq!((gd.dtype(), gd.to_vec::<f64>()), (DType::F64, vec![3., 3.]));
+    // An integer src has no edge. An integer target records nothing, and takes a float src.
+    let y = &x * 1.0;
+    y.copy_(&ints(&[7, 8]));
+    assert_eq!(chain(&y), names("CopyBackwards", &[MUL, None]));
+    assert_eq!(vals(&y), [7., 8.]);
+    assert_eq!(grad_vals(&y, &[&x]), [[0., 0.]]);
+    let n = homura::zeros_with([2], DType::I64);
+    n.copy_(&x);
+    assert_eq!(n.to_vec::<i64>(), [1, 2]);
+    assert!(n.grad_fn().is_none() && !n.requires_grad());
+    // On the meta device: from a CPU src, the gradient can't be brought back; from a meta src,
+    // shapes only. A meta src can't be copied into a CPU tensor.
+    let m = homura::zeros_with([2], Device::Meta);
+    m.copy_(&x);
+    assert_eq!(chain(&m), names("CopyBackwards", &[None, ACC]));
+    assert_eq!(
+        panic_message(|| drop(grads(&m, &[&x]))),
+        "Cannot copy out of meta tensor; no data!"
+    );
+    let mo = homura::ones_with([2], Device::Meta);
+    mo.requires_grad_(true);
+    let m = homura::zeros_with([3, 2], Device::Meta);
+    m.copy_(&mo);
+    let g = grads(&m, &[&mo]).remove(0).unwrap();
+    assert_eq!((g.device(), g.shape().to_vec()), (Device::Meta, vec![2]));
+    // Only the gradients that are needed are computed: through the old value of a meta target,
+    // the gradient for a CPU src isn't converted back.
+    let mm = homura::ones_with([2], Device::Meta);
+    mm.requires_grad_(true);
+    let m = &mm * 1.0;
+    m.copy_(&x);
+    let g = grads(&m, &[&mm]).remove(0).unwrap();
+    assert_eq!((g.device(), g.shape().to_vec()), (Device::Meta, vec![2]));
+    let y = &x * 1.0;
+    assert_unchanged(&y, "Cannot copy out of meta tensor; no data!", || {
+        y.copy_(&mo);
     });
-    assert!(b.is_leaf() && !b.requires_grad());
+    // Zero-dimensional and empty.
+    let s = Tensor::from_slice(&[2.0f32], []);
+    s.requires_grad_(true);
+    let y = &s * 1.0;
+    y.copy_(&x.sum());
+    assert_eq!(grad_vals(&y, &[&s, &x]), [vec![0.], vec![1., 1.]]);
+    let e = homura::zeros([0, 2]);
+    e.requires_grad_(true);
+    let y = &e * 1.0;
+    y.fill_(1.0);
+    y.copy_(&x);
+    assert_eq!(grads(&y, &[&e])[0].as_ref().unwrap().shape()[..], [0, 2]);
+}
+
+#[test]
+fn gradients_through_copies_and_fills_can_be_differentiated_again() {
+    let x = leaf(&[1., 2.]);
+    let z = leaf(&[3., 5.]);
+    let create_graph = || GradOptions {
+        create_graph: true,
+        ..Default::default()
+    };
+    // The gradients of `g.sum()`, keeping the graph for the next ones.
+    let again = |g: &Tensor, inputs: &[&Tensor]| -> Vec<Vec<f32>> {
+        let options = GradOptions {
+            retain_graph: Some(true),
+            ..Default::default()
+        };
+        let g = autograd::grad(&[&g.sum()], inputs, options);
+        g.iter().map(|g| vals(g.as_ref().unwrap())).collect()
+    };
+    let y = &x * &x;
+    y.copy_(&(&z * &z));
+    let g = autograd::grad(&[&y.sum()], &[&x, &z], create_graph());
+    let (gx, gz) = (g[0].as_ref().unwrap(), g[1].as_ref().unwrap());
+    assert_eq!((vals(gx), vals(gz)), (vec![0., 0.], vec![6., 10.]));
+    assert_eq!(again(gz, &[&z]), [[2., 2.]]);
+    assert_eq!(again(gx, &[&x]), [[0., 0.]]);
+    let y = &x * &x;
+    y.zero_();
+    let gx = autograd::grad(&[&y.sum()], &[&x], create_graph()).remove(0);
+    assert_eq!(vals(&gx.unwrap()), [0., 0.]);
+    // Chained with a recorded write.
+    let y = &x * 1.0;
+    y.copy_(&z);
+    y.mul_(&z);
+    assert_eq!(
+        chain(&y),
+        names("MulBackward0", &[Some("CopyBackwards"), ACC])
+    );
+    assert_eq!(grad_vals(&y, &[&x, &z]), [[0., 0.], [6., 10.]]);
+    // Second derivatives with respect to the target after the write, an intermediate result
+    // (review round 30): out = sum(y^2) with y = z * x, so d(out)/dz = 2 y x, whose derivatives
+    // are 2x for y, 2y + 2xz for x and 2x^2 for z.
+    let y = &x * 2.0;
+    y.copy_(&(&z * &x));
+    let out = (&y * &y).sum();
+    let g = autograd::grad(&[&out], &[&y, &z], create_graph());
+    let (gy, gz) = (g[0].as_ref().unwrap(), g[1].as_ref().unwrap());
+    assert_eq!((vals(gy), vals(gz)), (vec![6., 20.], vec![6., 40.]));
+    assert_eq!(
+        again(gz, &[&y, &x, &z]),
+        [vec![2., 4.], vec![12., 40.], vec![2., 8.]]
+    );
+    assert_eq!(again(gy, &[&x, &z]), [[6., 10.], [2., 4.]]);
+}
+
+#[test]
+fn copies_and_fills_into_leaves_and_views_are_rejected() {
+    let x = leaf(&[1., 2.]);
+    let z = leaf(&[3., 5.]);
+    for case in overwrites() {
+        let op = |t: &Tensor| (case.op)(t, &z);
+        assert_unchanged(&x, LEAF, || op(&x));
+        // Views of a leaf: created in grad mode, before the leaf required grad, in no-grad mode.
+        let v = x.view([2]);
+        assert_unchanged(&v, VIEW_OF_LEAF, || op(&v));
+        let b = homura::zeros([2]);
+        let early = b.view([2]);
+        b.requires_grad_(true);
+        assert_unchanged(&early, VIEW_OF_LEAF, || op(&early));
+        let quiet = {
+            let _no_grad = homura::no_grad();
+            x.view([2])
+        };
+        assert_unchanged(&quiet, VIEW_OF_LEAF, || op(&quiet));
+        // Views of a non-leaf, in grad and no-grad mode, and with their own flag set.
+        let y = &x * 1.0;
+        let yv = y.view([2]);
+        assert_unchanged(&yv, VIEW, || op(&yv));
+        let quiet = {
+            let _no_grad = homura::no_grad();
+            y.view([2])
+        };
+        assert_unchanged(&quiet, VIEW, || op(&quiet));
+        for no_grad in [false, true] {
+            let b = homura::zeros([2]);
+            let own = {
+                let _mode = homura::set_grad_enabled(!no_grad);
+                b.view([2])
+            };
+            own.requires_grad_(true);
+            assert_unchanged(&own, VIEW, || op(&own));
+        }
+        // In no-grad mode, written.
+        {
+            let _no_grad = homura::no_grad();
+            op(&v);
+            op(&yv);
+        }
+        assert_eq!(chain(&y), names("MulBackward0", &[ACC, None]));
+    }
+    // A view of a tensor that doesn't require grad, written from one that does.
+    let pv = homura::zeros([2]).view([2]);
+    assert_unchanged(&pv, VIEW, || {
+        pv.copy_(&x);
+    });
+    pv.copy_(&t(&[1., 2.]));
+    assert_eq!(vals(&pv), [1., 2.]);
+}
+
+#[test]
+fn views_of_a_copied_or_filled_tensor_are_stale() {
+    let x = leaf(&[1., 2.]);
+    let z = leaf(&[3., 5.]);
+    for case in overwrites() {
+        let name = case.name;
+        let y = &x * 1.0;
+        let v = y.view([2]);
+        (case.op)(&y, &z);
+        assert_eq!(panic_message(|| drop(&v * 2.0)), STALE, "{name}");
+        assert_eq!(panic_message(|| drop(v.grad_fn())), STALE, "{name}");
+        assert_eq!(panic_message(|| drop(grads(&y, &[&v]))), STALE, "{name}");
+        let fresh = y.view([2]);
+        assert_eq!(grad_vals(&fresh, &[&x]), case.grads[..1], "{name}");
+    }
 }
 
 // ---------------------------------------------------------------- edge cases
@@ -874,6 +1274,32 @@ fn in_place_operations_inside_functions_pass_gradcheck() {
         vec![p, y]
     };
     let inputs = [&x, &z, &w, &s];
+    gradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
+    gradgradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
+    // sub_ after a node that saves no output (review round 30), copies (broadcast, into a
+    // tensor that doesn't require grad, of self) and fills.
+    let f = |t: &[Tensor]| {
+        let (x, z, w) = (&t[0], &t[1], &t[2]);
+        let y = x * x;
+        y.sub_(z);
+        y.sub_(&(w * 2.0));
+        let c = homura::zeros_with([2, 3], DType::F64);
+        c.copy_(z);
+        c.mul_(&y);
+        c.copy_(&c);
+        let d = x * w;
+        d.zero_();
+        d.add_(&c);
+        let e = y.sin();
+        e.fill_(1.5);
+        e.mul_(z);
+        // cos saves its input, not its result, which the writes replace.
+        let r = x.cos();
+        r.uniform_(0.0, 1.0);
+        r.copy_(&(&y * w).sum_dim(0, true));
+        vec![d, e, r]
+    };
+    let inputs = [&x, &z, &w];
     gradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
     gradgradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
 }

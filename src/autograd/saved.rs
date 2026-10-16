@@ -195,14 +195,17 @@ fn check_version(
     }
 }
 
-/// The name PyTorch's messages give the operation that a node belongs to: the node's name
-/// without `Backward` and a version number of 0, such as `Mul` for `MulBackward0` and `Sum1`
-/// for `SumBackward1`.
+/// The name PyTorch's messages give the operation that a node belongs to: the name of a node
+/// generated from a formula without `Backward` and a version number of 0, such as `Mul` for
+/// `MulBackward0` and `Sum1` for `SumBackward1`; other names, such as `CopyBackwards`, as they
+/// are.
 fn operation_name(node: &str) -> String {
     match node.rsplit_once("Backward") {
         Some((operation, "0")) => operation.to_string(),
-        Some((operation, version)) => format!("{operation}{version}"),
-        None => node.to_string(),
+        Some((operation, version)) if version.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{operation}{version}")
+        }
+        _ => node.to_string(),
     }
 }
 
@@ -213,6 +216,8 @@ mod tests {
         for (node, operation) in [
             ("MulBackward0", "Mul"),
             ("SumBackward1", "Sum1"),
+            ("FillBackward2", "Fill2"),
+            ("CopyBackwards", "CopyBackwards"),
             ("AccumulateGrad", "AccumulateGrad"),
         ] {
             assert_eq!(super::operation_name(node), operation);

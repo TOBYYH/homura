@@ -9,6 +9,7 @@ mod addc;
 mod binary;
 mod clamp;
 mod index;
+mod inplace;
 mod lerp;
 mod matmul;
 mod misc;
@@ -25,6 +26,7 @@ pub(crate) use clamp::clamp;
 pub(crate) use index::{
     gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
 };
+pub(crate) use inplace::{copy, overwrite};
 pub(crate) use lerp::lerp;
 pub(crate) use matmul::{ScaledProduct, matmul, scaled_product};
 pub(crate) use misc::{deep_clone, to_copy};

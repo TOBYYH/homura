@@ -45,8 +45,11 @@
 //! out-of-place operation, with the target as its output: the target gets the operation's node
 //! as its new history, whose first edge leads to the old one, as in PyTorch. A formula that needs
 //! the target's value from before the write (`mul_` for the other factor's gradient, `pow_`,
-//! `clamp_`, `lerp_` with a tensor weight) saves a copy of it, with its old history. A tensor
-//! that doesn't require grad becomes part of the graph when it is written from one that does.
+//! `clamp_`, `lerp_` with a tensor weight) saves a copy of it, with its old history. Writes that
+//! replace the value give the old value a zero gradient, as in PyTorch: `copy_` (recorded as
+//! `CopyBackwards`, which gives `src` the gradient converted to its dtype and summed to its
+//! shape), `fill_`, `zero_`, `uniform_` and `normal_`. A tensor that doesn't require grad
+//! becomes part of the graph when it is written from one that does.
 //!
 //! ```
 //! let x = homura::tensor([1.0, 2.0]);
@@ -60,9 +63,9 @@
 //!
 //! Recorded writes are rejected before anything is written, so that the data, version and
 //! history of the target don't change: on a leaf that requires grad and on a view of one, with
-//! PyTorch's errors, and on any other view, which homura doesn't support yet. `copy_`, `fill_`,
-//! `zero_`, `uniform_` and `normal_` can't be recorded yet either. In no-grad mode every in-place
-//! operation is allowed, which is how optimizers update parameters; the history doesn't change.
+//! PyTorch's errors, and on any other view, which homura doesn't support yet. In no-grad mode
+//! every in-place operation is allowed, which is how optimizers update parameters; the history
+//! doesn't change.
 //!
 //! Every in-place operation bumps the version of the target's storage once. A backward pass that
 //! needs a tensor saved before a write panics with PyTorch's error, naming the tensor's current
@@ -145,9 +148,7 @@ mod saved;
 pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
 pub(crate) use meta::{AutogradMeta, ViewInfo, view_of};
 pub use node::GradFn;
-pub(crate) use record::{
-    check_in_place, check_unrecorded_in_place, original_value, record_in_place,
-};
+pub(crate) use record::{check_in_place, original_value, record_in_place};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };

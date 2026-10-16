@@ -219,12 +219,11 @@ impl Tensor {
     /// 2. `compute` runs the out-of-place operation in no-grad mode, which checks the arguments.
     ///    It returns the result and whatever else `record` needs from the computation.
     /// 3. The result has to fit `self`, see [`check_result`](Tensor::check_result).
-    /// 4. Unless the write is recorded, the result is written into `self`. Otherwise `record`
-    ///    records the operation's node with `self` as its output and `original` in the place of
-    ///    `self` as an input, and the write happens in that recording (see
-    ///    [`record_in_place`](crate::autograd::record_in_place)). With `saves_self`, which must
-    ///    hold whenever the operation's formula saves that input, `original` is the value of
-    ///    `self` before the write, with its history; otherwise it is `self`.
+    /// 4. The result is written into `self` by [`write_in_place`](Tensor::write_in_place),
+    ///    where `record` records the operation's node with `self` as its output and `original`
+    ///    in the place of `self` as an input. With `saves_self`, which must hold whenever the
+    ///    operation's formula saves that input, `original` is the value of `self` before the
+    ///    write, with its history; otherwise it is `self`.
     ///
     /// Every check runs before the write, so a call that panics changes neither the data, the
     /// version nor the history of `self`. The version is bumped exactly once.
@@ -241,19 +240,38 @@ impl Tensor {
             compute()
         };
         self.check_result(&result);
-        if !recorded {
-            self.write_copy(&result);
-            return self;
-        }
-        let original = if saves_self {
-            crate::autograd::original_value(self)
-        } else {
-            self.clone()
-        };
         let target = self.clone();
-        let write = Box::new(move || target.write_copy(&result));
-        crate::autograd::record_in_place(self, write, || record(&original, computed));
+        self.write_in_place(
+            recorded,
+            move || target.write_copy(&result),
+            || {
+                let original = if saves_self {
+                    crate::autograd::original_value(self)
+                } else {
+                    self.clone()
+                };
+                record(&original, computed);
+            },
+        );
         self
+    }
+
+    /// The last step of every in-place operation, after its checks: runs `write`, which must be
+    /// unable to fail, on its own, or, if the write is `recorded` (as
+    /// [`check_in_place`](crate::autograd::check_in_place) tells), inside the recording of the
+    /// node that `record` records with `self` as its output (see
+    /// [`record_in_place`](crate::autograd::record_in_place)).
+    pub(crate) fn write_in_place(
+        &self,
+        recorded: bool,
+        write: impl FnOnce() + 'static,
+        record: impl FnOnce(),
+    ) {
+        if recorded {
+            crate::autograd::record_in_place(self, Box::new(write), record);
+        } else {
+            write();
+        }
     }
 
     /// Checks that the result of an in-place operation can be written into `self` with

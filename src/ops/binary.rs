@@ -400,28 +400,52 @@ impl Tensor {
 
     /// Copies the elements of `src` into `self`, broadcasting `src` and converting its dtype.
     ///
+    /// In grad mode, a copy into a floating point tensor is recorded when `self` or `src`
+    /// requires grad (PyTorch's `CopyBackwards`): the old value of `self` gets a zero gradient
+    /// and `src` the gradient of `self`, converted to its dtype and summed to its shape.
+    ///
     /// # Panics
     ///
-    /// Panics if `src` can't be broadcast to the shape of `self`, if the elements of `self` can't
-    /// be proven to occupy distinct memory (an expanded tensor, for example), or if `src` is a
-    /// meta tensor and `self` is not.
+    /// Panics if the copy would have to be recorded into a leaf that requires grad or into a
+    /// view (see [the in-place rules](crate::autograd#in-place-operations)), if `src` can't be
+    /// broadcast to the shape of `self`, if the elements of `self` can't be proven to occupy
+    /// distinct memory (an expanded tensor, for example), or if `src` is a meta tensor and
+    /// `self` is not.
     pub fn copy_(&self, src: &Tensor) -> &Self {
-        crate::autograd::check_unrecorded_in_place(self, &[Some(src)]);
-        self.write_copy(src);
+        let recorded = crate::autograd::check_in_place(self, &[Some(src)]);
+        self.check_copy(src);
+        let (target, s) = (self.clone(), src.clone());
+        self.write_in_place(
+            recorded,
+            move || target.write_copy(&s),
+            || crate::autograd::formulas::copy(self, src),
+        );
         self
     }
 
     /// Sets every element to `value`.
+    ///
+    /// In grad mode, the write into a floating point tensor that requires grad is recorded
+    /// (`FillBackward2`), giving the old value a zero gradient.
     pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
-        crate::autograd::check_unrecorded_in_place(self, &[]);
-        self.write_fill(value.into());
-        self
+        self.overwrite_(value.into(), "FillBackward2")
     }
 
-    /// Sets every element to zero.
+    /// Sets every element to zero. Recorded like [`fill_`](Tensor::fill_), as `ZeroBackward0`.
     pub fn zero_(&self) -> &Self {
-        crate::autograd::check_unrecorded_in_place(self, &[]);
-        self.write_fill(0.into());
+        self.overwrite_(0.into(), "ZeroBackward0")
+    }
+
+    /// `fill_` recorded as node `name`.
+    fn overwrite_(&self, value: Scalar, name: &'static str) -> &Self {
+        let recorded = crate::autograd::check_in_place(self, &[]);
+        check_writable(&self.data());
+        let target = self.clone();
+        self.write_in_place(
+            recorded,
+            move || target.write_fill(value),
+            || crate::autograd::formulas::overwrite(self, name),
+        );
         self
     }
 
@@ -432,28 +456,37 @@ impl Tensor {
     /// [`write_fill`](Tensor::write_fill), exactly once, and never through another public
     /// in-place operation.
     pub(crate) fn write_copy(&self, src: &Tensor) {
+        let (dst, mut s) = self.check_copy(src);
+        if dst.device() == Device::Meta {
+            dst.storage.bump_version();
+            return;
+        }
+        if dst.partially_overlaps(&s) {
+            s = clone_data(&s);
+        }
+        // The version changes in the same critical section as the data.
+        cpu::exec(|| {
+            cpu::copy(&dst, &s);
+            dst.storage.bump_version();
+        });
+    }
+
+    /// The checks of [`write_copy`](Tensor::write_copy), which can't fail once they pass:
+    /// `self` is writable, `src` broadcasts to it, and the devices allow the copy. These are
+    /// not the checks of the other in-place operations' results: any dtype may be copied.
+    /// Returns the data of `self` and of `src`.
+    fn check_copy(&self, src: &Tensor) -> (TensorData, TensorData) {
         let dst = self.data();
-        let mut s = src.data();
+        let s = src.data();
         check_writable(&dst);
         // Checks that `src` broadcasts to `self`.
         s.layout.expand_to(&dst.layout.shape);
         match (dst.device(), s.device()) {
-            (Device::Meta, _) => {}
-            (Device::Cpu, Device::Cpu) => {
-                if dst.partially_overlaps(&s) {
-                    s = clone_data(&s);
-                }
-                // The version changes in the same critical section as the data.
-                cpu::exec(|| {
-                    cpu::copy(&dst, &s);
-                    dst.storage.bump_version();
-                });
-                return;
-            }
+            (Device::Meta, _) | (Device::Cpu, Device::Cpu) => {}
             (_, Device::Meta) => panic!("Cannot copy out of meta tensor; no data!"),
             (d, sd) => panic!("copy from {sd} to {d} is not supported"),
         }
-        dst.storage.bump_version();
+        (dst, s)
     }
 
     /// The data half of [`fill_`](Tensor::fill_), see [`write_copy`](Tensor::write_copy).

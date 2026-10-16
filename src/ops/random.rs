@@ -336,33 +336,33 @@ pub fn randn_like(t: &Tensor) -> Tensor {
 impl Tensor {
     /// Fills `self` with uniform samples from `[from, to)`.
     ///
+    /// In grad mode, the write into a floating point tensor that requires grad is recorded
+    /// (`UniformBackward0`), giving the old value a zero gradient.
+    ///
     /// # Panics
     ///
     /// Panics if `from > to`, or if `from`, `to` or `to - from` is not a finite value of the dtype
     /// of `self`, as PyTorch does.
     pub fn uniform_(&self, from: f64, to: f64) -> &Self {
-        crate::autograd::check_unrecorded_in_place(self, &[]);
-        let r = random_tensor(
-            self.shape(),
-            self.dtype(),
-            self.device(),
-            Dist::Uniform(from, to),
-        );
-        self.write_copy(&r);
-        self
+        self.sample_(Dist::Uniform(from, to), "UniformBackward0")
     }
 
-    /// Fills `self` with samples from a normal distribution.
+    /// Fills `self` with samples from a normal distribution. Recorded like
+    /// [`uniform_`](Tensor::uniform_), as `NormalBackward0`.
     pub fn normal_(&self, mean: f64, std: f64) -> &Self {
-        crate::autograd::check_unrecorded_in_place(self, &[]);
-        let r = random_tensor(
-            self.shape(),
-            self.dtype(),
-            self.device(),
-            Dist::Normal(mean, std),
-        );
-        self.write_copy(&r);
-        self
+        self.sample_(Dist::Normal(mean, std), "NormalBackward0")
+    }
+
+    /// Fills `self` with samples from `dist`, recorded as node `name`. The arguments are checked,
+    /// and the generator advanced, only once autograd allows the write.
+    fn sample_(&self, dist: Dist, name: &'static str) -> &Self {
+        let compute = || {
+            let r = random_tensor(self.shape(), self.dtype(), self.device(), dist);
+            (r, ())
+        };
+        self.in_place(&[], false, compute, |original, ()| {
+            crate::autograd::formulas::overwrite(original, name)
+        })
     }
 }
 

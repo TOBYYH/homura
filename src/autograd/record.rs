@@ -182,22 +182,6 @@ pub(crate) fn check_in_place(target: &Tensor, inputs: &[Option<&Tensor>]) -> boo
     true
 }
 
-/// [`check_in_place`] for the in-place operations that can't be recorded yet: those that would
-/// have to be recorded panic too, before anything is written.
-///
-/// # Panics
-///
-/// Panics where [`check_in_place`] does, and where it returns true.
-pub(crate) fn check_unrecorded_in_place(target: &Tensor, inputs: &[Option<&Tensor>]) {
-    if check_in_place(target, inputs) {
-        panic!(
-            "in-place operations that need to be recorded for autograd are not supported yet: \
-             the tensor written to or one of the inputs requires grad; use the out-of-place \
-             operation"
-        );
-    }
-}
-
 fn has_own_flag(t: &Tensor) -> bool {
     t.autograd_meta().as_ref().is_some_and(|m| m.requires_grad)
 }

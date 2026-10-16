@@ -189,6 +189,11 @@ fn forward(op: &str, t: &BTreeMap<String, Tensor>) -> Option<Tensor> {
         "chain_" => in_place(x(), |c| {
             c.add_(y()).mul_(y()).div_(y().exp()).pow_(2.0);
         }),
+        "mul_promote_bcast_" => in_place(x(), |c| _ = c.mul_(y())),
+        "add_promote_bcast_" => in_place(x(), |c| _ = c.add_(y())),
+        "copy_" | "copy_promote_" | "copy_int_" => in_place(x(), |c| _ = c.copy_(y())),
+        "fill_" => in_place(x(), |c| _ = c.fill_(2.5)),
+        "zero_" => in_place(x(), |c| _ = c.zero_()),
         _ => return None,
     })
 }
@@ -230,10 +235,13 @@ fn run(c: &Case) -> bool {
         match grad {
             Some(grad) if stored.contains(&key) => {
                 // f32 within atol = rtol = 1e-5, half precision within the dtype's precision,
-                // and non-finite cases exactly.
+                // and non-finite cases exactly. The f64 gradients of wider operands broadcast
+                // over self are summed in f32 (by the reference, while homura sums in f64 and
+                // rounds once), so they agree to f32 precision.
                 let (rtol, atol) = match (category, grad.dtype()) {
                     ("special", _) => (0.0, 0.0),
                     (_, DType::F32) => (1e-5, 1e-5),
+                    _ if op.ends_with("_bcast_") => (1e-5, 1e-5),
                     (_, dtype) => tolerance(dtype),
                 };
                 c.check_with(&key, &grad, |a, e| {
@@ -251,7 +259,7 @@ fn run(c: &Case) -> bool {
 fn gradients_match_pytorch() {
     let golden = Golden::load("grads.safetensors");
     let cases = golden.cases();
-    assert!(cases.len() >= 340, "only {} cases", cases.len());
+    assert!(cases.len() >= 350, "only {} cases", cases.len());
     let mut missing = vec![];
     for name in &cases {
         let c = Case::new(&golden, name);

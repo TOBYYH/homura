@@ -1066,6 +1066,22 @@ fn copy_converts_the_gradient_of_src_and_sums_it_to_its_shape() {
     assert_unchanged(&y, "Cannot copy out of meta tensor; no data!", || {
         y.copy_(&mo);
     });
+    // A narrower src too: the gradient is rounded to its dtype before the sum (review round
+    // 31), so 70000 and -70000 become infinities of opposite signs in F16 and give NaN, as in
+    // PyTorch, while the old value gets zeros.
+    let h = Tensor::from_slice(&[0.5f32], [1]).to(DType::F16);
+    h.requires_grad_(true);
+    let y = &x * 1.0;
+    y.copy_(&h);
+    let options = GradOptions {
+        grad_outputs: vec![Some(t(&[70000., -70000.]))],
+        ..Default::default()
+    };
+    let g = autograd::grad(&[&y], &[&x, &h], options);
+    let (gx, gh) = (g[0].as_ref().unwrap(), g[1].as_ref().unwrap());
+    assert_eq!(vals(gx), [0., 0.]);
+    assert_eq!(gh.dtype(), DType::F16);
+    assert!(vals(gh)[0].is_nan());
     // Zero-dimensional and empty.
     let s = Tensor::from_slice(&[2.0f32], []);
     s.requires_grad_(true);

@@ -398,6 +398,11 @@ assert g.device.type == "meta" and g.shape == (2,)
 y = x * 1
 assert message(lambda: y.copy_(mo)) == "Cannot copy out of meta tensor; no data!"
 assert y._version == 0 and y.tolist() == [1, 2]
+h = torch.tensor([0.5], dtype=torch.float16, requires_grad=True)
+y = x * 1
+y.copy_(h)
+gx, gh = torch.autograd.grad(y, [x, h], torch.tensor([70000.0, -70000.0]))
+assert gx.tolist() == [0, 0] and gh.dtype == torch.float16 and math.isnan(gh.item())
 s0 = torch.tensor(2.0, requires_grad=True)
 y = s0 * 1
 y.copy_(x.sum())
@@ -529,5 +534,25 @@ w3.add_(z)
 assert not w3.is_leaf and w3.requires_grad
 assert message(lambda: out.backward()) == "leaf variable has been moved into the graph interior"
 assert grads(w3, z) == [[1, 1]]
+
+# tests/random.rs, rejected_fills_leave_the_generator_alone (review round 31, R42): rejected
+# random fills leave the generator state unchanged; invalid arguments come before the overlap,
+# autograd's errors before both.
+for fill, invalid, invalid_message in [
+    (lambda t: t.uniform_(0.0, 1.0), lambda t: t.uniform_(2.0, 1.0), "uniform_ expects to return a [from, to) range, but found from=2 > to=1"),
+    (lambda t: t.normal_(0.0, 1.0), lambda t: t.normal_(0.0, -1.0), "normal expects std >= 0.0, but found std -1"),
+]:
+    for no_grad in [False, True]:
+        with torch.set_grad_enabled(not no_grad):
+            for target in [torch.ones(1).expand(4), torch.ones(1).expand(4).detach()]:
+                state = torch.get_rng_state()
+                assert message(lambda: fill(target)).startswith("unsupported operation: more than one element")
+                assert message(lambda: invalid(target)) == invalid_message
+                assert torch.equal(torch.get_rng_state(), state) and target.tolist() == [1, 1, 1, 1]
+    xl = torch.ones(4, requires_grad=True)
+    state = torch.get_rng_state()
+    assert message(lambda: fill(xl)) == LEAF and message(lambda: xl.uniform_(2.0, 1.0)) == LEAF
+    assert message(lambda: fill(xl.view(4))) == VIEW_OF_LEAF
+    assert torch.equal(torch.get_rng_state(), state)
 
 print("check_m1_inplace: all reference checks passed")

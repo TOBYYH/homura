@@ -205,6 +205,10 @@ fn in_place(x: &Tensor, f: impl FnOnce(&Tensor)) -> Tensor {
     c
 }
 
+/// Cases whose f64 operand `y` is broadcast over an f32 self, so that its gradient is summed in
+/// f32 before it is converted.
+const SUMMED_IN_F32: [&str; 2] = ["mul_promote_bcast_", "add_promote_bcast_"];
+
 /// Runs one case and checks its gradients. Returns `false` if there is no handler for it.
 fn run(c: &Case) -> bool {
     let (category, op) = c.name.split_once('.').unwrap();
@@ -235,13 +239,15 @@ fn run(c: &Case) -> bool {
         match grad {
             Some(grad) if stored.contains(&key) => {
                 // f32 within atol = rtol = 1e-5, half precision within the dtype's precision,
-                // and non-finite cases exactly. The f64 gradients of wider operands broadcast
-                // over self are summed in f32 (by the reference, while homura sums in f64 and
-                // rounds once), so they agree to f32 precision.
+                // and non-finite cases exactly. The f64 gradient of the wider operand y broadcast
+                // over self in SUMMED_IN_F32 is summed in f32 (by the reference, while homura
+                // sums in f64 and rounds once), so it agrees to f32 precision.
                 let (rtol, atol) = match (category, grad.dtype()) {
                     ("special", _) => (0.0, 0.0),
                     (_, DType::F32) => (1e-5, 1e-5),
-                    _ if op.ends_with("_bcast_") => (1e-5, 1e-5),
+                    (_, DType::F64) if SUMMED_IN_F32.contains(&op) && name.as_str() == "y" => {
+                        (1e-5, 1e-5)
+                    }
                     (_, dtype) => tolerance(dtype),
                 };
                 c.check_with(&key, &grad, |a, e| {

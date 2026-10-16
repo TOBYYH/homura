@@ -353,16 +353,21 @@ impl Tensor {
         self.sample_(Dist::Normal(mean, std), "NormalBackward0")
     }
 
-    /// Fills `self` with samples from `dist`, recorded as node `name`. The arguments are checked,
-    /// and the generator advanced, only once autograd allows the write.
+    /// Fills `self` with samples from `dist`, recorded as node `name`. Every check runs before
+    /// the generator advances, so a rejected call leaves the random sequence unchanged too:
+    /// autograd's, then the arguments, then whether `self` can be written.
     fn sample_(&self, dist: Dist, name: &'static str) -> &Self {
-        let compute = || {
-            let r = random_tensor(self.shape(), self.dtype(), self.device(), dist);
-            (r, ())
-        };
-        self.in_place(&[], false, compute, |original, ()| {
-            crate::autograd::formulas::overwrite(original, name)
-        })
+        let recorded = crate::autograd::check_in_place(self, &[]);
+        dist.validate(self.dtype());
+        super::binary::check_writable(&self.data());
+        let r = random_tensor(self.shape(), self.dtype(), self.device(), dist);
+        let target = self.clone();
+        self.write_in_place(
+            recorded,
+            move || target.write_copy(&r),
+            || crate::autograd::formulas::overwrite(self, name),
+        );
+        self
     }
 }
 

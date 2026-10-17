@@ -1150,6 +1150,40 @@ fn gradients_through_copies_and_fills_can_be_differentiated_again() {
 }
 
 #[test]
+fn overwritten_values_get_zero_gradients_under_create_graph() {
+    // R43: checked directly, since a later overwrite would give these nodes a zero gradient
+    // anyway. With a differentiable upstream gradient u and create_graph, the gradient of
+    // y = x * x through the write is zero (connected to x through MulBackward0), and its own
+    // gradient is zero for x and doesn't depend on u. Random values don't matter.
+    let z = leaf(&[3., 5.]);
+    for case in overwrites() {
+        let name = case.name;
+        if name == "copy_ self" {
+            continue;
+        }
+        let x = leaf(&[0.5, -1.25]);
+        let u = leaf(&[1., -0.5]);
+        let y = &x * &x;
+        (case.op)(&y, &z);
+        let options = GradOptions {
+            grad_outputs: vec![Some(u.clone())],
+            create_graph: true,
+            ..Default::default()
+        };
+        let g = autograd::grad(&[&y], &[&x], options).remove(0).unwrap();
+        assert_eq!(vals(&g), [0., 0.], "{name}");
+        assert!(g.requires_grad(), "{name}");
+        let options = GradOptions {
+            allow_unused: true,
+            ..Default::default()
+        };
+        let again = autograd::grad(&[&g.sum()], &[&x, &u], options);
+        assert_eq!(vals(again[0].as_ref().unwrap()), [0., 0.], "{name}");
+        assert!(again[1].is_none(), "{name}");
+    }
+}
+
+#[test]
 fn copies_and_fills_into_leaves_and_views_are_rejected() {
     let x = leaf(&[1., 2.]);
     let z = leaf(&[3., 5.]);

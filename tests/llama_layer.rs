@@ -146,5 +146,8 @@ fn llama_decoder_layer_backward_from_meta_to_cpu_leaves_fails() {
         panic_message(|| f.out.sum().backward()),
         "Cannot copy out of meta tensor; no data!"
     );
-    assert!(x.grad().is_none());
+    // The pass fails before any accumulator runs: no leaf has a gradient.
+    for t in std::iter::once(&x).chain(layer.weights()) {
+        assert!(t.grad().is_none());
+    }
 }

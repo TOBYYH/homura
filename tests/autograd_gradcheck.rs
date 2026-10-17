@@ -673,3 +673,23 @@ fn empty_inputs_get_zero_gradients_of_their_shape() {
         }
     }
 }
+
+#[test]
+fn empty_pieces_of_split_with_sizes_get_zero_gradients() {
+    // Round 36: an empty piece has no Jacobian entries for the checks above to compare.
+    for device in [Device::Cpu, Device::Meta] {
+        let x = homura::ones_with([2, 3], (DType::F64, device));
+        x.requires_grad_(true);
+        let pieces = x.split_with_sizes(&[1, 0, 2], -1);
+        assert_eq!(pieces[1].shape(), [2, 0]);
+        let g = autograd::grad(&[&pieces[1].sum()], &[&x], GradOptions::default())
+            .remove(0)
+            .unwrap();
+        assert_eq!(g.shape(), [2, 3]);
+        assert_eq!(g.dtype(), DType::F64);
+        assert_eq!(g.device(), device);
+        if device == Device::Cpu {
+            assert_eq!(g.to_vec::<f64>(), [0.0; 6]);
+        }
+    }
+}

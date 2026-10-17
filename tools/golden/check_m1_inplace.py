@@ -434,6 +434,22 @@ assert gy.tolist() == [6, 20] and gz.tolist() == [6, 40]
 assert [t.tolist() for t in torch.autograd.grad(gz.sum(), [y, x, z], retain_graph=True)] == [[2, 4], [12, 40], [2, 8]]
 assert [t.tolist() for t in torch.autograd.grad(gy.sum(), [x, z], retain_graph=True)] == [[6, 10], [2, 4]]
 
+# overwritten_values_get_zero_gradients_under_create_graph (R43): with a differentiable upstream
+# gradient, the gradient through each overwrite is zero (connected to x), and its own gradient is
+# zero for x and unused for u.
+for name, op, *_ in overwrites:
+    if name == "copy_ self":
+        continue
+    x = leaf(0.5, -1.25)
+    u = leaf(1.0, -0.5)
+    y = x * x
+    op(y)
+    (g,) = torch.autograd.grad(y, [x], u, create_graph=True)
+    assert g.tolist() == [0, 0] and g.requires_grad, name
+    gx, gu = torch.autograd.grad(g.sum(), [x, u], allow_unused=True)
+    assert gx.tolist() == [0, 0] and gu is None, name
+x, z = leaf(1.0, 2.0), leaf(3.0, 5.0)
+
 # copies_and_fills_into_leaves_and_views_are_rejected: as for the other in-place operations, the
 # reference records views of non-leaves (CopySlices) and has a message of its own for views
 # created in no-grad mode; homura rejects them (D7).

@@ -31,3 +31,17 @@ jobs:
         run: cargo +stable test --workspace --release --locked
       - name: Documentation
         run: cargo +stable doc --workspace --no-deps --locked
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88 --profile minimal
+      - name: Check
+        run: cargo +1.88 check --workspace --all-targets --locked

@@ -2,6 +2,7 @@
 name = "homura"
 version = "0.1.1"
 edition = "2024"
+rust-version.workspace = true
 description = "A PyTorch-like tensor computing framework in Rust, built on hardware vendors' official toolchains"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/TOBYYH/homura"
@@ -12,6 +13,9 @@ exclude = ["/tools", "/tests"]
 
 [workspace]
 members = ["homura-derive"]
+
+[workspace.package]
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

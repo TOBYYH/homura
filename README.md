@@ -10,6 +10,47 @@ backend is stable.
 > This project is in early development: only the CPU reference backend and the meta device are
 > implemented so far. The API is not stable yet and it is not ready for real-world use.
 
+## Status
+
+Implemented so far:
+
+- `Tensor` with PyTorch's reference semantics, dtypes and type promotion, views, indexing,
+  broadcasting and forward operators, on a CPU reference backend and on the meta device, which
+  computes only shapes and dtypes.
+- Automatic differentiation like PyTorch's autograd: backward passes, gradients of gradients to
+  any order, in-place operations checked with version counters, `retain_grad`, and
+  `gradcheck` / `gradgradcheck`. Gradients are checked against PyTorch, including for a Llama
+  decoder layer.
+- Minimal safetensors reading and writing.
+
+Not available yet: GPU backends (ROCm comes first), neural network modules and optimizers,
+custom autograd functions and hooks, and in-place operations on views that require grad.
+
+## Example
+
+```rust
+use homura::autograd::{self, GradOptions};
+
+let x = homura::tensor([1.0, 2.0, 3.0]);
+x.requires_grad_(true);
+
+// y = sum(x³), so dy/dx = 3x²
+let y = (&x * &x * &x).sum();
+y.backward();
+assert_eq!(x.grad().unwrap().to_vec::<f32>(), [3.0, 12.0, 27.0]);
+
+// Keep the graph of the gradient to differentiate it again: d(sum(3x²))/dx = 6x
+let y = (&x * &x * &x).sum();
+let options = GradOptions { create_graph: true, ..Default::default() };
+let dy = autograd::grad(&[&y], &[&x], options).remove(0).unwrap();
+let d2y = autograd::grad(&[&dy.sum()], &[&x], GradOptions::default()).remove(0).unwrap();
+assert_eq!(d2y.to_vec::<f32>(), [6.0, 12.0, 18.0]);
+```
+
+## Minimum supported Rust version
+
+Rust 1.88 or later. Raising it is a minor version change.
+
 ## License
 
 Licensed under either of

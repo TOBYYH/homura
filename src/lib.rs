@@ -15,12 +15,21 @@
 //! assert_eq!(y.sum().item::<f32>(), 15.0);
 //! ```
 //!
+//! [`autograd`] computes gradients like PyTorch's autograd, including gradients of gradients:
+//! operations on tensors that require grad record a backward graph, which
+//! [`Tensor::backward`] or [`autograd::grad`] runs.
+//!
 //! This project is in early development: only the CPU reference backend and the meta device are
 //! implemented, and the API is not stable yet.
 
 // Code shared with the integration tests (`src/autograd/test_support`) names the crate `homura`.
 #[cfg(test)]
 extern crate self as homura;
+
+// The README's examples run as documentation tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 pub mod autograd;
 mod backend;

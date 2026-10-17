@@ -23,6 +23,25 @@
 //! Only leaves accumulate their gradients into `.grad`; a tensor computed by a recorded operation
 //! stores its own after [`Tensor::retain_grad`], in [`grad`] passes too.
 //!
+//! # Coming from PyTorch
+//!
+//! | PyTorch | homura |
+//! | --- | --- |
+//! | `x.requires_grad_()` | [`x.requires_grad_(true)`](Tensor::requires_grad_) |
+//! | `y.backward()`, `y.backward(g)` | [`y.backward()`](Tensor::backward), [`y.backward_with(&g)`](Tensor::backward_with) |
+//! | `torch.autograd.backward`, `torch.autograd.grad` | [`backward`], [`grad`], with [`BackwardOptions`] and [`GradOptions`] |
+//! | `x.grad`, `x.grad = None` | [`x.grad()`](Tensor::grad), [`x.set_grad(None)`](Tensor::set_grad) |
+//! | `y.grad_fn`, `y.is_leaf`, `y.retain_grad()` | [`Tensor::grad_fn`], [`Tensor::is_leaf`], [`Tensor::retain_grad`] |
+//! | `x.detach()`, `x.detach_()` | [`Tensor::detach`], [`Tensor::detach_`] |
+//! | `with torch.no_grad():` | `let _guard = homura::no_grad();` |
+//! | `x.clone()` | [`x.deep_clone()`](Tensor::deep_clone) |
+//! | `repr(y)` | `format!("{y:?}")`, with the same `grad_fn=<MulBackward0>` or `requires_grad=True` |
+//!
+//! Mind `clone`: [`Tensor`]'s `Clone` copies the handle, like `y = x` in Python. The clone *is*
+//! `x`, with its data, history and `.grad`, so an in-place operation through it changes `x` and
+//! its history. Port `x.clone()` to `deep_clone`, which copies the data and is recorded as
+//! `CloneBackward0`, like PyTorch's.
+//!
 //! # Current state
 //!
 //! Every differentiable operation records its node with a backward formula: `add`, `sub`, `mul`,
@@ -41,6 +60,11 @@
 //!
 //! The gradient of `prod` for an input that contains zeros can't be differentiated again yet: a
 //! backward pass with `create_graph` that computes it panics.
+//!
+//! Backward passes run wherever their tensors live. On the meta device they compute only the
+//! gradients' shapes, dtypes and devices; a backward pass from a CPU leaf copied to the meta
+//! device fails when it reaches the copy, since meta tensors have no data to copy back, as in
+//! PyTorch.
 //!
 //! # In-place operations
 //!
@@ -85,6 +109,29 @@
 //! grad, has no node: it requires grad as long as its base does, but gradients reaching it are
 //! dropped, and it can't be the root of a backward pass. Calling `requires_grad_(true)` on such
 //! a view makes it a leaf of its own.
+//!
+//! | View | `requires_grad` | `is_leaf` | `grad_fn` | Gradients reaching it |
+//! | --- | --- | --- | --- | --- |
+//! | Created in grad mode from a tensor that requires grad | `true` | `false` | its own node, such as `ViewBackward0` | go to its base |
+//! | Created in no-grad mode, or before its base required grad | as its base | `true` | `None` | are dropped |
+//! | Such a view after `requires_grad_(true)` | `true` | `true` | `None` | accumulate into its own `.grad` |
+//! | Stale: its base's history was rewritten in place after it was created | unchanged | unchanged | panics | panic, like every use of its history |
+//!
+//! In grad mode, any view rejects in-place operations that would be recorded, see
+//! [In-place operations](#in-place-operations); in no-grad mode they are allowed.
+//!
+//! # Differences from PyTorch
+//!
+//! homura doesn't support yet some cases that PyTorch handles. They panic with an error that
+//! says so, instead of computing something else:
+//!
+//! - Recorded in-place operations on views, which PyTorch records through the view's base:
+//!   write into the base, or into a `deep_clone` of the view.
+//! - Stale views, which PyTorch replays on their base's new history: create the view again.
+//! - Differentiating the gradient of `prod` for an input that contains zeros.
+//!
+//! Custom differentiable functions (PyTorch's `torch.autograd.Function`), hooks, anomaly
+//! detection, checkpointing and forward-mode differentiation are not available yet.
 //!
 //! # Lifetimes and threads
 //!

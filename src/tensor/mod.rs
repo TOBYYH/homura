@@ -21,10 +21,21 @@ pub(crate) use view::{select_position, slice_bounds};
 /// An n-dimensional array with reference semantics, like a PyTorch tensor.
 ///
 /// `Clone` copies the handle, not the data: the clone refers to the same tensor, and in-place
-/// operations through either handle are visible through both, just like `y = x` in Python. Use
+/// operations through either handle are visible through both, just like `y = x` in Python. The
+/// clone shares the autograd state too: history, `requires_grad` and `.grad`. Use
 /// [`Tensor::deep_clone`] for PyTorch's `x.clone()`.
 ///
 /// Programming errors (mismatched shapes, dtypes or devices) panic with PyTorch's error messages.
+///
+/// `{:?}` prints a tensor like PyTorch's `repr`, including the autograd suffix
+/// `grad_fn=<MulBackward0>` or `requires_grad=True`:
+///
+/// ```
+/// let x = homura::tensor([1.0, 2.0]);
+/// x.requires_grad_(true);
+/// assert_eq!(format!("{x:?}"), "tensor([1., 2.], requires_grad=True)");
+/// assert_eq!(format!("{:?}", &x * 2.0), "tensor([2., 4.], grad_fn=<MulBackward0>)");
+/// ```
 ///
 /// # Threads
 ///

@@ -68,8 +68,8 @@ impl Node for AccumulateGrad {
 /// Stores `grad`, the gradient that a backward pass computed for the non-leaf `t`, which called
 /// `retain_grad`, into its `.grad` (PyTorch's retains-grad hook): a copy the first time, then
 /// the sum with the previous gradient. Unlike a leaf's, the sum is never computed in place, so
-/// that gradients handed out earlier don't change. With `create_graph` both are recorded, so the
-/// stored gradient has a graph.
+/// that gradients handed out earlier don't change. With `create_graph` both are recorded when
+/// their inputs require grad; a constant incoming gradient can still be stored without a graph.
 ///
 /// Lifetime: the node holds `t` only weakly and saves non-leaves as data copies, so storing
 /// doesn't make the node keep `t` alive. The stored gradient's graph can still reach `t`

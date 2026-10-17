@@ -278,9 +278,11 @@ impl Tensor {
     /// its uses; later passes add theirs to it, out of place, so tensors returned by
     /// [`grad`](Tensor::grad) earlier don't change. A pass stores it whenever it computes it:
     /// [`autograd::grad`](crate::autograd::grad) too, when this tensor is on a path to the
-    /// requested inputs or is one of them. With `create_graph`, the stored gradient has a graph
-    /// (its first value is a `CloneBackward0` of the incoming gradient), which can keep this
-    /// tensor alive; see the [`autograd`](crate::autograd) module.
+    /// requested inputs or is one of them. With `create_graph`, the copy and later additions
+    /// are recorded when their inputs require grad; the first recorded copy is a
+    /// `CloneBackward0`. A constant incoming gradient can still be stored without a graph.
+    /// A stored gradient's graph can keep this tensor alive; see the
+    /// [`autograd`](crate::autograd) module.
     ///
     /// The registration follows the tensor through in-place operations: after `y.add_(..)`, the
     /// new history stores into `y.grad` and the old one no longer does. After

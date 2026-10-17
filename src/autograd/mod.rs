@@ -100,11 +100,12 @@
 //!
 //! [`Tensor::retain_grad`] registers the tensor with its node only weakly, so it doesn't keep
 //! the tensor alive, and the gradient stored without `create_graph` has no graph. With
-//! `create_graph` (in [`grad`] passes too), the stored gradient has one, which usually reaches
-//! the tensor only through data copies the graph saved, so dropping the tensor frees it. It can
-//! still form a cycle when the gradient's graph holds the tensor itself, for example as the base
-//! of a view that is a leaf of its own and was used in the gradient's computation: clear such a
-//! gradient with `set_grad(None)` when done with it.
+//! `create_graph` (in [`grad`] passes too), the copy and additions are recorded when their inputs
+//! require grad; a constant gradient can still have no graph. When the stored gradient has a
+//! graph, it usually reaches the tensor only through data copies the graph saved, so dropping
+//! the tensor frees it. It can still form a cycle when the gradient's graph holds the tensor
+//! itself, for example as the base of a view that is a leaf of its own and was used in the
+//! gradient's computation: clear such a gradient with `set_grad(None)` when done with it.
 //!
 //! A tensor that doesn't require grad and joins the graph through an in-place operation can form
 //! another cycle, with or without a backward pass, when a node of its new history saved the

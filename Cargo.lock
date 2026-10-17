@@ -27,14 +27,14 @@ dependencies = [
 
 [[package]]
 name = "homura"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "half",
 ]
 
 [[package]]
 name = "homura-derive"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "proc-macro2"

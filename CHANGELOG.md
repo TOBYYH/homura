@@ -17,8 +17,10 @@ All notable changes to this project are documented in this file. The format is b
   `retains_grad`, `detach`, `detach_`, `backward` and `backward_with`, and the `GradFn` handle
   (`name`, `next_functions`, `is_same`).
 - Gradient formulas for every differentiable operation, with PyTorch's node names and saved
-  tensors, matching PyTorch's gradients at NaN, infinities, ties and other boundaries. The
-  gradient of `prod` for an input with zeros can't be differentiated again yet.
+  tensors, following PyTorch's rules at NaN, infinities, ties and other boundaries. Floating
+  point CPU reductions and inner products accumulate in f64, so extreme cancellation can produce
+  different finite / infinity / NaN results. The gradient of `prod` for an input with zeros
+  can't be differentiated again yet.
 - In grad mode, the 17 in-place operations are recorded like their out-of-place versions, and
   backward passes check with version counters that the tensors they saved weren't modified, with
   PyTorch's errors. Recorded in-place operations on views, and views whose base was modified in
@@ -51,10 +53,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
-- `addmm`, `addmv`, `addr`, `baddbmm` and `addbmm` follow PyTorch's kernels: with a zero
-  `alpha`, the result is `beta * input` even where the product overflows; f16 and bf16 products
-  are accumulated and scaled in f32 and rounded once; `addr` multiplies `alpha` by `vec1`
-  before `vec2`, so a tiny `alpha` no longer turns a finite result infinite.
+- For f32 and f64 `addmm`, `addmv`, `baddbmm` and `addbmm`, a zero `alpha` gives
+  `beta * input` even where the product overflows. Their f16 and bf16 matrix products are
+  kept in f32 until they have been scaled, then rounded to the output dtype (CPU inner
+  products still accumulate in f64). `addr` multiplies `alpha` by `vec1` before `vec2`, so
+  a tiny `alpha` no longer turns a finite result infinite. These rules are independent of
+  size and layout; some PyTorch CPU kernel paths differ.
 - `uniform_` and `normal_` check that the target can be written before drawing samples, so a
   rejected call doesn't advance the random number generator.
 - Inclusive index ranges ending at `i64::MAX` reach the end of the dimension instead of

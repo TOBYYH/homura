@@ -151,8 +151,9 @@ fn converted(s: Scalar, ty: DType, name: &str) -> Scalar {
 #[derive(Clone, Copy, PartialEq)]
 enum Kernel {
     /// `addmm`, `baddbmm` and `addbmm`: BLAS `gemm`, or for half precision a product
-    /// accumulated in f32 and combined with the coefficients in f32 before rounding once. The
-    /// coefficients are converted to f32 (`F64` for `F64`).
+    /// kept in f32 and combined with the coefficients there before rounding to the output
+    /// dtype. CPU inner products still accumulate in f64. The coefficients are converted to
+    /// f32 (`F64` for `F64`).
     Gemm,
     /// `addmv`: BLAS `gemv`, or for half precision the same. The coefficients are converted
     /// to the dtype.
@@ -173,12 +174,13 @@ enum Kernel {
 ///   than 400 elements (`m * k * n`) with a kernel of its own instead, where an overflowing
 ///   product times zero is NaN; homura follows BLAS at every size, which is also what GPU
 ///   libraries do.
-/// - `F16` and `BF16`: the product is accumulated in f32 and scaled there, then rounded once, so
-///   it overflows to NaN only if it overflows f32. This is PyTorch's `gemv` for a row-major
-///   matrix; for a column-major one (including `[m, 1]`) it scales the vector first and rounds
-///   `beta * input` separately, and its `baddbmm` of 400 or more elements with several batches
-///   drops `beta` when `alpha` is zero. homura's values don't depend on the layout and don't
-///   follow either.
+/// - `F16` and `BF16`: the factors are converted to f32, the product accumulates in f64 and is
+///   rounded to f32, then scaled there before rounding to the output dtype. With zero `alpha`,
+///   an overflowing f32 product still gives NaN. The f32 scaling follows PyTorch's `gemv` for a
+///   row-major matrix; for a column-major one (including `[m, 1]`) it scales the vector first
+///   and rounds `beta * input` separately, and its `baddbmm` of 400 or more elements with
+///   several batches drops `beta` when `alpha` is zero. homura's values don't depend on the
+///   layout and don't follow either.
 /// - integers: the product in the dtype, scaled with wrapping arithmetic.
 fn scaled_matrix_product(
     input: &Tensor,
@@ -290,9 +292,11 @@ impl Tensor {
     /// The result keeps the input dtype: for integer inputs, floating point coefficients are
     /// truncated toward zero, as in PyTorch. For `F32` and `F64`, a zero `alpha` means that the
     /// factors aren't read, as in BLAS, so infinities in them or an overflowing product don't
-    /// make the result NaN; `F16` and `BF16` products are accumulated and scaled in f32 before
-    /// rounding once. All this also holds for [`addmv`](Tensor::addmv),
+    /// make the result NaN; `F16` and `BF16` factors are converted to f32, their products
+    /// accumulate in f64 and round to f32, and scaling is done in f32 before rounding to the
+    /// output dtype. All this also holds for [`addmv`](Tensor::addmv),
     /// [`baddbmm`](Tensor::baddbmm) and [`addbmm`](Tensor::addbmm).
+    /// The rules don't depend on size or layout; some PyTorch CPU kernel paths differ.
     ///
     /// # Panics
     ///

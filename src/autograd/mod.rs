@@ -129,6 +129,13 @@
 //!   write into the base, or into a `deep_clone` of the view.
 //! - Stale views, which PyTorch replays on their base's new history: create the view again.
 //! - Differentiating the gradient of `prod` for an input that contains zeros.
+//! - Computing the gradient of [`Tensor::as_strided`] when its input's elements overlap in
+//!   memory: use a `deep_clone` of the input first.
+//!
+//! The CPU reference backend accumulates floating point reductions and matrix inner products
+//! in f64. This differs from some PyTorch kernels: extreme cancellation can change finite,
+//! infinity and NaN results, even for finite inputs. Scaled matrix products also use rules
+//! independent of size and layout; see [`Tensor::addmm`].
 //!
 //! Custom differentiable functions (PyTorch's `torch.autograd.Function`), hooks, anomaly
 //! detection, checkpointing and forward-mode differentiation are not available yet.

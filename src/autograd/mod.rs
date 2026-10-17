@@ -153,6 +153,8 @@ mod gradcheck;
 mod graph_tests;
 #[cfg(test)]
 mod inplace_tests;
+#[cfg(test)]
+mod llama_tests;
 mod meta;
 mod node;
 mod record;

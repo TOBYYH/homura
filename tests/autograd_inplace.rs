@@ -1293,7 +1293,7 @@ fn in_place_operations_inside_functions_pass_gradcheck() {
     gradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
     gradgradcheck(f, &inputs, GradcheckOptions::default()).unwrap();
     // sub_ after a node that saves no output (review round 30), copies (broadcast, into a
-    // tensor that doesn't require grad, of self) and fills.
+    // tensor that doesn't require grad, of self), fills and random fills.
     let f = |t: &[Tensor]| {
         let (x, z, w) = (&t[0], &t[1], &t[2]);
         let y = x * x;
@@ -1313,7 +1313,11 @@ fn in_place_operations_inside_functions_pass_gradcheck() {
         let r = x.cos();
         r.uniform_(0.0, 1.0);
         r.copy_(&(&y * w).sum_dim(0, true));
-        vec![d, e, r]
+        let n = x.neg();
+        n.normal_(0.0, 1.0);
+        n.zero_();
+        n.add_(&(z * w));
+        vec![d, e, r, n]
     };
     let inputs = [&x, &z, &w];
     gradcheck(f, &inputs, GradcheckOptions::default()).unwrap();

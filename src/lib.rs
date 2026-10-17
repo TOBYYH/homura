@@ -18,6 +18,10 @@
 //! This project is in early development: only the CPU reference backend and the meta device are
 //! implemented, and the API is not stable yet.
 
+// Code shared with the integration tests (`src/autograd/test_support`) names the crate `homura`.
+#[cfg(test)]
+extern crate self as homura;
+
 pub mod autograd;
 mod backend;
 mod defaults;

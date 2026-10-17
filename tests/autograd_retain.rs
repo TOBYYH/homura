@@ -5,6 +5,7 @@
 //! these tests encode; the lifetime tests are in src/autograd/retain_tests.rs.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Barrier;
 use std::thread;
 
 use homura::autograd::{self, BackwardOptions, GradOptions};
@@ -182,6 +183,16 @@ fn gradients_stored_with_create_graph_can_be_differentiated() {
     autograd::grad(&[&g], &[&x], GradOptions::default());
     assert_eq!(y.grad().unwrap().to_vec::<f64>(), [2.0]);
     assert_eq!(first.to_vec::<f64>(), [1.0]);
+
+    // Round 35: create_graph records only what depends on tensors that require grad, so a
+    // constant incoming gradient is stored without a graph.
+    let x = leaf(&[1., 2.]);
+    let y = &x * 2.0;
+    y.retain_grad();
+    grad_creating_graph(&y.sum(), &[&x]);
+    let stored = y.grad().unwrap();
+    assert_eq!(vals(&stored), [1., 1.]);
+    assert!(!stored.requires_grad() && stored.grad_fn().is_none());
 }
 
 #[test]
@@ -299,4 +310,53 @@ fn concurrent_backward_passes_lose_no_retained_gradient() {
     }
     assert_eq!(grad_vals(&y), [300.; 1000]);
     assert_eq!(grad_vals(&x), [300.; 1000]);
+}
+
+#[test]
+fn a_tensor_detached_in_place_takes_both_kinds_of_concurrent_writes() {
+    // Round 35: after detach_, the old graph still stores into y (out of place) while y, a leaf
+    // now, accumulates the gradients of its new graph (in place). Both writes take y's lock.
+    let x = homura::zeros([1000]);
+    x.requires_grad_(true);
+    let y = &x + 1.0;
+    y.retain_grad();
+    let old = (&y * 3.0).sum();
+    y.detach_();
+    y.requires_grad_(true);
+    let new = (&y * 5.0).sum();
+    let workers: Vec<_> = [old, new]
+        .into_iter()
+        .map(|out| {
+            thread::spawn(move || {
+                for _ in 0..100 {
+                    backward_keeping_graph(&out);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(grad_vals(&y), [800.; 1000]);
+    assert_eq!(grad_vals(&x), [300.; 1000]);
+}
+
+#[test]
+fn concurrent_calls_register_once() {
+    // Round 35: retain_grad checks again under the lock, so threads that call it at the same time
+    // register y once, and a backward pass stores its gradient once.
+    let x = leaf(&[1., 2.]);
+    let y = &x * 2.0;
+    let barrier = Barrier::new(8);
+    thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                barrier.wait();
+                y.retain_grad();
+            });
+        }
+    });
+    assert!(y.retains_grad());
+    (&y * 3.0).sum().backward();
+    assert_eq!(grad_vals(&y), [3., 3.]);
 }

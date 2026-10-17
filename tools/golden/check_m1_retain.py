@@ -109,6 +109,12 @@ first = y.grad
 assert first.tolist() == [1.0]
 torch.autograd.grad(g, x)
 assert y.grad.tolist() == [2.0] and first.tolist() == [1.0]
+# A constant incoming gradient is stored without a graph, even with create_graph (round 35).
+x = leaf(1.0, 2.0)
+y = x * 2
+y.retain_grad()
+torch.autograd.grad(y.sum(), [x], create_graph=True)
+assert y.grad.tolist() == [1.0, 1.0] and not y.grad.requires_grad and y.grad.grad_fn is None
 
 # stored_gradients_are_contiguous_and_keep_the_dtype
 x = torch.zeros(3, 2, requires_grad=True)
@@ -193,7 +199,26 @@ assert v.grad.tolist() == [4.0, 4.0]
 # x = zeros(1000) leaf, y = x + 1 retained, (y * 1).sum() and (y * 2).sum() each backward-ed 100
 # times on its own thread (retain_graph=True), x.grad is always 300 while y.grad was 298 or 299 in
 # about half of the runs, and the interpreter segfaulted in some. homura serializes both, so the
-# test expects 300 for both.
+# test expects 300 for both. The same holds for the two round-35 tests after it (a tensor detached
+# in place that takes retained and leaf writes from two threads, and concurrent retain_grad calls);
+# their serial results are what the tests expect:
+x = torch.zeros(1000, requires_grad=True)
+y = x + 1
+y.retain_grad()
+old = (y * 3).sum()
+y.detach_()
+y.requires_grad_(True)
+new = (y * 5).sum()
+for _ in range(100):
+    old.backward(retain_graph=True)
+    new.backward(retain_graph=True)
+assert y.grad.tolist() == [800.0] * 1000 and x.grad.tolist() == [300.0] * 1000
+x = leaf(1.0, 2.0)
+y = x * 2
+for _ in range(8):
+    y.retain_grad()
+(y * 3).sum().backward()
+assert y.retains_grad and y.grad.tolist() == [3.0, 3.0]
 
 # Lifetimes (src/autograd/retain_tests.rs).
 # registration_does_not_keep_the_tensor_alive
@@ -285,6 +310,7 @@ with torch.no_grad():
 with torch.no_grad():
     nv.add_(1)
 assert r(b) == "tensor([2., 3.], grad_fn=<MulBackward0>)"
+assert r(nv) == "tensor([2., 3.], grad_fn=<Invalid>)"
 b2 = x * 1
 s = b2.view(2)
 b2.add_(1)

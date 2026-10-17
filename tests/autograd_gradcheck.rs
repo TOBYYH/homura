@@ -329,6 +329,10 @@ fn reduction_and_view_formulas() {
     check("expand", &[&v], |x| {
         vec![x[0].expand([2, 3]), x[0].expand([2, -1])]
     });
+    let target = homura::zeros([2, 3]);
+    check("expand_as", &[&v, &t], |x| {
+        vec![x[0].expand_as(&target), x[1].expand_as(&target)]
+    });
     check("view", &[&x], |x| vec![x[0].view([3, 2]), x[0].view([-1])]);
     check("reshape", &[&x, &t], |x| {
         vec![x[0].reshape([3, 2]), x[1].reshape([6]), x[1].flatten(0, -1)]
@@ -395,6 +399,11 @@ fn reduction_and_view_formulas() {
         ]
     });
     check("split", &[&x], |x| x[0].split(2, -1));
+    check("split_with_sizes", &[&t], |x| {
+        let mut pieces = x[0].split_with_sizes(&[1, 0, 2], -1);
+        pieces.extend(x[0].split_with_sizes(&[2], 0));
+        pieces
+    });
     check("chunk", &[&x], |x| x[0].chunk(2, 0));
     check("repeat", &[&v], |x| vec![x[0].repeat([2, 2])]);
     let w = var(&[6], 3);

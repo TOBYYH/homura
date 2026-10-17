@@ -11,7 +11,7 @@
 //! y.backward();
 //! assert_eq!(x.grad().unwrap().to_vec::<f32>(), [2.0, 4.0, 6.0]);
 //!
-//! // `grad` returns the gradients instead of accumulating them into `.grad`.
+//! // `grad` returns the gradients instead of accumulating them into the leaves' `.grad`.
 //! let y = (&x * &x).sum();
 //! let g = autograd::grad(&[&y], &[&x], autograd::GradOptions::default());
 //! assert_eq!(g[0].as_ref().unwrap().to_vec::<f32>(), [2.0, 4.0, 6.0]);
@@ -19,6 +19,9 @@
 //!
 //! With `create_graph`, the backward pass is recorded too, so gradients can be differentiated
 //! again (higher-order derivatives).
+//!
+//! Only leaves accumulate their gradients into `.grad`; a tensor computed by a recorded operation
+//! stores its own after [`Tensor::retain_grad`], in [`grad`] passes too.
 //!
 //! # Current state
 //!
@@ -92,7 +95,16 @@
 //! graphs that reach the next leaf is the exception and is destroyed recursively.
 //! `backward` with `create_graph` stores gradients that have a graph which usually reaches the
 //! leaf again: the leaf and its gradient then keep each other alive until the gradient is
-//! cleared with `set_grad(None)`, as in PyTorch. [`grad`] never writes `.grad`.
+//! cleared with `set_grad(None)`, as in PyTorch. [`grad`] doesn't accumulate into leaves, so it
+//! has no such cycle.
+//!
+//! [`Tensor::retain_grad`] registers the tensor with its node only weakly, so it doesn't keep
+//! the tensor alive, and the gradient stored without `create_graph` has no graph. With
+//! `create_graph` (in [`grad`] passes too), the stored gradient has one, which usually reaches
+//! the tensor only through data copies the graph saved, so dropping the tensor frees it. It can
+//! still form a cycle when the gradient's graph holds the tensor itself, for example as the base
+//! of a view that is a leaf of its own and was used in the gradient's computation: clear such a
+//! gradient with `set_grad(None)` when done with it.
 //!
 //! A tensor that doesn't require grad and joins the graph through an in-place operation can form
 //! another cycle, with or without a backward pass, when a node of its new history saved the
@@ -143,10 +155,12 @@ mod inplace_tests;
 mod meta;
 mod node;
 mod record;
+#[cfg(test)]
+mod retain_tests;
 mod saved;
 
 pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
-pub(crate) use meta::{AutogradMeta, ViewInfo, view_of};
+pub(crate) use meta::{AutogradMeta, ViewInfo, repr_suffix, view_of};
 pub use node::GradFn;
 pub(crate) use record::{check_in_place, original_value, record_in_place};
 
@@ -244,8 +258,9 @@ pub fn backward(tensors: &[&Tensor], grad_tensors: &[Option<&Tensor>], options: 
 }
 
 /// Computes and returns the gradients of `outputs` with respect to `inputs`
-/// (`torch.autograd.grad`), without writing any `.grad`. Only the parts of the graph that lead
-/// to `inputs` run.
+/// (`torch.autograd.grad`), without accumulating them into the `.grad` of the leaves. Only the
+/// parts of the graph that lead to `inputs` run. Tensors on those paths (or among `inputs`) that
+/// called [`Tensor::retain_grad`] store their gradients, as in PyTorch.
 ///
 /// The result has one entry per input; it is `None` only for inputs that the outputs don't
 /// depend on, which panics unless `allow_unused` is set.

@@ -4,6 +4,8 @@
 //! gradients it will receive, then runs nodes once all of them have arrived, latest created
 //! first (accumulators as soon as they are ready). Gradients for the same input of a node are
 //! summed in its input buffer. Everything is iterative, so deep graphs don't overflow the stack.
+//! Once a node has all its gradients, those of its outputs that called `retain_grad` are stored
+//! in their `.grad`.
 //!
 //! The engine runs on the calling thread. Grad mode is set to `create_graph` for the whole pass,
 //! so with `create_graph` the formulas, the conversions of gradients and the sums in the input
@@ -13,6 +15,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+use super::accumulate::store_retained;
 use super::node::{Edge, InputMeta, NodeKey, NodeRef};
 use super::set_grad_enabled;
 use crate::Tensor;
@@ -22,8 +25,10 @@ use crate::Tensor;
 ///
 /// With `capture` (`autograd::grad`), the gradients flowing into those edges are returned, one
 /// per entry, `None` for entries that are `None` or that no gradient reaches; only the nodes on
-/// a path to them run, so no `.grad` is written. Without it (`backward`), every reachable node
-/// runs and the accumulators write the gradients of the leaves.
+/// a path to them run, so no leaf accumulates its gradient. Without it (`backward`), every
+/// reachable node runs and the accumulators write the gradients of the leaves. Either way, the
+/// gradients of retained non-leaves are stored as soon as their node has received all of its
+/// gradients, also when the node is captured without running, as in PyTorch.
 ///
 /// Unless `keep_graph`, each node frees its saved tensors once it has run.
 ///
@@ -56,6 +61,7 @@ pub(crate) fn run(
             .buffers
             .remove(&key)
             .expect("a ready node has a buffer");
+        store_retained_outputs(&node, &grads);
         let mut mask = None;
         if let Some(exec) = &pass.exec {
             for &(input_nr, i) in exec.captures.get(&key).into_iter().flatten() {
@@ -82,6 +88,18 @@ pub(crate) fn run(
         }
     }
     captured
+}
+
+/// Stores the gradients that `node` received into the `.grad` of its outputs that called
+/// `retain_grad` and are still alive. Outputs that received no gradient keep their `.grad`.
+fn store_retained_outputs(node: &NodeRef, grads: &[Option<Tensor>]) {
+    for retained in node.retained_outputs() {
+        if let Some(grad) = &grads[retained.output_nr as usize]
+            && let Some(t) = retained.tensor.upgrade()
+        {
+            store_retained(&t, grad);
+        }
+    }
 }
 
 /// The state of one backward pass.

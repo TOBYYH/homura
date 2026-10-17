@@ -219,15 +219,19 @@ pub(crate) fn gradient_edge(t: &Tensor) -> Option<Edge> {
 /// in-place operation in grad mode after the view was created. Replaying the view on the new
 /// history is not supported yet.
 pub(crate) fn check_not_stale(t: &Tensor) {
-    if let Some(view) = t.view_info()
-        && meta::history_gen(&view.base) != view.base_history_gen
-    {
+    if is_stale(t) {
         panic!(
             "a view whose base was modified by an in-place operation in grad mode after the view \
              was created can't be used for gradient computation yet; create the view again \
              after the in-place operation"
         );
     }
+}
+
+/// Whether `t` is a view whose history is stale, see [`check_not_stale`].
+pub(crate) fn is_stale(t: &Tensor) -> bool {
+    t.view_info()
+        .is_some_and(|view| meta::history_gen(&view.base) != view.base_history_gen)
 }
 
 /// Makes `t` output `output_nr` of `node`, which has just been recorded.
@@ -243,6 +247,12 @@ pub(crate) fn set_history(t: &Tensor, node: NodeRef, output_nr: u32) {
 
 /// Replaces the history of `t`, which an in-place operation in grad mode has just overwritten.
 /// Views of `t` recorded against the previous history become stale.
+///
+/// If `t` called `retain_grad`, its registration moves to the new node, as in PyTorch: the old
+/// history no longer stores into `t.grad`. A tensor that called `retain_grad` and was then
+/// detached in place has no old history here (PyTorch fails an internal assertion); it is
+/// registered with the new node, which keeps `retains_grad` true to its word, while the
+/// registration on its old history stays, as `detach_` left it.
 pub(crate) fn rebase_history(t: &Tensor, node: NodeRef, output_nr: u32) {
     debug_assert!(
         t.view_info().is_none(),
@@ -251,6 +261,12 @@ pub(crate) fn rebase_history(t: &Tensor, node: NodeRef, output_nr: u32) {
     let previous = {
         let mut guard = t.autograd_meta();
         let meta = guard.get_or_insert_with(meta::AutogradMeta::default);
+        if meta.retains_grad {
+            if let Some(old) = &meta.grad_fn {
+                old.remove_retained(meta.output_nr, t);
+            }
+            node.add_retained(output_nr, t);
+        }
         meta.output_nr = output_nr;
         meta.history_gen += 1;
         meta.grad_fn.replace(node)

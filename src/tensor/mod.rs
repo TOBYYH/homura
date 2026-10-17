@@ -47,13 +47,19 @@ struct TensorImpl {
 }
 
 /// A weak handle to a tensor: it doesn't keep the tensor alive. Saved tensors use it to describe
-/// the original in error messages, and tests to check when tensors are destroyed.
+/// the original in error messages, nodes to find the tensors whose gradient they store
+/// (`retain_grad`), and tests to check when tensors are destroyed.
 #[derive(Clone)]
 pub(crate) struct WeakTensor(std::sync::Weak<TensorImpl>);
 
 impl WeakTensor {
     pub(crate) fn upgrade(&self) -> Option<Tensor> {
         self.0.upgrade().map(Tensor)
+    }
+
+    /// Whether this is a handle to `t`.
+    pub(crate) fn points_to(&self, t: &Tensor) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&t.0))
     }
 }
 

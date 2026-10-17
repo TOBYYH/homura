@@ -15,9 +15,10 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::saved::{SavedId, SavedTensor};
+use crate::tensor::WeakTensor;
 use crate::{DType, Device, Shape, Tensor};
 
 /// A backward formula: the gradients of an operation's inputs given the gradients of its
@@ -78,6 +79,17 @@ pub(crate) struct NodeCell {
     /// One per output of the forward operation.
     input_meta: Vec<InputMeta>,
     saved: Box<[SavedTensor]>,
+    /// The outputs whose gradient is stored in their `.grad` (PyTorch's `retains_grad_hooks_`),
+    /// registered by `retain_grad`. The lock is held only to copy or change the list.
+    retained: Mutex<Vec<Retained>>,
+}
+
+/// A tensor that called `retain_grad` while it was output `output_nr` of the node. Weak, so that
+/// the registration doesn't keep the tensor alive; it lapses when the tensor is dropped.
+#[derive(Clone)]
+pub(crate) struct Retained {
+    pub output_nr: u32,
+    pub tensor: WeakTensor,
 }
 
 static NEXT_SEQUENCE_NR: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +166,40 @@ impl NodeRef {
 
     pub fn input_meta(&self) -> &[InputMeta] {
         &self.cell().input_meta
+    }
+
+    /// Registers `t`, output `output_nr` of this node, to have its gradient stored in its
+    /// `.grad`.
+    pub fn add_retained(&self, output_nr: u32, t: &Tensor) {
+        self.retained().push(Retained {
+            output_nr,
+            tensor: t.downgrade(),
+        });
+    }
+
+    /// Removes the registration of `t` as output `output_nr`, if there is one, leaving those of
+    /// other tensors and outputs.
+    pub fn remove_retained(&self, output_nr: u32, t: &Tensor) {
+        let mut retained = self.retained();
+        if let Some(i) = retained
+            .iter()
+            .position(|r| r.output_nr == output_nr && r.tensor.points_to(t))
+        {
+            retained.swap_remove(i);
+        }
+    }
+
+    /// The registered outputs, copied out so that no lock is held while their gradients are
+    /// stored.
+    pub fn retained_outputs(&self) -> Vec<Retained> {
+        self.retained().clone()
+    }
+
+    fn retained(&self) -> std::sync::MutexGuard<'_, Vec<Retained>> {
+        self.cell()
+            .retained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Frees the saved tensors (`retain_graph = false`). The node and its edges stay alive as
@@ -375,6 +421,7 @@ impl NodeBuilder {
             next_edges: self.next_edges,
             input_meta,
             saved: self.saved.into_boxed_slice(),
+            retained: Mutex::new(vec![]),
         })))
     }
 }

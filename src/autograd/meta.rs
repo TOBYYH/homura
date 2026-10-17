@@ -1,10 +1,13 @@
 //! Per-tensor autograd state and the tensor properties derived from it.
 //!
 //! The functions here lock a tensor's state only briefly and never two tensors' states at once,
-//! so callers may hold no other autograd lock while calling them.
+//! so callers may hold no other tensor's state lock while calling them. The locks are taken in
+//! one order: a tensor's `.grad` lock ([`with_grad_lock`]), then its state, then the list of
+//! retained outputs of a node (while registering or moving a `retain_grad`); each may also be
+//! taken alone.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use super::node::{GradFn, NodeRef, WeakNodeRef};
 use super::{BackwardOptions, record};
@@ -18,7 +21,8 @@ pub(crate) struct AutogradMeta {
     /// The tensor's own flag, set on leaves by `requires_grad_`. A view also requires grad when
     /// its base does, see [`requires_grad`].
     pub requires_grad: bool,
-    /// The gradient accumulated into a leaf.
+    /// The gradient accumulated into a leaf, or stored into a non-leaf that called
+    /// `retain_grad`.
     pub grad: Option<Tensor>,
     /// The node that computed the tensor; `None` for leaves.
     pub grad_fn: Option<NodeRef>,
@@ -33,6 +37,12 @@ pub(crate) struct AutogradMeta {
     /// `detach_` clears the history, so that those copies refuse to be used; a new history
     /// starts without one.
     pub detached: Option<Arc<AtomicBool>>,
+    /// Set by `retain_grad` on a non-leaf, whose `grad_fn` then has it registered. Kept by
+    /// `detach_`, as in PyTorch.
+    pub retains_grad: bool,
+    /// Serializes the backward passes that update `grad`, created on first use; see
+    /// [`with_grad_lock`].
+    pub grad_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// How a view relates to the tensor whose storage it shares. Set once, when the view is created.
@@ -164,6 +174,43 @@ pub(crate) fn set_grad(t: &Tensor, grad: Option<Tensor>) {
     drop(previous);
 }
 
+/// Runs `update`, which reads and replaces the `.grad` of `t`, serialized with every other such
+/// update of `t` by a backward pass: the accumulation into a leaf and the storing of a retained
+/// gradient. Concurrent backward passes into the same `.grad` then lose nothing.
+///
+/// The lock is taken after the state lock of `t` is released and is never held while waiting for
+/// another tensor's, so `update` may lock states (through [`grad`] and [`set_grad`]) and run
+/// tensor operations, which take no such lock.
+pub(crate) fn with_grad_lock<R>(t: &Tensor, update: impl FnOnce() -> R) -> R {
+    let lock = t
+        .autograd_meta()
+        .get_or_insert_with(AutogradMeta::default)
+        .grad_lock
+        .get_or_insert_default()
+        .clone();
+    let _serial = lock.lock().unwrap_or_else(|e| e.into_inner());
+    update()
+}
+
+/// The autograd part of the `Debug` output of `t`, as in PyTorch: `grad_fn=<Name>` if it has a
+/// history, else `requires_grad=True` if it requires grad. A stale view, whose `grad_fn` panics,
+/// shows `grad_fn=<Invalid>`, what PyTorch shows when getting a tensor's `grad_fn` fails: the
+/// view has a history, but it can't be used.
+pub(crate) fn repr_suffix(t: &Tensor) -> Option<String> {
+    if record::is_stale(t) {
+        return Some("grad_fn=<Invalid>".into());
+    }
+    if let Some((node, _)) = grad_fn(t) {
+        return Some(format!("grad_fn=<{}>", node.name()));
+    }
+    requires_grad(t).then(|| "requires_grad=True".into())
+}
+
+/// Whether `t` called `retain_grad` (as a non-leaf).
+pub(crate) fn retains_grad(t: &Tensor) -> bool {
+    t.autograd_meta().as_ref().is_some_and(|m| m.retains_grad)
+}
+
 /// How many times an in-place operation in grad mode has rewritten the history of `t`.
 pub(crate) fn history_gen(t: &Tensor) -> u64 {
     t.autograd_meta().as_ref().map_or(0, |m| m.history_gen)
@@ -210,15 +257,71 @@ impl Tensor {
     }
 
     /// Whether this tensor has no history, PyTorch's `is_leaf`: it was created by the user
-    /// rather than computed by a recorded operation. Only leaves accumulate gradients into
-    /// their `.grad`.
+    /// rather than computed by a recorded operation. Backward passes accumulate gradients into
+    /// the `.grad` of leaves; a non-leaf stores its gradient only after
+    /// [`retain_grad`](Tensor::retain_grad).
     pub fn is_leaf(&self) -> bool {
         is_leaf(self)
     }
 
-    /// The gradient accumulated into this tensor by backward passes, PyTorch's `.grad`.
+    /// The gradient accumulated into this tensor by backward passes, PyTorch's `.grad`: for a
+    /// leaf that requires grad, or for a non-leaf after [`retain_grad`](Tensor::retain_grad).
     pub fn grad(&self) -> Option<Tensor> {
         grad(self)
+    }
+
+    /// Makes backward passes store the gradient of this non-leaf in its `.grad`, as they do for
+    /// leaves, and returns `self` (PyTorch's `retain_grad`). Does nothing on a leaf, or if
+    /// called before.
+    ///
+    /// The stored gradient is the total gradient flowing into this tensor in a pass, from all
+    /// its uses; later passes add theirs to it, out of place, so tensors returned by
+    /// [`grad`](Tensor::grad) earlier don't change. A pass stores it whenever it computes it:
+    /// [`autograd::grad`](crate::autograd::grad) too, when this tensor is on a path to the
+    /// requested inputs or is one of them. With `create_graph`, the stored gradient has a graph
+    /// (its first value is a `CloneBackward0` of the incoming gradient), which can keep this
+    /// tensor alive; see the [`autograd`](crate::autograd) module.
+    ///
+    /// The registration follows the tensor through in-place operations: after `y.add_(..)`, the
+    /// new history stores into `y.grad` and the old one no longer does. After
+    /// [`detach_`](Tensor::detach_), the old history still stores into it, as in PyTorch.
+    ///
+    /// ```
+    /// let x = homura::tensor([1.0, 2.0]);
+    /// x.requires_grad_(true);
+    /// let y = &x * 2.0;
+    /// y.retain_grad();
+    /// (&y * &y).sum().backward();
+    /// assert_eq!(y.grad().unwrap().to_vec::<f32>(), [4.0, 8.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensor doesn't require grad, with PyTorch's message, or if it is a stale
+    /// view (see [`grad_fn`](Tensor::grad_fn)).
+    pub fn retain_grad(&self) -> &Self {
+        if !requires_grad(self) {
+            panic!("can't retain_grad on Tensor that has requires_grad=False");
+        }
+        if is_leaf(self) || retains_grad(self) {
+            return self;
+        }
+        record::check_not_stale(self);
+        let mut guard = self.autograd_meta();
+        let meta = guard.as_mut().expect("a non-leaf has autograd state");
+        // Checked again under the lock, so that concurrent calls register once.
+        if !meta.retains_grad {
+            let node = meta.grad_fn.as_ref().expect("a non-leaf has a grad_fn");
+            node.add_retained(meta.output_nr, self);
+            meta.retains_grad = true;
+        }
+        self
+    }
+
+    /// Whether this tensor is a non-leaf that called [`retain_grad`](Tensor::retain_grad)
+    /// (PyTorch's `retains_grad`). Stays true after [`detach_`](Tensor::detach_), as in PyTorch.
+    pub fn retains_grad(&self) -> bool {
+        retains_grad(self)
     }
 
     /// Replaces the gradient of this tensor, like assigning to PyTorch's `.grad`; `None` clears

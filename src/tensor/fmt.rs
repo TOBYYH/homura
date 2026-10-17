@@ -257,8 +257,11 @@ impl fmt::Debug for Tensor {
             }
             .tensor(&shape, &strides, 0, indent)
         };
+        suffixes.extend(crate::autograd::repr_suffix(self));
         let mut out = format!("tensor({body}");
-        let mut last_line = body.len() - body.rfind('\n').map_or(0, |i| i + 1) + indent;
+        // PyTorch's `_add_suffixes` counts the last line as `len(s) - s.rfind("\n") + 1`: two
+        // more than its length.
+        let mut last_line = out.len() - out.rfind('\n').map_or(0, |i| i + 1) + 2;
         for s in suffixes {
             if last_line + s.len() + 2 > LINE_WIDTH {
                 out.push_str(&format!(",\n{}{s}", " ".repeat(indent)));
@@ -338,5 +341,86 @@ mod tests {
              17.6000, 18.7000, 19.8000, 20.9000, 22.0000, 23.1000, 24.2000,\n         25.3000, \
              26.4000, 27.5000, 28.6000, 29.7000, 30.8000, 31.9000]])"
         );
+    }
+
+    /// The strings are PyTorch's (tools/golden/check_m1_retain.py), except where noted.
+    #[test]
+    fn autograd_suffixes_match_pytorch() {
+        let s = |t: &Tensor| format!("{t:?}");
+        let x = crate::tensor([1.0, 2.0]);
+        x.requires_grad_(true);
+        assert_eq!(s(&x), "tensor([1., 2.], requires_grad=True)");
+        assert_eq!(s(&(&x * 2.0)), "tensor([2., 4.], grad_fn=<MulBackward0>)");
+        assert_eq!(s(&x.sum()), "tensor(3., grad_fn=<SumBackward0>)");
+        let b = crate::zeros([2]);
+        b.copy_(&x);
+        assert_eq!(s(&b), "tensor([1., 2.], grad_fn=<CopyBackwards>)");
+        let v = {
+            let _no_grad = crate::no_grad();
+            x.view([2])
+        };
+        assert_eq!(s(&v), "tensor([1., 2.], requires_grad=True)");
+        assert_eq!(s(&x.detach()), "tensor([1., 2.])");
+        let empty = crate::zeros([0]);
+        empty.requires_grad_(true);
+        assert_eq!(s(&empty), "tensor([], requires_grad=True)");
+        // homura's own spelling of sizes, dtypes and devices; the suffix rules are PyTorch's.
+        let empty = crate::zeros([0, 3]);
+        empty.requires_grad_(true);
+        assert_eq!(
+            s(&(&empty * 1.0)),
+            "tensor([], size=[0, 3], grad_fn=<MulBackward0>)"
+        );
+        let m = crate::zeros_with([2, 3], (DType::F16, Device::Meta));
+        m.requires_grad_(true);
+        assert_eq!(
+            s(&(&m * 1.0)),
+            "tensor(..., device=meta, size=[2, 3], dtype=f16, grad_fn=<MulBackward0>)"
+        );
+        let long = crate::arange(2000.0);
+        long.requires_grad_(true);
+        assert_eq!(
+            s(&(&long * 1.0)),
+            "tensor([0.0000e+00, 1.0000e+00, 2.0000e+00,  ..., 1.9970e+03, 1.9980e+03,\n        \
+             1.9990e+03], grad_fn=<MulBackward0>)"
+        );
+        // Wrapping counts the last line two longer than it is, on one line and on several.
+        let row = |n: usize| {
+            let x = crate::arange(n as f64);
+            x.requires_grad_(true);
+            s(&(&x * 1.5))
+        };
+        assert_eq!(
+            row(5),
+            "tensor([0.0000, 1.5000, 3.0000, 4.5000, 6.0000], grad_fn=<MulBackward0>)"
+        );
+        assert_eq!(
+            row(6),
+            "tensor([0.0000, 1.5000, 3.0000, 4.5000, 6.0000, 7.5000],\n       \
+             grad_fn=<MulBackward0>)"
+        );
+        let grid = |cols: usize| {
+            let x = crate::arange((2 * cols) as f64);
+            x.requires_grad_(true);
+            s(&(&x.view([2, cols as i64]) * 1.25))
+        };
+        assert_eq!(
+            grid(5),
+            "tensor([[ 0.0000,  1.2500,  2.5000,  3.7500,  5.0000],\n        \
+             [ 6.2500,  7.5000,  8.7500, 10.0000, 11.2500]], grad_fn=<MulBackward0>)"
+        );
+        assert_eq!(
+            grid(6),
+            "tensor([[ 0.0000,  1.2500,  2.5000,  3.7500,  5.0000,  6.2500],\n        \
+             [ 7.5000,  8.7500, 10.0000, 11.2500, 12.5000, 13.7500]],\n       \
+             grad_fn=<MulBackward0>)"
+        );
+        // A stale view: PyTorch replays it and shows `grad_fn=<AsStridedBackward0>`; homura shows
+        // `Invalid`, PyTorch's text for a `grad_fn` that can't be computed, and doesn't panic.
+        let b = &x * 1.0;
+        let stale = b.view([2]);
+        b.add_(1.0);
+        assert_eq!(s(&stale), "tensor([2., 3.], grad_fn=<Invalid>)");
+        assert_eq!(s(&b), "tensor([2., 3.], grad_fn=<AddBackward0>)");
     }
 }

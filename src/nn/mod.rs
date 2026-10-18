@@ -1,23 +1,25 @@
 //! Neural network modules, like PyTorch's `torch.nn`.
 //!
 //! A model is a struct whose fields are its [`Parameter`]s, buffers
-//! ([`Tensor`](crate::Tensor)s), submodules and hyperparameters. It implements [`Module`], which
-//! lists those members, and [`Member`], which lets it be a field of another module; it gets
-//! PyTorch's module methods from `Module`:
+//! ([`Tensor`](crate::Tensor)s), submodules and hyperparameters. `#[derive(Module)]` implements
+//! [`Module`] for it, which lists those members by field name, and [`Member`], which lets it be a
+//! field of another module. It gets PyTorch's module methods from `Module`:
 //! [`parameters`](Module::parameters), [`state_dict`](Module::state_dict),
 //! [`load_state_dict`](Module::load_state_dict), [`to`](Module::to), [`train`](Module::train),
 //! [`eval`](Module::eval) and the others. They all take `&self`. The forward computation is an
 //! ordinary method of the struct.
 //!
 //! ```
-//! use homura::nn::{Member, Module, Parameter, Visitor};
+//! use homura::nn::{Module, Parameter};
 //! use homura::{DType, Tensor};
 //!
+//! #[derive(Module)]
 //! struct Mlp {
 //!     hidden: Linear,
 //!     output: Linear,
 //! }
 //!
+//! #[derive(Module)]
 //! struct Linear {
 //!     weight: Parameter,
 //!     bias: Parameter,
@@ -42,33 +44,6 @@
 //!     }
 //! }
 //!
-//! impl Module for Linear {
-//!     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
-//!         self.weight.visit_as("weight", v);
-//!         self.bias.visit_as("bias", v);
-//!     }
-//! }
-//!
-//! impl Module for Mlp {
-//!     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
-//!         self.hidden.visit_as("hidden", v);
-//!         self.output.visit_as("output", v);
-//!     }
-//! }
-//!
-//! // How each reports itself as a field of another module: as a submodule.
-//! impl Member for Linear {
-//!     fn visit_as<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
-//!         v.module(name, self, None);
-//!     }
-//! }
-//!
-//! impl Member for Mlp {
-//!     fn visit_as<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
-//!         v.module(name, self, None);
-//!     }
-//! }
-//!
 //! let model = Mlp { hidden: Linear::new(4, 8), output: Linear::new(8, 2) };
 //! let keys: Vec<String> = model.named_parameters().into_iter().map(|(k, _)| k).collect();
 //! assert_eq!(keys, ["hidden.weight", "hidden.bias", "output.weight", "output.bias"]);
@@ -79,13 +54,67 @@
 //! assert_eq!(model.output.bias.grad().unwrap().to_vec::<f64>(), [3.0, 3.0]);
 //! ```
 //!
+//! # Deriving `Module`
+//!
+//! The type of each field decides what it is (see [`Member`]): a `Parameter` is a parameter, a
+//! `Tensor` a buffer, a [`Training`] flag the module's train / eval mode, a struct that derives
+//! `Module` a submodule; `Option`, `Vec`, `BTreeMap`, `Box` and `Arc` of those are what they
+//! hold, and numbers, strings and other plain values are hyperparameters, which are not listed.
+//! A unit struct is a module without members, such as an activation. Attributes change what a
+//! field is:
+//!
+//! ```
+//! use std::rc::Rc;
+//!
+//! use homura::nn::{Module, Parameter, Training};
+//! use homura::Tensor;
+//!
+//! #[derive(Module)]
+//! struct Norm {
+//!     #[module(rename = "weight")]
+//!     scale: Parameter,
+//!     /// A buffer that is not part of the state dict (`persistent=False`); `to` converts it.
+//!     #[module(non_persistent)]
+//!     cache: Option<Tensor>,
+//!     /// Not a member: its type doesn't implement `Member`.
+//!     #[module(skip)]
+//!     log: Rc<Vec<String>>,
+//!     /// Only modules whose computation depends on the mode need the flag.
+//!     training: Training,
+//!     eps: f64,
+//! }
+//!
+//! let norm = Norm {
+//!     scale: Parameter::new(homura::ones([4])),
+//!     cache: Some(homura::zeros([4])),
+//!     log: Rc::default(),
+//!     training: Training::default(),
+//!     eps: 1e-5,
+//! };
+//! assert_eq!(norm.state_dict().keys().collect::<Vec<_>>(), ["weight"]);
+//! assert_eq!(norm.named_buffers()[0].0, "cache");
+//! norm.eval();
+//! assert!(!norm.training.get());
+//! ```
+//!
+//! Generic structs derive `Module` too; the implementations require `Member` for the fields whose
+//! types refer to a type parameter, except fields that contain the struct itself (the children
+//! of a `Tree<T>`). Implement `Module` by hand for structs that are recursive through another
+//! generic struct. With homura renamed in `Cargo.toml`, give its path with
+//! `#[module(crate = "path")]` on the struct. To report members in another way, implement
+//! `Module` and `Member` by hand (see [`Module`]).
+//!
+//! [`Sequential`] applies layers that implement [`Forward`] one after another.
+//!
 //! # Coming from PyTorch
 //!
 //! | PyTorch | homura |
 //! | --- | --- |
 //! | `nn.Parameter(t)`, `nn.Parameter(t, requires_grad=False)` | [`Parameter::new(t)`](Parameter::new), [`Parameter::with_requires_grad(t, false)`](Parameter::with_requires_grad) |
-//! | `self.w = nn.Parameter(..)` in `__init__` | a `Parameter` field, reported by [`Module::visit`] (see [`Member`]) |
-//! | `self.register_buffer("b", t)`, `persistent=False` | a [`Tensor`](crate::Tensor) field; [`Visitor::buffer`] with `persistent = false` |
+//! | `class Net(nn.Module)` | `#[derive(Module)] struct Net` |
+//! | `self.w = nn.Parameter(..)` in `__init__` | a `Parameter` field |
+//! | `self.register_buffer("b", t)`, `persistent=False` | a [`Tensor`](crate::Tensor) field, `#[module(non_persistent)]` |
+//! | `nn.Sequential(a, b)` | [`Sequential::new().append(a).append(b)`](Sequential) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
@@ -114,6 +143,9 @@
 //!   [`Tensor`](crate::Tensor), so `&param` works where a `&Tensor` is expected, and `&*param`
 //!   where an operator needs the tensor (`&*param * 2.0`).
 
+#[cfg(doctest)]
+mod derive_errors;
+mod layers;
 mod module;
 #[cfg(test)]
 mod module_tests;
@@ -121,7 +153,16 @@ mod parameter;
 mod state_dict;
 mod training;
 
+/// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
+pub use homura_derive::Module;
+pub use layers::{Forward, Sequential};
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;
 pub use state_dict::{LoadError, LoadReport, StateDict, StateDictIter};
 pub use training::Training;
+
+/// What `#[derive(Module)]` expands to uses; not part of the API.
+#[doc(hidden)]
+pub mod __private {
+    pub use super::module::NonPersistent;
+}

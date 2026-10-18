@@ -30,3 +30,4 @@ workspace = true
 
 [dependencies]
 half = "2.7"
+homura-derive = { version = "=0.2.0", path = "homura-derive" }

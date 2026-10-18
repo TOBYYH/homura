@@ -14,3 +14,10 @@ proc-macro = true
 workspace = true
 
 [dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "2.0.119", features = ["visit"] }
+
+[dev-dependencies]
+# The tests of the expansion check where errors point.
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }

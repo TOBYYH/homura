@@ -57,6 +57,12 @@ pub trait Visitor<'a> {
 ///
 /// Tensors and parameters are members but not modules, so the methods of [`Module`] never
 /// shadow tensor methods of the same name: `Box<Tensor>::to` is [`Tensor::to`].
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` can't be a member of a module",
+    label = "`{Self}` doesn't implement `Member`",
+    note = "the fields of a module are parameters, buffers, submodules and hyperparameters; mark \
+            other fields `#[module(skip)]`"
+)]
 pub trait Member {
     /// Reports this value to `v` as a member named `name` of a module: a module calls
     /// `v.module(name, self, None)`; the other types report what the table above says.
@@ -82,9 +88,11 @@ pub trait Member {
 ///
 /// # Implementing `Module`
 ///
-/// [`visit`](Module::visit) reports each member of the module by calling
-/// [`visit_as`](Member::visit_as) on it with its name; the member's type decides what it is (see
-/// [`Member`]). As a member of another module, a module reports itself as a submodule.
+/// `#[derive(Module)]` implements `Module` and [`Member`] for a struct, reporting its fields (see
+/// [Deriving `Module`](super#deriving-module)). By hand, [`visit`](Module::visit) reports each
+/// member of the module by calling [`visit_as`](Member::visit_as) on it with its name; the
+/// member's type decides what it is (see [`Member`]). As a member of another module, a module
+/// reports itself as a submodule.
 ///
 /// ```
 /// use homura::nn::{Member, Module, Parameter, Visitor};
@@ -639,6 +647,31 @@ impl<'a> Visitor<'a> for SharedVisitor<'_, 'a> {
 
     fn training(&mut self, training: &'a Training) {
         self.inner.training(training);
+    }
+}
+
+/// How `#[module(non_persistent)]` fields report themselves: as buffers that are not part of
+/// the state dict.
+#[diagnostic::on_unimplemented(
+    message = "`#[module(non_persistent)]` needs a `Tensor` or `Option<Tensor>` field, not \
+               `{Self}`",
+    label = "not a buffer"
+)]
+pub trait NonPersistent {
+    fn visit_non_persistent<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>);
+}
+
+impl NonPersistent for Tensor {
+    fn visit_non_persistent<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
+        v.buffer(name, self, false);
+    }
+}
+
+impl NonPersistent for Option<Tensor> {
+    fn visit_non_persistent<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
+        if let Some(buffer) = self {
+            v.buffer(name, buffer, false);
+        }
     }
 }
 

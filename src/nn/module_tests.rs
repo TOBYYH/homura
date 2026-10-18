@@ -1,4 +1,5 @@
-//! Version counters around `Module::to` and failed loads, which the public API doesn't show.
+//! Version counters around `Module::to` and failed loads, which the public API doesn't show, and
+//! `#[derive(Module)]` inside the crate.
 
 use super::{Member, Module, Parameter, StateDict, Visitor};
 use crate::Tensor;
@@ -102,4 +103,22 @@ impl Member for Mixed {
     fn visit_as<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
         v.module(name, self, None);
     }
+}
+
+/// The expansion names the crate `::homura`, which `extern crate self` declares here.
+#[derive(super::Module)]
+struct Derived {
+    weight: Parameter,
+    #[module(non_persistent)]
+    cache: Tensor,
+}
+
+#[test]
+fn modules_derive_inside_the_crate() {
+    let m = Derived {
+        weight: Parameter::new(crate::zeros([1])),
+        cache: crate::zeros([1]),
+    };
+    assert_eq!(m.state_dict().keys().collect::<Vec<_>>(), ["weight"]);
+    assert_eq!(m.named_buffers()[0].0, "cache");
 }

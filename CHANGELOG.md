@@ -8,13 +8,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- The `nn` module's core: `Parameter`; the `Module` and `Member` traits, implemented by hand for
-  now, with `Visitor` and `SharedId`; PyTorch's traversals (`named_parameters`, `named_buffers`,
+- The `nn` module's core: `Parameter`; the `Module` and `Member` traits, with `Visitor` and
+  `SharedId`; PyTorch's traversals (`named_parameters`, `named_buffers`,
   `named_modules`, `named_children` and the unnamed versions), `train` / `eval` through
   `Training` flags, `zero_grad` and `requires_grad_`; `StateDict`, `state_dict` and
   `load_state_dict`, which checks every entry before it writes any; and `Module::to`, which
-  converts parameters and buffers in place, keeping them the same tensors. The derive macro,
-  layers, losses and optimizers are not available yet.
+  converts parameters and buffers in place, keeping them the same tensors. Layers, losses and
+  optimizers are not available yet.
+- `#[derive(Module)]` (`nn::Module`, from the new `homura-derive` crate) for structs with named
+  fields or none, generic ones included, with the field attributes `rename`, `skip` and
+  `non_persistent` and the struct attribute `crate`.
+- `nn::Sequential` and the `nn::Forward` trait of its layers.
 
 ### Changed
 

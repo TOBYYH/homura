@@ -23,8 +23,8 @@
 //! This project is in early development: only the CPU reference backend and the meta device are
 //! implemented, and the API is not stable yet.
 
-// Code shared with the integration tests (`src/autograd/test_support`) names the crate `homura`.
-#[cfg(test)]
+// `#[derive(nn::Module)]` in this crate, and code shared with the integration tests
+// (`src/autograd/test_support`), name the crate `homura`.
 extern crate self as homura;
 
 // The README's examples run as documentation tests.

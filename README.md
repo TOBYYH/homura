@@ -22,11 +22,11 @@ Implemented so far:
   `gradcheck` / `gradgradcheck`. Gradients are checked against PyTorch, including for a Llama
   decoder layer.
 - Minimal safetensors reading and writing.
-- The core of `nn` modules: `Parameter`, the `Module` trait with PyTorch's traversals,
-  `state_dict` / `load_state_dict` and in-place conversion with `to`.
+- The core of `nn` modules: `Parameter`, `#[derive(Module)]` and the `Module` trait with
+  PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
+  `Sequential`.
 
-Not available yet: GPU backends (ROCm comes first), `#[derive(Module)]`, neural network layers,
-losses and optimizers, custom autograd functions and hooks, and in-place operations on views that
+Not available yet: GPU backends (ROCm comes first), neural network layers, losses and optimizers, custom autograd functions and hooks, and in-place operations on views that
 require grad.
 
 ## Example

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use super::meta;
 use super::node::NodeRef;
-use crate::Tensor;
 use crate::tensor::{TensorData, WeakTensor};
+use crate::{DType, Device, Tensor};
 
 /// The index of a saved tensor in its node, handed out by `NodeBuilder::save`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,8 +27,14 @@ enum Packed {
     /// be set so that a higher-order graph reaches it, and such a graph must reach the leaf's own
     /// accumulator. A leaf owns no node, but its `.grad` can own a graph (under
     /// `backward(create_graph = true)`, one that saves the leaf again: a reference cycle that only
-    /// clearing the `.grad` breaks, as in PyTorch).
-    Leaf { tensor: Tensor, version: u64 },
+    /// clearing the `.grad` breaks, as in PyTorch). Its dtype and device when saved tell a later
+    /// replacement of its data (`Tensor::set_data`) apart from an in-place modification.
+    Leaf {
+        tensor: Tensor,
+        version: u64,
+        dtype: DType,
+        device: Device,
+    },
     /// An input with a history: a snapshot of its data without autograd state, its history, and
     /// the flag that `detach_` sets on the original. Not holding the original tensor lets graph
     /// destruction reach `grad_fn` without recursion. The weak handle to the original only names
@@ -58,6 +64,8 @@ impl SavedTensor {
             None => Packed::Leaf {
                 tensor: t.clone(),
                 version,
+                dtype: t.dtype(),
+                device: t.device(),
             },
             Some((grad_fn, output_nr, detached)) => Packed::NonLeaf {
                 data: t.data(),
@@ -94,7 +102,8 @@ impl SavedTensor {
     ///
     /// Panics with PyTorch's messages if the tensor was released, detached in place after it
     /// was saved (checked even if the original was dropped since), or modified in place after
-    /// it was saved.
+    /// it was saved; also if it is a leaf whose data was replaced since, which changes its
+    /// version too (see `Tensor::set_data`).
     pub(super) fn unpack(&self, owner: &NodeRef) -> Tensor {
         // Copy handles out under the lock; build the tensor after releasing it.
         let packed = self.slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -106,8 +115,23 @@ impl SavedTensor {
                  if you need to backward through the graph a second time or if you need to \
                  access saved tensors after calling backward."
             ),
-            Some(Packed::Leaf { tensor, version }) => {
-                check_version(&tensor.data(), version, || meta::grad_fn(&tensor));
+            Some(Packed::Leaf {
+                tensor,
+                version,
+                dtype,
+                device,
+            }) => {
+                let data = tensor.data();
+                if (data.dtype, data.device()) != (dtype, device) {
+                    panic!(
+                        "the data of a leaf saved for the backward pass was replaced after it was \
+                         saved (it was {dtype} on {device}, it is {} on {}); run the forward pass \
+                         again",
+                        data.dtype,
+                        data.device()
+                    );
+                }
+                check_version(&data, version, || meta::grad_fn(&tensor));
                 tensor
             }
             Some(Packed::NonLeaf {

@@ -156,6 +156,28 @@ pub(crate) fn set_requires_grad(t: &Tensor, flag: bool) {
         .requires_grad = flag;
 }
 
+/// Drops the cached accumulator of `t` after its data was replaced (`Tensor::set_data`), so that
+/// new graphs get an accumulator recording the new metadata. Old graphs keep theirs.
+pub(crate) fn forget_accumulator(t: &Tensor) {
+    let previous = t
+        .autograd_meta()
+        .as_mut()
+        .and_then(|m| m.grad_accumulator.take());
+    drop(previous);
+}
+
+/// Replaces the data of the leaf `t` with `data` (see `Tensor::set_data`) and, if `grad` is given,
+/// its `.grad` with `grad`, for `Module::to`. Holds the `.grad` lock throughout, so that a backward
+/// pass never sees one replaced without the other.
+pub(crate) fn replace_leaf_data(t: &Tensor, data: TensorData, grad: Option<Tensor>) {
+    with_grad_lock(t, || {
+        t.set_data(data);
+        if grad.is_some() {
+            set_grad(t, grad);
+        }
+    });
+}
+
 /// The gradient accumulated into `t`.
 pub(crate) fn grad(t: &Tensor) -> Option<Tensor> {
     t.autograd_meta().as_ref().and_then(|m| m.grad.clone())

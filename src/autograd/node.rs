@@ -343,6 +343,11 @@ impl ApplyContext<'_> {
         self.node.cell().next_edges[i].is_some() && self.mask.is_none_or(|m| m[i])
     }
 
+    /// The metadata of the forward outputs whose gradients this node receives, as recorded.
+    pub fn input_meta(&self) -> &[InputMeta] {
+        self.node.input_meta()
+    }
+
     /// The running node. Formulas don't get it, so that they can't release saved tensors.
     #[cfg(test)]
     pub fn node(&self) -> &NodeRef {

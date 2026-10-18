@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- The `nn` module's core: `Parameter`; the `Module` and `Member` traits, implemented by hand for
+  now, with `Visitor` and `SharedId`; PyTorch's traversals (`named_parameters`, `named_buffers`,
+  `named_modules`, `named_children` and the unnamed versions), `train` / `eval` through
+  `Training` flags, `zero_grad` and `requires_grad_`; `StateDict`, `state_dict` and
+  `load_state_dict`, which checks every entry before it writes any; and `Module::to`, which
+  converts parameters and buffers in place, keeping them the same tensors. The derive macro,
+  layers, losses and optimizers are not available yet.
+
+### Changed
+
+- A backward pass panics instead of writing a gradient that doesn't match its leaf, when
+  `Module::to` converted the leaf (or the tensor that is its `.grad`) after the graph was
+  recorded; views whose base was converted are stale.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

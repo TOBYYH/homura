@@ -481,10 +481,8 @@ impl Tensor {
         check_writable(&dst);
         // Checks that `src` broadcasts to `self`.
         s.layout.expand_to(&dst.layout.shape);
-        match (dst.device(), s.device()) {
-            (Device::Meta, _) | (Device::Cpu, Device::Cpu) => {}
-            (_, Device::Meta) => panic!("Cannot copy out of meta tensor; no data!"),
-            (d, sd) => panic!("copy from {sd} to {d} is not supported"),
+        if let Some(e) = copy_device_error(&dst, &s) {
+            panic!("{e}");
         }
         (dst, s)
     }
@@ -504,14 +502,34 @@ impl Tensor {
     }
 }
 
+/// Why `copy_` from a tensor with the same shape as the target `dst` would fail, or `None` if
+/// it works: the checks of `copy_` other than broadcasting, for callers that check many copies
+/// before doing any (`Module::load_state_dict`).
+pub(crate) fn copy_error(dst: &TensorData, src: &TensorData) -> Option<String> {
+    writable_error(dst)
+        .map(String::from)
+        .or_else(|| copy_device_error(dst, src))
+}
+
+fn copy_device_error(dst: &TensorData, src: &TensorData) -> Option<String> {
+    match (dst.device(), src.device()) {
+        (Device::Meta, _) | (Device::Cpu, Device::Cpu) => None,
+        (_, Device::Meta) => Some("Cannot copy out of meta tensor; no data!".into()),
+        (d, sd) => Some(format!("copy from {sd} to {d} is not supported")),
+    }
+}
+
 /// Panics unless the elements of `dst` are proven to be distinct memory locations (see
 /// `Layout::may_overlap_internally`), so that no location is written more than once.
 pub(crate) fn check_writable(dst: &TensorData) {
-    if dst.layout.may_overlap_internally() {
-        panic!(
-            "unsupported operation: more than one element of the written-to tensor may refer to \
-             a single memory location. Please deep_clone() the tensor before performing the \
-             operation."
-        );
+    if let Some(e) = writable_error(dst) {
+        panic!("{e}");
     }
+}
+
+fn writable_error(dst: &TensorData) -> Option<&'static str> {
+    dst.layout.may_overlap_internally().then_some(
+        "unsupported operation: more than one element of the written-to tensor may refer to a \
+         single memory location. Please deep_clone() the tensor before performing the operation.",
+    )
 }

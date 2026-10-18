@@ -1,6 +1,7 @@
 //! Connecting tensors to the backward graph.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::accumulate::grad_accumulator;
@@ -216,22 +217,43 @@ pub(crate) fn gradient_edge(t: &Tensor) -> Option<Edge> {
 }
 
 /// Panics if `t` is a view whose history is stale: its base had its history rewritten by an
-/// in-place operation in grad mode after the view was created. Replaying the view on the new
-/// history is not supported yet.
+/// in-place operation in grad mode after the view was created (replaying the view on the new
+/// history is not supported yet), or its base's data was replaced by `Module::to`, so that the
+/// view no longer shares it.
 pub(crate) fn check_not_stale(t: &Tensor) {
-    if is_stale(t) {
-        panic!(
+    match staleness(t) {
+        None => {}
+        Some(Stale::History) => panic!(
             "a view whose base was modified by an in-place operation in grad mode after the view \
              was created can't be used for gradient computation yet; create the view again \
              after the in-place operation"
-        );
+        ),
+        Some(Stale::Data) => panic!(
+            "a view whose base had its data replaced (by Module::to) after the view was created \
+             can't be used for gradient computation: it still refers to the old data; create \
+             the view again"
+        ),
     }
 }
 
 /// Whether `t` is a view whose history is stale, see [`check_not_stale`].
 pub(crate) fn is_stale(t: &Tensor) -> bool {
-    t.view_info()
-        .is_some_and(|view| meta::history_gen(&view.base) != view.base_history_gen)
+    staleness(t).is_some()
+}
+
+enum Stale {
+    History,
+    Data,
+}
+
+fn staleness(t: &Tensor) -> Option<Stale> {
+    let view = t.view_info()?;
+    if meta::history_gen(&view.base) != view.base_history_gen {
+        return Some(Stale::History);
+    }
+    // Views share their root base's storage until `set_data` replaces the base's.
+    let shared = Arc::ptr_eq(&t.data().storage, &view.base.data().storage);
+    (!shared).then_some(Stale::Data)
 }
 
 /// Makes `t` output `output_nr` of `node`, which has just been recorded.

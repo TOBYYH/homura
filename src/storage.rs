@@ -112,4 +112,12 @@ impl Storage {
     pub fn bump_version(&self) {
         self.version.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Starts the version of this new storage one past `previous`, the version of the storage it
+    /// replaces as a tensor's data (see `Tensor::set_data`), so that a backward pass that saved
+    /// the tensor before the replacement sees a version change. Only for a storage that no other
+    /// tensor uses yet: the versions of shared storage only ever grow by one per write.
+    pub fn continue_version(&self, previous: u64) {
+        self.version.store(previous + 1, Ordering::Relaxed);
+    }
 }

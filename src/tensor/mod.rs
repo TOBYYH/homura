@@ -14,6 +14,7 @@ mod fmt;
 mod index;
 mod view;
 
+pub(crate) use convert::{conversion_error, convert_data};
 pub use create::*;
 pub use index::{Ellipsis, IndexItem, IndexSpec, NewAxis, TensorIndex};
 pub(crate) use view::{select_position, slice_bounds};
@@ -311,6 +312,15 @@ impl TensorData {
     }
 }
 
+/// The size in bytes of a new contiguous tensor of `shape` and `dtype`, or why it can't be
+/// created: on every device, it must not exceed `isize::MAX`.
+pub(crate) fn checked_nbytes(shape: &Shape, dtype: DType) -> Result<usize, String> {
+    crate::shape::checked_num_elements(shape)
+        .and_then(|n| n.checked_mul(dtype.size_in_bytes()))
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| format!("a tensor of shape {shape:?} and dtype {dtype} would be too large"))
+}
+
 impl Tensor {
     pub(crate) fn from_data(data: TensorData) -> Tensor {
         Tensor::from_parts(data, None, None)
@@ -353,13 +363,7 @@ impl Tensor {
     ///
     /// Panics if the size in bytes exceeds `isize::MAX`, on every device.
     pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
-        let nbytes = shape
-            .num_elements()
-            .checked_mul(dtype.size_in_bytes())
-            .filter(|&n| n <= isize::MAX as usize)
-            .unwrap_or_else(|| {
-                panic!("a tensor of shape {shape:?} and dtype {dtype} would be too large")
-            });
+        let nbytes = checked_nbytes(&shape, dtype).unwrap_or_else(|e| panic!("{e}"));
         let storage = Arc::new(Storage::new(nbytes, device));
         Tensor::from_data(TensorData {
             storage,
@@ -491,6 +495,12 @@ impl Tensor {
     /// Whether `self` and `other` are handles to the same tensor (Python's `x is y`).
     pub fn is_same(&self, other: &Tensor) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// An address that identifies this tensor while a handle to it is alive, for collections
+    /// that deduplicate tensors by identity ([`is_same`](Tensor::is_same)).
+    pub(crate) fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 
     pub(crate) fn downgrade(&self) -> WeakTensor {

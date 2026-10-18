@@ -32,12 +32,18 @@ impl Node for AccumulateGrad {
 
     /// Checks the leaf's current state, not the state it had when the graph was recorded: a leaf
     /// that has since stopped requiring grad keeps its `.grad` unchanged, and one that an
-    /// in-place operation has given a history is rejected, as in PyTorch.
+    /// in-place operation has given a history is rejected, as in PyTorch. So is a leaf whose
+    /// data `Module::to` has replaced with another dtype or device since this accumulator was
+    /// created (`Tensor::set_data`), which PyTorch accepts: the gradient would no longer match
+    /// the leaf. A replacement that went back to the recorded dtype and device is accepted.
+    /// A `.grad` whose metadata no longer match the leaf's is rejected too, so that a backward
+    /// pass never writes a gradient that doesn't match its leaf.
     ///
     /// # Panics
     ///
-    /// Panics if the leaf now has a `grad_fn`.
-    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+    /// Panics if the leaf now has a `grad_fn` or other metadata, or if its `.grad` doesn't match
+    /// it.
+    fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
         let [Some(grad)] = <[Option<Tensor>; 1]>::try_from(grads).expect("one gradient") else {
             return vec![];
         };
@@ -45,10 +51,36 @@ impl Node for AccumulateGrad {
             if meta::grad_fn(&self.leaf).is_some() {
                 panic!("leaf variable has been moved into the graph interior");
             }
+            let (recorded, current) = (&ctx.input_meta()[0], InputMeta::of(&self.leaf));
+            if *recorded != current {
+                panic!(
+                    "the data of a leaf was replaced after the graph was recorded (it was {} \
+                     {:?} on {}, it is {} {:?} on {}); run the forward pass again",
+                    recorded.dtype,
+                    recorded.shape,
+                    recorded.device,
+                    current.dtype,
+                    current.shape,
+                    current.device
+                );
+            }
             if !meta::requires_grad(&self.leaf) {
                 return;
             }
-            let new = match meta::grad(&self.leaf) {
+            let old = meta::grad(&self.leaf);
+            // `set_grad` checks the gradient, but it can be a tensor that `Module::to` converted
+            // since, as a member of a module.
+            if let Some(old) = &old
+                && InputMeta::of(old) != current
+            {
+                let old = InputMeta::of(old);
+                panic!(
+                    "the .grad of a leaf no longer matches it (the gradient is {} {:?} on {}, the \
+                     leaf is {} {:?} on {}); clear it with set_grad(None)",
+                    old.dtype, old.shape, old.device, current.dtype, current.shape, current.device
+                );
+            }
+            let new = match old {
                 // Never store the incoming gradient itself: it may be an expanded view, which
                 // can't be updated in place, or a tensor that the caller still holds.
                 None => grad.deep_clone(),

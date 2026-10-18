@@ -1,8 +1,8 @@
 //! Moving data between tensors, dtypes, devices and the host.
 
-use super::{Tensor, TensorOptions};
+use super::{Tensor, TensorData, TensorOptions};
 use crate::backend::cpu;
-use crate::ops::cast_data;
+use crate::ops::{cast_data, clone_data};
 use crate::{DType, Device, Element};
 
 impl Tensor {
@@ -54,13 +54,68 @@ impl Tensor {
         if dtype == data.dtype && device == data.device() {
             return self.clone();
         }
-        let out = match (data.device(), device) {
-            (_, Device::Meta) => Tensor::empty_on(data.layout.shape.clone(), dtype, device),
-            (Device::Meta, _) => panic!("Cannot copy out of meta tensor; no data!"),
-            (Device::Cpu, Device::Cpu) => Tensor::from_data(cast_data(&data, dtype)),
-            (from, to) => panic!("copying from {from} to {to} is not supported yet"),
-        };
+        let out = Tensor::from_data(convert_data(&data, dtype, device));
         crate::autograd::formulas::to_copy(self, &out);
         out
+    }
+
+    /// Replaces the storage, layout and dtype of this tensor with `data`, which has the same
+    /// shape (PyTorch's `x.data = new`), for `Module::to`. Every handle to the tensor sees the
+    /// new data; its `requires_grad` and `.grad` stay. Views and `detach` aliases created before
+    /// keep the old storage.
+    ///
+    /// Graphs recorded before can't use the new data by accident: the storage of `data` must be
+    /// new (no other tensor uses it), and its version starts one past the old storage's, so a
+    /// graph that saved this tensor fails its version check; the cached accumulator is dropped,
+    /// and the old one, which an old graph still holds, refuses gradients whose metadata no
+    /// longer match (see `AccumulateGrad`); views of the old storage become stale.
+    ///
+    /// # Panics
+    ///
+    /// Panics (an internal error) if the tensor has a history or is a view, or if the shapes
+    /// differ: callers check these first.
+    pub(crate) fn set_data(&self, data: TensorData) {
+        assert!(
+            self.view_info().is_none() && self.is_leaf(),
+            "internal error: set_data on a view or a tensor with a history"
+        );
+        let old = {
+            let mut guard = self.0.data.write().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                guard.layout.shape, data.layout.shape,
+                "internal error: set_data with another shape"
+            );
+            data.storage.continue_version(guard.storage.version());
+            std::mem::replace(&mut *guard, data)
+        };
+        drop(old);
+        crate::autograd::forget_accumulator(self);
+    }
+}
+
+/// Why converting data from device `from` to device `to` is impossible, or `None` if it works.
+pub(crate) fn conversion_error(from: Device, to: Device) -> Option<String> {
+    match (from, to) {
+        (_, Device::Meta) | (Device::Cpu, Device::Cpu) => None,
+        (Device::Meta, _) => Some("Cannot copy out of meta tensor; no data!".into()),
+        (from, to) => Some(format!("copying from {from} to {to} is not supported yet")),
+    }
+}
+
+/// `data` converted to `dtype` on `device`, in new contiguous storage that nothing else uses.
+///
+/// # Panics
+///
+/// Panics with [`conversion_error`]'s message if the devices don't allow the conversion.
+pub(crate) fn convert_data(data: &TensorData, dtype: DType, device: Device) -> TensorData {
+    if let Some(e) = conversion_error(data.device(), device) {
+        panic!("{e}");
+    }
+    if device == Device::Meta {
+        Tensor::empty_on(data.layout.shape.clone(), dtype, device).data()
+    } else if dtype == data.dtype {
+        clone_data(data)
+    } else {
+        cast_data(data, dtype)
     }
 }

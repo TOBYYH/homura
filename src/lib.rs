@@ -17,7 +17,8 @@
 //!
 //! [`autograd`] computes gradients like PyTorch's autograd, including gradients of gradients:
 //! operations on tensors that require grad record a backward graph, which
-//! [`Tensor::backward`] or [`autograd::grad`] runs.
+//! [`Tensor::backward`] or [`autograd::grad`] runs. [`nn`] has PyTorch's module machinery:
+//! parameters, state dicts, loading and conversion of module trees.
 //!
 //! This project is in early development: only the CPU reference backend and the meta device are
 //! implemented, and the API is not stable yet.
@@ -38,6 +39,7 @@ mod device;
 mod dtype;
 mod error;
 mod io;
+pub mod nn;
 mod ops;
 mod shape;
 mod storage;

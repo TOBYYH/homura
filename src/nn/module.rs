@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use super::{LoadError, LoadReport, Parameter, StateDict, Training};
+use crate::nn::functional::Reduction;
 use crate::tensor::{TensorData, checked_nbytes, conversion_error, convert_data};
 use crate::{DType, Device, GeluApproximate, Tensor, TensorOptions, bf16, f16};
 
@@ -895,4 +896,5 @@ plain_values!(
     DType,
     Device,
     GeluApproximate,
+    Reduction,
 );

@@ -30,6 +30,13 @@ impl Resolved {
         };
     }
 
+    fn is_bool(&self) -> bool {
+        match self {
+            Resolved::Tensor(t) => t.dtype == DType::Bool,
+            Resolved::Scalar(s) => matches!(s, Scalar::Bool(_)),
+        }
+    }
+
     fn shape(&self) -> Shape {
         match self {
             Resolved::Tensor(t) => t.layout.shape.clone(),
@@ -72,11 +79,20 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
         LogicalAnd | LogicalOr => DType::Bool,
         _ => common,
     };
-    if compute == DType::Bool && op == Sub {
-        panic!(
-            "Subtraction, the `-` operator, with two bool tensors is not supported. Use \
-             `logical_xor()` instead."
-        );
+    // As in PyTorch, a bool operand is rejected before type promotion, also a single one
+    // (`[2, 3] - [true, false]`) and a bool scalar.
+    if op == Sub {
+        match (a.is_bool(), b.is_bool()) {
+            (true, true) => panic!(
+                "Subtraction, the `-` operator, with two bool tensors is not supported. Use \
+                 `not_equal()` (logical xor) instead."
+            ),
+            (true, false) | (false, true) => panic!(
+                "Subtraction, the `-` operator, with a bool tensor is not supported. If you are \
+                 trying to invert a mask, use `logical_not()` instead."
+            ),
+            (false, false) => {}
+        }
     }
     if compute == DType::Bool && op == Pow {
         panic!("pow is not supported for bool tensors");
@@ -201,6 +217,11 @@ impl Tensor {
     }
 
     /// `self - other`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either operand is a bool tensor or scalar, as PyTorch does (for meta tensors
+    /// too, where PyTorch skips the check); [`logical_not`](Tensor::logical_not) inverts a mask.
     pub fn sub(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Sub, other)
     }

@@ -26,6 +26,11 @@ pub fn sigmoid(input: &Tensor) -> Tensor {
     input.sigmoid()
 }
 
+/// `log(sigmoid(x))`, [`Tensor::log_sigmoid`].
+pub fn logsigmoid(input: &Tensor) -> Tensor {
+    input.log_sigmoid()
+}
+
 /// Softmax along `dim`, [`Tensor::softmax`].
 pub fn softmax(input: &Tensor, dim: i64) -> Tensor {
     input.softmax(dim)

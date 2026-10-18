@@ -32,7 +32,7 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
         }
         // Like PyTorch, the sign keeps integer and bool dtypes.
         Sign => dtype,
-        Silu | Gelu | GeluTanh => {
+        Silu | Gelu | GeluTanh | LogSigmoid => {
             if !dtype.is_floating_point() {
                 panic!("{op:?} is not implemented for {dtype} tensors");
             }
@@ -120,6 +120,17 @@ impl Tensor {
     /// `1 / (1 + e^-x)`.
     pub fn sigmoid(&self) -> Tensor {
         unary_op(UnaryOp::Sigmoid, self)
+    }
+
+    /// `log(sigmoid(x))`, computed stably as `min(x, 0) - log(1 + e^-|x|)` like PyTorch's CPU
+    /// kernel (`F.logsigmoid`), so that it is accurate for large `|x|`: the result for `x = 40`
+    /// is `-4.25e-18`, not zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is not floating point, as in PyTorch.
+    pub fn log_sigmoid(&self) -> Tensor {
+        unary_op(UnaryOp::LogSigmoid, self)
     }
 
     /// `max(x, 0)`.

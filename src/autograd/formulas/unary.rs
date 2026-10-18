@@ -23,6 +23,7 @@ pub(crate) fn unary(op: UnaryOp, x: &Tensor, out: &Tensor) {
         Cos => record(&inputs, &[out], |b| CosBackward0 { x: b.save(x) }),
         Erf => record(&inputs, &[out], |b| ErfBackward0 { x: b.save(x) }),
         Silu => record(&inputs, &[out], |b| SiluBackward0 { x: b.save(x) }),
+        LogSigmoid => record(&inputs, &[out], |b| LogSigmoidBackward0 { x: b.save(x) }),
         Gelu | GeluTanh => record(&inputs, &[out], |b| GeluBackward0 {
             x: b.save(x),
             approximate: if op == Gelu {
@@ -162,6 +163,84 @@ unary_nodes! {
         let sigmoid = x.sigmoid();
         g.mul(&sigmoid).mul(x.mul(1.0 - &sigmoid).add(1.0))
     };
+}
+
+/// `log(σ(x))`: the gradient is [`log_sigmoid_backward`] of `g` and the saved input.
+struct LogSigmoidBackward0 {
+    x: SavedId,
+}
+
+impl Node for LogSigmoidBackward0 {
+    fn name(&self) -> &'static str {
+        "LogSigmoidBackward0"
+    }
+
+    fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let g = only(grads);
+        let x = ctx.unpack(self.x);
+        vec![Some(log_sigmoid_backward(&g, &x))]
+    }
+}
+
+/// The gradient of the input of `log(σ(x))` for upstream gradient `g`, PyTorch's
+/// `log_sigmoid_backward` CPU kernel: from its buffer `b = e^-|x|`, `(1 - b / (1 + b)) * g` for
+/// negative `x` and `b / (1 + b) * g` otherwise. The buffer stays representable where `σ(-x)`,
+/// computed as `1 / (1 + e^x)`, underflows to zero, so that a large `g` still gives the nonzero
+/// gradient (`x = 90`, `g = 1e38` gives 0.0819 in `f32`). In half precision, the buffer is
+/// rounded to the dtype, like PyTorch's, and the rest is computed in `f32` and rounded once.
+///
+/// When `g` or `x` requires grad (a backward pass with `create_graph`), the result is recorded as
+/// a node of its own with the reference's derivatives instead of differentiating the operations
+/// above.
+fn log_sigmoid_backward(g: &Tensor, x: &Tensor) -> Tensor {
+    let grad = {
+        let _no_grad = crate::autograd::no_grad();
+        let dtype = x.dtype();
+        let buffer = x.abs().neg().exp();
+        let (buffer, g) = if matches!(dtype, DType::F16 | DType::BF16) {
+            (buffer.to(DType::F32), g.to(DType::F32))
+        } else {
+            (buffer, g.clone())
+        };
+        let ratio = buffer.div(buffer.add(1.0));
+        let derivative = where_(&x.less(0.0), 1.0 - &ratio, &ratio);
+        derivative.mul(&g).to(dtype)
+    };
+    record(&[Some(g), Some(x)], &[&grad], |b| {
+        LogSigmoidBackwardBackward0 {
+            grad_output: b.save(g),
+            x: b.save(x),
+        }
+    });
+    grad
+}
+
+/// [`log_sigmoid_backward`] of the upstream gradient `g` and the input `x`, for upstream gradient
+/// `r`, with derivatives.yaml's formulas: `g` gets `log_sigmoid_backward(r, x)` and `x` gets
+/// `log_sigmoid_double_backward(r * g, x)`, `r * g * (z - 1) * z` with `z = σ(x)`, which stays
+/// nonzero where `σ(-x)` is saturated at 1 (`x = -40`, `g = 1e18` gives -4.25).
+struct LogSigmoidBackwardBackward0 {
+    grad_output: SavedId,
+    x: SavedId,
+}
+
+impl Node for LogSigmoidBackwardBackward0 {
+    fn name(&self) -> &'static str {
+        "LogSigmoidBackwardBackward0"
+    }
+
+    fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let r = only(grads);
+        let x = ctx.unpack(self.x);
+        let dg = ctx
+            .needs_input_grad(0)
+            .then(|| log_sigmoid_backward(&r, &x));
+        let dx = ctx.needs_input_grad(1).then(|| {
+            let z = x.sigmoid();
+            r.mul(ctx.unpack(self.grad_output)).mul(z.sub(1.0)).mul(&z)
+        });
+        vec![dg, dx]
+    }
 }
 
 /// `gelu(x)`: PyTorch's `gelu_backward`, written with tensor operations so that it can be

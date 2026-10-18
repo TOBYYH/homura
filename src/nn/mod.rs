@@ -97,6 +97,11 @@
 //! applies such layers one after another. [`functional`] has their computations as functions of
 //! tensors, and [`init`] the initializations that layers use, with PyTorch's formulas.
 //!
+//! The losses are functions in [`functional`]: [`mse_loss`](functional::mse_loss),
+//! [`nll_loss`](functional::nll_loss), [`cross_entropy`](functional::cross_entropy) and
+//! [`binary_cross_entropy_with_logits`](functional::binary_cross_entropy_with_logits), with a
+//! [`Reduction`](functional::Reduction).
+//!
 //! # Coming from PyTorch
 //!
 //! | PyTorch | homura |
@@ -109,6 +114,9 @@
 //! | `nn.Linear(4, 3)`, `nn.Linear(4, 3, bias=False)` | [`Linear::new(4, 3)`](Linear::new), [`Linear::new(4, 3).bias(false)`](Linear::bias) |
 //! | `nn.ReLU()`, `nn.GELU(approximate="tanh")`, `nn.Softmax(dim=-1)` | [`Relu`], [`Gelu::new().approximate(GeluApproximate::Tanh)`](Gelu::approximate), [`Softmax::new(-1)`](Softmax::new) |
 //! | `F.linear(x, w, b)`, `F.relu(x)` | [`functional::linear(&x, &w, Some(&b))`](functional::linear), [`functional::relu(&x)`](functional::relu) or `x.relu()` |
+//! | `F.cross_entropy(x, t)`, `F.cross_entropy(x, t, weight=w, label_smoothing=0.1)` | [`functional::cross_entropy(&x, &t, Default::default())`](functional::cross_entropy), `cross_entropy(&x, &t, CrossEntropyOptions { weight: Some(w), label_smoothing: 0.1, ..Default::default() })` |
+//! | `F.nll_loss(x, t)`, `F.mse_loss(x, y, reduction="sum")` | [`functional::nll_loss(&x, &t, None, -100, Reduction::Mean)`](functional::nll_loss), [`functional::mse_loss(&x, &y, Reduction::Sum)`](functional::mse_loss) |
+//! | `F.binary_cross_entropy_with_logits(x, y, pos_weight=p)` | [`functional::binary_cross_entropy_with_logits(&x, &y, None, Reduction::Mean, Some(&p))`](functional::binary_cross_entropy_with_logits) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
@@ -140,6 +148,10 @@
 //! - Parameters are not a tensor subclass: [`Parameter`] derefs to
 //!   [`Tensor`](crate::Tensor), so `&param` works where a `&Tensor` is expected, and `&*param`
 //!   where an operator needs the tensor (`&*param * 2.0`).
+//! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
+//!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
+//!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`
+//!   targets for inputs of more than two dimensions, which PyTorch's CPU kernel rejects.
 
 #[cfg(doctest)]
 mod derive_errors;

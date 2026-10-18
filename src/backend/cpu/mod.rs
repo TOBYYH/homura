@@ -405,6 +405,11 @@ pub(crate) fn unary(op: UnaryOp, out: &TensorData, src: &TensorData) {
                 Erf => float_map!(|x| Float::erf(x)),
                 Tanh => float_map!(|x| x.tanh()),
                 Sigmoid => float_map!(|x| one / (one + (-x).exp())),
+                // PyTorch's CPU kernel: min(x, 0) - log1p(e^-|x|).
+                LogSigmoid => float_map!(|x| {
+                    let min = if x.is_nan() || x < C::ZERO { x } else { C::ZERO };
+                    min - (-x.abs()).exp().ln_1p()
+                }),
                 Silu => float_map!(|x| x / (one + (-x).exp())),
                 Gelu => {
                     let frac_1_sqrt_2 = C::of(std::f64::consts::FRAC_1_SQRT_2);

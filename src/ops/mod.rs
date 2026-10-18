@@ -46,6 +46,7 @@ pub(crate) enum UnaryOp {
     Erf,
     Tanh,
     Sigmoid,
+    LogSigmoid,
     Silu,
     Gelu,
     GeluTanh,

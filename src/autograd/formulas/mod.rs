@@ -11,6 +11,7 @@ mod clamp;
 mod index;
 mod inplace;
 mod lerp;
+pub(crate) mod loss;
 mod matmul;
 mod misc;
 mod pow;

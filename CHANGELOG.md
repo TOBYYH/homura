@@ -13,8 +13,8 @@ All notable changes to this project are documented in this file. The format is b
   `named_modules`, `named_children` and the unnamed versions), `train` / `eval` through
   `Training` flags, `zero_grad` and `requires_grad_`; `StateDict`, `state_dict` and
   `load_state_dict`, which checks every entry before it writes any; and `Module::to`, which
-  converts parameters and buffers in place, keeping them the same tensors. Losses and
-  optimizers are not available yet.
+  converts parameters and buffers in place, keeping them the same tensors. Optimizers are not
+  available yet.
 - `#[derive(Module)]` (`nn::Module`, from the new `homura-derive` crate) for structs with named
   fields or none, generic ones included, with the field attributes `rename`, `skip` and
   `non_persistent` and the struct attribute `crate`.
@@ -26,9 +26,17 @@ All notable changes to this project are documented in this file. The format is b
   activations `relu`, `gelu`, `silu`, `tanh`, `sigmoid`, `softmax` and `log_softmax`.
 - The layers `nn::Linear`, initialized like PyTorch's, and `nn::Relu`, `nn::Gelu`, `nn::Silu`,
   `nn::Tanh`, `nn::Sigmoid` and `nn::Softmax`.
+- The losses `nn::functional::mse_loss`, `nll_loss`, `cross_entropy` (class and probability
+  targets, `weight`, `ignore_index`, `label_smoothing`, through `CrossEntropyOptions`) and
+  `binary_cross_entropy_with_logits` (`weight`, `pos_weight`), with a `Reduction`, recording
+  PyTorch's backward nodes and gradient formulas.
+- `Tensor::log_sigmoid` and `nn::functional::logsigmoid`, computed stably like PyTorch's kernel.
 
 ### Changed
 
+- Subtraction (`sub`, `sub_`, the `-` operator) panics like PyTorch when either operand is a bool
+  tensor or scalar; it used to promote a single bool operand (`[2, 3] - [true, false]` gave
+  `[1, 3]`). Meta tensors are checked too.
 - `fill_`, `full` (with `full_with`, `new_full` and `full_like`), `masked_fill` and
   `masked_fill_` with a scalar panic like PyTorch when the value overflows the dtype (`300` for
   `U8`, `1e40` for `F32`), also for tensors without elements and for a zero-dimensional tensor

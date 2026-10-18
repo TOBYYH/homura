@@ -13,8 +13,7 @@ All notable changes to this project are documented in this file. The format is b
   `named_modules`, `named_children` and the unnamed versions), `train` / `eval` through
   `Training` flags, `zero_grad` and `requires_grad_`; `StateDict`, `state_dict` and
   `load_state_dict`, which checks every entry before it writes any; and `Module::to`, which
-  converts parameters and buffers in place, keeping them the same tensors. Optimizers are not
-  available yet.
+  converts parameters and buffers in place, keeping them the same tensors.
 - `#[derive(Module)]` (`nn::Module`, from the new `homura-derive` crate) for structs with named
   fields or none, generic ones included, with the field attributes `rename`, `skip` and
   `non_persistent` and the struct attribute `crate`.
@@ -31,6 +30,16 @@ All notable changes to this project are documented in this file. The format is b
   `binary_cross_entropy_with_logits` (`weight`, `pos_weight`), with a `Reduction`, recording
   PyTorch's backward nodes and gradient formulas.
 - `Tensor::log_sigmoid` and `nn::functional::logsigmoid`, computed stably like PyTorch's kernel.
+- The `optim` module: the `Optimizer` trait with `ParamGroup`s, and `Sgd` (momentum, dampening,
+  weight decay, Nesterov, maximize), `Adam` and `AdamW` (betas, eps, weight decay, AMSGrad,
+  maximize), with PyTorch's defaults, checks and update order. Each compound operation of a step
+  is computed like PyTorch's vectorized CPU kernels and rounded once, which matched the reference
+  build bit for bit in the tested cases, except that F16 / BF16 scaled additions past the last
+  multiple of 32 elements don't round after each operation as PyTorch's scalar loop does. Scalars
+  that overflow their type are rejected as there. Only the options of a group can be changed
+  afterwards (`options_mut`). Unlike PyTorch, a parameter listed twice in a group is an error, and
+  `step` checks the options, the parameters and their state before it updates anything. Optimizer
+  state can't be saved or loaded yet.
 
 ### Changed
 

@@ -507,6 +507,68 @@ pub(crate) fn binary_scalar(
     })
 }
 
+/// The elementwise steps of the optimizers that PyTorch computes in one kernel, as its vectorized
+/// CPU kernels (AVX2 build) do: in the computation type of the dtype (`f32` for `f16` and
+/// `bf16`), rounding to the dtype once. Composing them from separate operations would round the
+/// intermediate products, which can overflow or vanish. PyTorch's scalar loop for the elements
+/// after the last full vector rounds `f16` / `bf16` scaled additions after each operation;
+/// homura computes every element like the vectorized loop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fused {
+    /// `a + alpha * b` (`add(b, alpha=)`), with one rounding: `fmadd(b, alpha, a)`, with `alpha`
+    /// rounded to the dtype first.
+    ScaledAdd(f64),
+    /// `lerp(a, b, weight)` with a scalar weight: `fmadd(weight, b - a, a)` if `|weight| < 0.5`
+    /// and `fmadd(weight - 1, b - a, b)` otherwise.
+    Lerp(f64),
+    /// `a + value * b * c` (`addcmul`), as `fmadd(value * b, c, a)`: the compiler fuses the last
+    /// multiplication and the addition of PyTorch's kernel.
+    Addcmul(f64),
+    /// `a + value * b / c` (`addcdiv`), without fused multiply-adds.
+    Addcdiv(f64),
+}
+
+/// `out = op(a, b)` or `op(a, b, c)` for floating point operands of the dtype and shape of
+/// `out`; `c` is given exactly for `Addcmul` and `Addcdiv`.
+pub(crate) fn fused(
+    op: Fused,
+    out: &TensorData,
+    a: &TensorData,
+    b: &TensorData,
+    c: Option<&TensorData>,
+) {
+    dispatch_float!(out.dtype, T => {
+        let of = <T as FloatElement>::C::of;
+        match op {
+            Fused::ScaledAdd(alpha) => {
+                let alpha = T::down(of(alpha)).up();
+                map2::<T, T, T>(out, a, b, |x, y| T::down(y.up().mul_add(alpha, x.up())));
+            }
+            Fused::Lerp(weight) => {
+                let weight = of(weight);
+                let small = weight.abs() < of(0.5);
+                let coeff = if small { weight } else { weight - of(1.0) };
+                map2::<T, T, T>(out, a, b, |x, y| {
+                    let (x, y) = (x.up(), y.up());
+                    T::down(coeff.mul_add(y - x, if small { x } else { y }))
+                });
+            }
+            Fused::Addcmul(value) => {
+                let value = of(value);
+                let c = c.expect("addcmul has three operands");
+                map3::<T, T, T, T>(out, a, b, c, |x, y, z| {
+                    T::down((value * y.up()).mul_add(z.up(), x.up()))
+                });
+            }
+            Fused::Addcdiv(value) => {
+                let value = of(value);
+                let c = c.expect("addcdiv has three operands");
+                map3::<T, T, T, T>(out, a, b, c, |x, y, z| T::down(x.up() + value * y.up() / z.up()));
+            }
+        }
+    })
+}
+
 /// `out = cond ? x : y`. `x` and `y` have the dtype of `out`, `cond` is `Bool`; all have the
 /// shape of `out`.
 pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &TensorData) {

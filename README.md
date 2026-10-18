@@ -26,9 +26,12 @@ Implemented so far:
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
   `Sequential`; `nn::init`, `Linear` and the activation layers, initialized like PyTorch's; the
   losses `mse_loss`, `nll_loss`, `cross_entropy` and `binary_cross_entropy_with_logits`.
+- The optimizers `optim::Sgd`, `Adam` and `AdamW`, with parameter groups, checked step by step
+  against PyTorch's.
 
-Not available yet: GPU backends (ROCm comes first), most neural network layers, optimizers,
-custom autograd functions and hooks, and in-place operations on views that require grad.
+Not available yet: GPU backends (ROCm comes first), most neural network layers, saving and
+loading optimizer state, custom autograd functions and hooks, and in-place operations on views
+that require grad.
 
 ## Example
 

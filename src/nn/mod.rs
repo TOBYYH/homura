@@ -10,7 +10,7 @@
 //! ordinary method of the struct.
 //!
 //! ```
-//! use homura::nn::{Module, Parameter};
+//! use homura::nn::{Linear, Module};
 //! use homura::{DType, Tensor};
 //!
 //! #[derive(Module)]
@@ -19,39 +19,25 @@
 //!     output: Linear,
 //! }
 //!
-//! #[derive(Module)]
-//! struct Linear {
-//!     weight: Parameter,
-//!     bias: Parameter,
-//! }
-//!
-//! impl Linear {
-//!     fn new(inputs: usize, outputs: usize) -> Linear {
-//!         Linear {
-//!             weight: Parameter::new(homura::randn([outputs, inputs])),
-//!             bias: Parameter::new(homura::zeros([outputs])),
-//!         }
-//!     }
-//!
-//!     fn forward(&self, x: &Tensor) -> Tensor {
-//!         x.matmul(&self.weight.transpose(0, 1)) + &*self.bias
-//!     }
-//! }
-//!
 //! impl Mlp {
+//!     fn new() -> Mlp {
+//!         Mlp { hidden: Linear::new(4, 8), output: Linear::new(8, 2) }
+//!     }
+//!
 //!     fn forward(&self, x: &Tensor) -> Tensor {
 //!         self.output.forward(&self.hidden.forward(x).relu())
 //!     }
 //! }
 //!
-//! let model = Mlp { hidden: Linear::new(4, 8), output: Linear::new(8, 2) };
+//! let model = Mlp::new();
 //! let keys: Vec<String> = model.named_parameters().into_iter().map(|(k, _)| k).collect();
 //! assert_eq!(keys, ["hidden.weight", "hidden.bias", "output.weight", "output.bias"]);
 //!
 //! model.to(DType::F64);
 //! let y = model.forward(&homura::ones_with([3, 4], DType::F64));
 //! y.sum().backward();
-//! assert_eq!(model.output.bias.grad().unwrap().to_vec::<f64>(), [3.0, 3.0]);
+//! let bias = model.output.bias.as_ref().unwrap();
+//! assert_eq!(bias.grad().unwrap().to_vec::<f64>(), [3.0, 3.0]);
 //! ```
 //!
 //! # Deriving `Module`
@@ -104,7 +90,12 @@
 //! `#[module(crate = "path")]` on the struct. To report members in another way, implement
 //! `Module` and `Member` by hand (see [`Module`]).
 //!
-//! [`Sequential`] applies layers that implement [`Forward`] one after another.
+//! # Layers
+//!
+//! [`Linear`] and the activations [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and
+//! [`Softmax`] are modules with a `forward` method and implement [`Forward`]; [`Sequential`]
+//! applies such layers one after another. [`functional`] has their computations as functions of
+//! tensors, and [`init`] the initializations that layers use, with PyTorch's formulas.
 //!
 //! # Coming from PyTorch
 //!
@@ -115,6 +106,10 @@
 //! | `self.w = nn.Parameter(..)` in `__init__` | a `Parameter` field |
 //! | `self.register_buffer("b", t)`, `persistent=False` | a [`Tensor`](crate::Tensor) field, `#[module(non_persistent)]` |
 //! | `nn.Sequential(a, b)` | [`Sequential::new().append(a).append(b)`](Sequential) |
+//! | `nn.Linear(4, 3)`, `nn.Linear(4, 3, bias=False)` | [`Linear::new(4, 3)`](Linear::new), [`Linear::new(4, 3).bias(false)`](Linear::bias) |
+//! | `nn.ReLU()`, `nn.GELU(approximate="tanh")`, `nn.Softmax(dim=-1)` | [`Relu`], [`Gelu::new().approximate(GeluApproximate::Tanh)`](Gelu::approximate), [`Softmax::new(-1)`](Softmax::new) |
+//! | `F.linear(x, w, b)`, `F.relu(x)` | [`functional::linear(&x, &w, Some(&b))`](functional::linear), [`functional::relu(&x)`](functional::relu) or `x.relu()` |
+//! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
@@ -139,12 +134,17 @@
 //!   parameters. The `.grad` of a converted tensor is replaced by a converted copy, where
 //!   PyTorch converts the gradient tensor itself; one that has a history must be cleared before
 //!   converting.
+//! - Initializations and layer constructors draw from homura's random number generator, whose
+//!   numbers differ from PyTorch's for the same seed; load a state dict to start from PyTorch's
+//!   values.
 //! - Parameters are not a tensor subclass: [`Parameter`] derefs to
 //!   [`Tensor`](crate::Tensor), so `&param` works where a `&Tensor` is expected, and `&*param`
 //!   where an operator needs the tensor (`&*param * 2.0`).
 
 #[cfg(doctest)]
 mod derive_errors;
+pub mod functional;
+pub mod init;
 mod layers;
 mod module;
 #[cfg(test)]
@@ -155,7 +155,7 @@ mod training;
 
 /// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
 pub use homura_derive::Module;
-pub use layers::{Forward, Sequential};
+pub use layers::{Forward, Gelu, Linear, Relu, Sequential, Sigmoid, Silu, Softmax, Tanh};
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;
 pub use state_dict::{LoadError, LoadReport, StateDict, StateDictIter};

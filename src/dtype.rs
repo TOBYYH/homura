@@ -316,6 +316,46 @@ impl Scalar {
             Scalar::Float(_) => crate::default_dtype(),
         }
     }
+
+    /// The value as a scalar of `dtype`, converted the way PyTorch checks a scalar it writes into
+    /// a tensor (`fill_`, `full`, `masked_fill`): `None` if it overflows `dtype`.
+    ///
+    /// - Bool targets take any value, as nonzero or zero.
+    /// - Floating point targets reject finite values beyond the dtype's largest finite value;
+    ///   infinities and NaN pass, and the value is kept, to be rounded by the kernel.
+    /// - Integer targets take integers in their range, plus, for `U8`, negative integers down to
+    ///   `-255`, which wrap around. Floats must lie in `[MIN, MAX + 1)` (checked before they are
+    ///   truncated toward zero, so `-0.5` doesn't fit `U8` but `255.9` becomes 255); infinities
+    ///   and NaN never fit.
+    pub(crate) fn checked_to(self, dtype: DType) -> Option<Scalar> {
+        match dtype.kind() {
+            Kind::Bool => Some(Scalar::Bool(self.to_bool())),
+            Kind::Float => {
+                let v = self.to_f64();
+                (!(v.is_finite() && v.abs() > dtype.float_max())).then_some(self)
+            }
+            Kind::Int => {
+                let (min, max) = dtype.int_range();
+                match self {
+                    Scalar::Bool(v) => Some(Scalar::Int(v as i64)),
+                    Scalar::Int(v) => {
+                        // Like PyTorch, negative integers down to `-255` wrap around for `U8`.
+                        let min = if dtype == DType::U8 { -max } else { min };
+                        (min..=max).contains(&v).then_some(Scalar::Int(v))
+                    }
+                    Scalar::Float(v) => {
+                        // Fractional values above MAX still truncate to MAX; MAX + 1 is the
+                        // exclusive upper bound. Compute it in i128 so I64 uses exactly 2^63, not
+                        // a rounded MAX.
+                        let upper = (max as i128 + 1) as f64;
+                        (min as f64..upper)
+                            .contains(&v)
+                            .then_some(Scalar::Int(v as i64))
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for Scalar {

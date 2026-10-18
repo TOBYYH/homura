@@ -24,10 +24,11 @@ Implemented so far:
 - Minimal safetensors reading and writing.
 - The core of `nn` modules: `Parameter`, `#[derive(Module)]` and the `Module` trait with
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
-  `Sequential`.
+  `Sequential`; `nn::init`, `Linear` and the activation layers, initialized like PyTorch's.
 
-Not available yet: GPU backends (ROCm comes first), neural network layers, losses and optimizers, custom autograd functions and hooks, and in-place operations on views that
-require grad.
+Not available yet: GPU backends (ROCm comes first), most neural network layers, losses and
+optimizers, custom autograd functions and hooks, and in-place operations on views that require
+grad.
 
 ## Example
 

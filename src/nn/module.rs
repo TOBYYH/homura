@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{LoadError, LoadReport, Parameter, StateDict, Training};
 use crate::tensor::{TensorData, checked_nbytes, conversion_error, convert_data};
-use crate::{DType, Device, Tensor, TensorOptions, bf16, f16};
+use crate::{DType, Device, GeluApproximate, Tensor, TensorOptions, bf16, f16};
 
 /// The identity of a submodule shared through an [`Arc`]: the address of the `Arc`'s value,
 /// which stays unique while the traversal holds the module tree. Traversals that list each
@@ -894,4 +894,5 @@ plain_values!(
     (),
     DType,
     Device,
+    GeluApproximate,
 );

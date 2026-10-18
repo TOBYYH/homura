@@ -13,15 +13,27 @@ All notable changes to this project are documented in this file. The format is b
   `named_modules`, `named_children` and the unnamed versions), `train` / `eval` through
   `Training` flags, `zero_grad` and `requires_grad_`; `StateDict`, `state_dict` and
   `load_state_dict`, which checks every entry before it writes any; and `Module::to`, which
-  converts parameters and buffers in place, keeping them the same tensors. Layers, losses and
+  converts parameters and buffers in place, keeping them the same tensors. Losses and
   optimizers are not available yet.
 - `#[derive(Module)]` (`nn::Module`, from the new `homura-derive` crate) for structs with named
   fields or none, generic ones included, with the field attributes `rename`, `skip` and
   `non_persistent` and the struct attribute `crate`.
 - `nn::Sequential` and the `nn::Forward` trait of its layers.
+- `nn::init` with PyTorch's initializations (`uniform_`, `normal_`, `constant_`, `ones_`,
+  `zeros_`, `kaiming_uniform_`, `kaiming_normal_`, `xavier_uniform_`, `xavier_normal_`) and
+  `calculate_gain` / `calculate_fan_in_and_fan_out`.
+- `nn::functional` with `linear`, which records the operations of PyTorch's `F.linear`, and the
+  activations `relu`, `gelu`, `silu`, `tanh`, `sigmoid`, `softmax` and `log_softmax`.
+- The layers `nn::Linear`, initialized like PyTorch's, and `nn::Relu`, `nn::Gelu`, `nn::Silu`,
+  `nn::Tanh`, `nn::Sigmoid` and `nn::Softmax`.
 
 ### Changed
 
+- `fill_`, `full` (with `full_with`, `new_full` and `full_like`), `masked_fill` and
+  `masked_fill_` with a scalar panic like PyTorch when the value overflows the dtype (`300` for
+  `U8`, `1e40` for `F32`), also for tensors without elements and for a zero-dimensional tensor
+  `value` of `masked_fill`; they used to write a wrapped or infinite value. Meta tensors take
+  any value. Unlike PyTorch, a single `F16` or `BF16` element is checked too.
 - A backward pass panics instead of writing a gradient that doesn't match its leaf, when
   `Module::to` converted the leaf (or the tensor that is its `.grad`) after the graph was
   recorded; views whose base was converted are stale.

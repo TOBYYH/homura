@@ -222,6 +222,7 @@ impl Tensor {
 
 /// A tensor filled with `value`.
 fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
+    let value = crate::ops::fill_value(value, dtype, device);
     let t = Tensor::empty_on(shape, dtype, device);
     // New memory is zeroed; `-0.0` still needs filling to keep its sign bit.
     let zero_bits = match value {
@@ -274,6 +275,10 @@ pub fn full(shape: impl IntoShape, value: impl Into<Scalar>) -> Tensor {
 }
 
 /// [`full`] with the given dtype and/or device.
+///
+/// # Panics
+///
+/// Panics if `value` overflows the dtype, as [`Tensor::fill_`] describes.
 pub fn full_with(
     shape: impl IntoShape,
     value: impl Into<Scalar>,

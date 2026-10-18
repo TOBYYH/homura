@@ -5,6 +5,7 @@
 //! and dtypes without any data.
 
 use crate::backend::cpu;
+use crate::dtype::Kind;
 use crate::shape::compute_view_strides;
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Scalar, Shape, Tensor};
@@ -198,6 +199,34 @@ pub(crate) fn reshape_data(data: &TensorData, shape: Shape) -> TensorData {
             layout: Layout::contiguous(shape),
             ..clone_data(data)
         },
+    }
+}
+
+/// `value` converted for writing into a tensor of `dtype` on `device`, as `fill_`, `full` and
+/// `masked_fill` do: see [`Scalar::checked_to`]. Meta tensors take any value, like PyTorch's meta
+/// kernels, which don't convert it.
+///
+/// # Panics
+///
+/// Panics if `value` overflows `dtype`, with PyTorch's message, also for tensors without
+/// elements.
+pub(crate) fn fill_value(value: Scalar, dtype: DType, device: Device) -> Scalar {
+    if device == Device::Meta {
+        return value;
+    }
+    value
+        .checked_to(dtype)
+        .unwrap_or_else(|| panic!("value cannot be converted to type {dtype} without overflow"))
+}
+
+/// The value of the single element of `t`, a CPU tensor, as a scalar of its kind: a bool, an
+/// integer (exact for every integer dtype) or a float (exact for every floating point dtype).
+pub(crate) fn scalar_value(t: &Tensor) -> Scalar {
+    let t = t.detach();
+    match t.dtype().kind() {
+        Kind::Bool => Scalar::Bool(t.item()),
+        Kind::Int => Scalar::Int(t.to(DType::I64).item()),
+        Kind::Float => Scalar::Float(t.to(DType::F64).item()),
     }
 }
 

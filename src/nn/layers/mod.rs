@@ -1,7 +1,11 @@
 //! Layers: modules with a forward computation.
 
+mod activation;
+mod linear;
 mod sequential;
 
+pub use activation::{Gelu, Relu, Sigmoid, Silu, Softmax, Tanh};
+pub use linear::Linear;
 pub use sequential::Sequential;
 
 use std::sync::Arc;

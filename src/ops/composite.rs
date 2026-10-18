@@ -3,7 +3,6 @@
 use super::{Operand, common_device, scalar_data};
 use crate::autograd::formulas::ScaledProduct;
 use crate::backend::cpu;
-use crate::dtype::Kind;
 use crate::shape::normalize_dim;
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
@@ -53,41 +52,11 @@ fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scala
             );
         }
     }
-    let overflow = || -> ! { panic!("{name}={s} cannot be converted to {dtype} without overflow") };
-    match dtype.kind() {
-        Kind::Bool => Scalar::Bool(s.to_bool()),
-        Kind::Float => {
-            let v = s.to_f64();
-            if rule == Coefficients::Strict && v.is_finite() && v.abs() > dtype.float_max() {
-                overflow();
-            }
-            s
-        }
-        Kind::Int => {
-            let (min, max) = dtype.int_range();
-            Scalar::Int(match s {
-                Scalar::Bool(v) => v as i64,
-                Scalar::Int(v) => {
-                    // Like PyTorch, negative integers down to `-255` wrap around for `U8`.
-                    let min = if dtype == DType::U8 { -max } else { min };
-                    if !(min..=max).contains(&v) {
-                        overflow();
-                    }
-                    v
-                }
-                Scalar::Float(v) => {
-                    // Check before truncating to preserve the lower-bound rule. Fractional
-                    // values above MAX still truncate to MAX; MAX + 1 is the exclusive upper
-                    // bound. Compute it in i128 so I64 uses exactly 2^63, not a rounded MAX.
-                    let upper = (max as i128 + 1) as f64;
-                    if !(min as f64..upper).contains(&v) {
-                        overflow();
-                    }
-                    v as i64
-                }
-            })
-        }
+    if rule == Coefficients::Truncate && dtype.is_floating_point() {
+        return s;
     }
+    s.checked_to(dtype)
+        .unwrap_or_else(|| panic!("{name}={s} cannot be converted to {dtype} without overflow"))
 }
 
 /// Checks the `input` of an `add*` operation against its result of `shape`, which has the dtype

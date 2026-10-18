@@ -1,6 +1,8 @@
 //! Elementwise binary and ternary operations, and in-place writes.
 
-use super::{BinaryOp, Operand, cast_data, clone_data, common_device, scalar_data};
+use super::{
+    BinaryOp, Operand, cast_data, clone_data, common_device, fill_value, scalar_data, scalar_value,
+};
 use crate::backend::cpu;
 use crate::dtype::ResultType;
 use crate::shape::broadcast_shapes;
@@ -356,7 +358,15 @@ impl Tensor {
     }
 
     /// A copy of `self` with `value` written where `mask` is true. `value` must be a scalar or a
-    /// zero-dimensional tensor; the result keeps the dtype of `self`.
+    /// zero-dimensional tensor; the result keeps the dtype of `self`. A tensor `value` gets the
+    /// gradient of the positions it fills.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mask` isn't a bool tensor, if a tensor `value` has dimensions, or if `value`
+    /// overflows the dtype of `self` (see [`fill_`](Tensor::fill_)), whether it is a scalar or a
+    /// tensor, before anything is computed. Meta tensors take any value; PyTorch's meta
+    /// `masked_fill` rejects infinities and NaN for integer dtypes.
     pub fn masked_fill(&self, mask: &Tensor, value: impl Into<Operand>) -> Tensor {
         where_(mask, self.masked_fill_value(mask, value.into()), self)
     }
@@ -369,7 +379,10 @@ impl Tensor {
             panic!("masked_fill only supports boolean masks, but got mask with dtype {m}");
         }
         match value {
-            Operand::Scalar(s) => Tensor::from_data(scalar_data(s, self.dtype(), self.device())),
+            Operand::Scalar(s) => {
+                let (dtype, device) = (self.dtype(), self.device());
+                Tensor::from_data(scalar_data(fill_value(s, dtype, device), dtype, device))
+            }
             Operand::Tensor(t) => {
                 if t.num_dims() != 0 {
                     panic!(
@@ -377,6 +390,11 @@ impl Tensor {
                          with {} dimension(s).",
                         t.num_dims()
                     );
+                }
+                // The value must fit the dtype like a scalar value (PyTorch reads it as one); it
+                // is still converted with a recorded `to`, so that it gets its gradient.
+                if t.device() == Device::Cpu {
+                    fill_value(scalar_value(&t), self.dtype(), self.device());
                 }
                 t.to(self.dtype())
             }
@@ -427,6 +445,16 @@ impl Tensor {
     ///
     /// In grad mode, the write into a floating point tensor that requires grad is recorded
     /// (`FillBackward2`), giving the old value a zero gradient.
+    ///
+    /// # Panics
+    ///
+    /// Besides the [in-place rules](crate::autograd#in-place-operations), panics if `value`
+    /// overflows the dtype of `self`, before anything is written, as PyTorch does: a finite value
+    /// beyond the largest finite value of a floating point dtype, or a value outside an integer
+    /// dtype's range (floats are truncated toward zero, and `U8` also takes negative integers
+    /// down to `-255`, which wrap around). Meta tensors take any value. This holds for any number
+    /// of elements; PyTorch skips the check for a single `F16` or `BF16` element, which it fills
+    /// with the rounded value (`65505` becomes `65504`, `1e6` infinity).
     pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
         self.overwrite_(value.into(), "FillBackward2")
     }
@@ -440,6 +468,7 @@ impl Tensor {
     fn overwrite_(&self, value: Scalar, name: &'static str) -> &Self {
         let recorded = crate::autograd::check_in_place(self, &[]);
         check_writable(&self.data());
+        let value = fill_value(value, self.dtype(), self.device());
         let target = self.clone();
         self.write_in_place(
             recorded,

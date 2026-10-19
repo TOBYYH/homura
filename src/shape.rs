@@ -433,6 +433,17 @@ pub(crate) fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
     true
 }
 
+/// Whether `shape` broadcasts to `desired`: it has no more dimensions, and each of its trailing
+/// sizes equals the one in `desired` or is 1 (PyTorch's `is_expandable_to`).
+pub(crate) fn is_expandable_to(shape: &[usize], desired: &[usize]) -> bool {
+    desired.len().checked_sub(shape.len()).is_some_and(|lead| {
+        shape
+            .iter()
+            .zip(&desired[lead..])
+            .all(|(&s, &n)| s == n || s == 1)
+    })
+}
+
 /// The broadcast shape of `a` and `b` (NumPy rules).
 pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Shape {
     let n = a.len().max(b.len());

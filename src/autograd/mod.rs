@@ -36,6 +36,11 @@
 //! | `with torch.no_grad():` | `let _guard = homura::no_grad();` |
 //! | `x.clone()` | [`x.deep_clone()`](Tensor::deep_clone) |
 //! | `repr(y)` | `format!("{y:?}")`, with the same `grad_fn=<MulBackward0>` or `requires_grad=True` |
+//! | `class F(torch.autograd.Function)`, `F.apply(x)` | `impl` [`Function`] `for F`, [`F.apply(&[&x])`](Function::apply) |
+//! | `ctx.save_for_backward(x)`, `ctx.saved_tensors` | [`ForwardContext::save_for_backward`], [`BackwardContext::saved_tensors`] |
+//! | `ctx.needs_input_grad[i]` | [`ForwardContext::needs_input_grad`], [`BackwardContext::needs_input_grad`] |
+//! | `ctx.mark_non_differentiable(y)` | [`ForwardContext::mark_non_differentiable`] |
+//! | `ctx.shape = x.shape` in `forward` | a field of the function value, set in [`Function::forward`] |
 //!
 //! Mind `clone`: [`Tensor`]'s `Clone` copies the handle, like `y = x` in Python. The clone *is*
 //! `x`, with its data, history and `.grad`, so an in-place operation through it changes `x` and
@@ -122,6 +127,82 @@
 //! In grad mode, any view rejects in-place operations that would be recorded, see
 //! [In-place operations](#in-place-operations); in no-grad mode they are allowed.
 //!
+//! # Custom functions
+//!
+//! A [`Function`] is an operation with a hand-written backward pass. [`Function::apply`] runs its
+//! `forward` in no-grad mode, then, if grad mode is on and an input requires grad, records one
+//! node for the call, named after the type (`ExpBackward` for `Exp`), with an edge per input.
+//! The outputs are new tensors that share the data and layout of the tensors `forward` returned;
+//! the floating point ones that weren't marked with
+//! [`mark_non_differentiable`](ForwardContext::mark_non_differentiable) require grad and have
+//! the node as their `grad_fn`. Integer, `Bool` and marked outputs never require grad, and
+//! `backward` receives `None` for them, as for any output that no gradient reached; when none
+//! did, the backward pass doesn't call `backward` at all.
+//!
+//! [`save_for_backward`](ForwardContext::save_for_backward) tells apart, by identity, the
+//! inputs, the outputs and everything else, as PyTorch does. Saved inputs and differentiable
+//! outputs behave like the tensors built-in operations save: modifications are detected, they
+//! are freed by a backward pass without `retain_graph`, and in a pass with `create_graph` they
+//! come back connected to the graph, so a `backward` written with tensor operations on them is
+//! differentiable again. Any other saved tensor is saved as it is, with the same checks. An
+//! intermediate value computed with grad mode off has no history: it is a constant, correct
+//! for the first derivative only. If `forward` explicitly enables grad mode, other saved tensors
+//! retain the history it records. Saving the output of `exp`
+//! gives every order:
+//!
+//! ```
+//! use homura::Tensor;
+//! use homura::autograd::{self, BackwardContext, ForwardContext, Function, GradOptions};
+//!
+//! struct Exp;
+//!
+//! impl Function for Exp {
+//!     fn forward(&mut self, ctx: &mut ForwardContext, inputs: &[&Tensor]) -> Vec<Tensor> {
+//!         let y = inputs[0].exp();
+//!         ctx.save_for_backward(&[&y]);
+//!         vec![y]
+//!     }
+//!
+//!     fn backward(&self, ctx: &BackwardContext<'_>, grads: &[Option<Tensor>]) -> Vec<Option<Tensor>> {
+//!         let y = &ctx.saved_tensors()[0];
+//!         vec![grads[0].as_ref().map(|g| g * y)]
+//!     }
+//! }
+//!
+//! let x = homura::tensor([0.0, 1.0]);
+//! x.requires_grad_(true);
+//! let y = Exp.apply(&[&x]).remove(0);
+//! let options = GradOptions { create_graph: true, ..Default::default() };
+//! let dx = autograd::grad(&[&y.sum()], &[&x], options).remove(0).unwrap();
+//! let d2x = autograd::grad(&[&dx.sum()], &[&x], GradOptions::default()).remove(0).unwrap();
+//! assert_eq!(d2x.to_vec::<f32>(), x.detach().exp().to_vec::<f32>());
+//! ```
+//!
+//! Saving the exponential as an intermediate instead (returning `&e * 1.0`, a separate tensor)
+//! gives the same first derivative, but it is a constant, so `dx` above wouldn't require grad.
+//! Recomputing it in `backward` from the saved input (`saved_tensors()[0].exp()`) is correct
+//! again for every order.
+//!
+//! The function value is moved into the node, and lives as long as it. Its fields carry the
+//! operation's non-tensor arguments and whatever `forward` computes for `backward` besides
+//! tensors. Tensors in its fields are the caller's responsibility: they are not inputs, so they
+//! get no edges, and not saved tensors, so they get none of the checks above; recorded
+//! operations on them in `backward` build graphs through their own history.
+//!
+//! `forward` must not modify its inputs in place, return a tensor that shares memory with an input
+//! or another output, or mark a tensor it doesn't return: [`Function::apply`] panics after it
+//! returns, in every grad mode, and the modification isn't undone. Return a `deep_clone`
+//! instead. A gradient that `backward` returns is checked like those of built-in operations: a
+//! larger shape that the input's shape broadcasts to is summed to it, another dtype is
+//! converted, and only a zero-dimensional gradient may be on another device, which it is moved
+//! to. `backward` may run nested backward passes on graphs of its own.
+//!
+//! Calls on different threads are independent. Concurrent backward passes through the same node
+//! are safe, but each pass that doesn't `retain_graph` frees the saved tensors when it is done
+//! with the node, so the others then fail: give all of them `retain_graph`. Mutable state in the
+//! function value is up to its implementation. Differentiating, inside `backward`, a graph that
+//! contains the running node is not supported.
+//!
 //! # Differences from PyTorch
 //!
 //! homura doesn't support yet some cases that PyTorch handles. They panic with an error that
@@ -147,8 +228,29 @@
 //! `IndexPutBackward0` sums the gradient of the values of [`Tensor::index_put`] to their shape
 //! itself; PyTorch's engine does, recording `SumBackward1` and `ViewBackward0`.
 //!
-//! Custom differentiable functions (PyTorch's `torch.autograd.Function`), hooks, anomaly
-//! detection, checkpointing and forward-mode differentiation are not available yet.
+//! [Custom functions](#custom-functions) differ from PyTorch's `torch.autograd.Function` on
+//! purpose:
+//!
+//! - Outputs that share memory with an input or another output, in-place modifications of the
+//!   inputs in `forward` and marking a tensor that isn't an output as non-differentiable panic.
+//!   PyTorch accepts all three: the first through views or new tensors that share the data, the
+//!   second silently (without `mark_dirty`, the gradients may be wrong), and ignores the third.
+//! - Outputs that received no gradient give `backward` `None`, where PyTorch gives zeros by
+//!   default. When no output received one, `backward` isn't called, and [`grad`] with
+//!   `allow_unused` returns `None` for the inputs; PyTorch calls `backward` anyway.
+//! - The outputs are always new tensors without any history `forward` gave them, recorded or
+//!   not; PyTorch returns the tensors `forward` returned, replacing their history when it
+//!   records the call. So an output is never a view: one that `forward` computed as a view of an
+//!   intermediate value can be modified in place, recorded after the node, where PyTorch
+//!   rejects that.
+//! - Nodes are named after the last segment of the type's path, without generic arguments. The
+//!   spelling of type names isn't guaranteed to be stable between compiler versions; the names
+//!   are for display only.
+//! - `mark_dirty`, `set_materialize_grads`, `once_differentiable`, `setup_context`, `jvp` and
+//!   `vmap` are not available.
+//!
+//! Hooks, anomaly detection, checkpointing and forward-mode differentiation are not available
+//! yet.
 //!
 //! # Lifetimes and threads
 //!
@@ -212,6 +314,9 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 pub(crate) mod formulas;
+mod function;
+#[cfg(test)]
+mod function_tests;
 mod gradcheck;
 #[cfg(test)]
 mod graph_tests;
@@ -226,6 +331,7 @@ mod record;
 mod retain_tests;
 mod saved;
 
+pub use function::{BackwardContext, ForwardContext, Function};
 pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
 pub(crate) use meta::{
     AutogradMeta, ViewInfo, forget_accumulator, replace_leaf_data, repr_suffix, view_of,
@@ -312,13 +418,15 @@ pub struct GradOptions {
 /// to the leaves' `.grad` (`torch.autograd.backward`).
 ///
 /// `grad_tensors` is empty or has one entry per tensor: the gradient of that tensor, which must
-/// have its shape and is converted to its dtype and device. `None` entries are created as ones,
-/// which needs a tensor with a single element. See [`Tensor::backward`] for the common case.
+/// have its shape and is converted to its dtype; it must be on its device unless it is
+/// zero-dimensional, then it is moved there. `None` entries are created as ones, which needs a
+/// tensor with a single element. See [`Tensor::backward`] for the common case.
 ///
 /// # Panics
 ///
 /// Panics with PyTorch's messages if a tensor doesn't require grad, if a gradient can't be
-/// created or has the wrong shape, if `grad_tensors` has the wrong length, or if the backward
+/// created, has the wrong shape or is on the wrong device, if `grad_tensors` has the wrong
+/// length, or if the backward
 /// pass fails (a saved tensor was freed or modified in place, a derivative isn't implemented).
 pub fn backward(tensors: &[&Tensor], grad_tensors: &[Option<&Tensor>], options: BackwardOptions) {
     let roots = root_edges(tensors, make_grads(tensors, grad_tensors));

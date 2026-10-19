@@ -24,10 +24,12 @@ use crate::{DType, Device, Shape, Tensor};
 /// A backward formula: the gradients of an operation's inputs given the gradients of its
 /// outputs.
 ///
-/// A formula holds only plain values (shapes, scalars, dtypes) and the [`SavedId`]s of tensors
+/// A built-in formula holds only plain values (shapes, scalars, dtypes) and the [`SavedId`]s of tensors
 /// saved through [`NodeBuilder`], never a `Tensor` or a [`NodeRef`]: keeping every saved tensor in
 /// the node lets [`NodeRef::release_saved`] and graph destruction reach all of them.
-/// `AccumulateGrad`, which holds its leaf like PyTorch's, is the only exception.
+/// `AccumulateGrad` holds its leaf like PyTorch's. A custom [`Function`](super::Function) node
+/// also owns the caller's function value: tensor fields in that value are outside the managed
+/// saved slots, and their ownership and lifetime are the implementation's responsibility.
 pub(crate) trait Node: Send + Sync + 'static {
     /// The name PyTorch gives this kind of node, such as `"MulBackward0"`.
     fn name(&self) -> &'static str;

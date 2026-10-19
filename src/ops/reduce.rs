@@ -160,15 +160,10 @@ impl Tensor {
     pub fn sum_to_size(&self, size: impl IntoShape) -> Tensor {
         let size = size.into_shape();
         let shape = self.shape();
-        let lead = shape.len().checked_sub(size.len());
-        let expandable = lead.is_some_and(|lead| {
-            size.iter()
-                .zip(&shape[lead..])
-                .all(|(&s, &n)| s == n || s == 1)
-        });
-        let Some(lead) = lead.filter(|_| expandable) else {
+        if !crate::shape::is_expandable_to(&size, &shape) {
             panic!("size {{{size:?}}} is not expandable to size {{{shape:?}}}.");
-        };
+        }
+        let lead = shape.len() - size.len();
         let dims: Vec<i64> = (0..shape.len())
             .filter(|&d| d < lead || (size[d - lead] == 1 && shape[d] != 1))
             .map(|d| d as i64)

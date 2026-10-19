@@ -34,8 +34,8 @@ use crate::Tensor;
 ///
 /// # Panics
 ///
-/// Panics if a formula panics, or returns a gradient whose shape doesn't match the input it is
-/// for.
+/// Panics if a formula panics, or returns a gradient that doesn't fit the input it is for (see
+/// [`validate`]).
 pub(crate) fn run(
     roots: Vec<(Edge, Tensor)>,
     capture: Option<&[Option<Edge>]>,
@@ -52,7 +52,7 @@ pub(crate) fn run(
     let mut captured = vec![None; capture.map_or(0, <[_]>::len)];
     // The gradients of the roots, as PyTorch's graph root node passes them on.
     for (i, (edge, grad)) in roots.into_iter().enumerate() {
-        let grad = validate("GraphRoot", i, grad, &meta_of(&edge));
+        let grad = validate(None, i, grad, &meta_of(&edge));
         pass.deliver(&edge, Some(grad));
     }
     while let Some(Ready(node)) = pass.ready.pop() {
@@ -83,7 +83,7 @@ pub(crate) fn run(
         }
         for (i, (grad, edge)) in outputs.into_iter().zip(node.next_edges()).enumerate() {
             let Some(edge) = edge else { continue };
-            let grad = grad.map(|g| validate(node.name(), i, g, &meta_of(edge)));
+            let grad = grad.map(|g| validate(Some(node.name()), i, g, &meta_of(edge)));
             pass.deliver(edge, grad);
         }
     }
@@ -235,22 +235,45 @@ fn meta_of(edge: &Edge) -> InputMeta {
 }
 
 /// Checks the gradient that node `name` computed for its edge `index` against what the receiving
-/// input expects (PyTorch's `validate_outputs`) and converts it to the input's dtype and device,
-/// so that formulas don't have to undo type promotion.
-fn validate(name: &str, index: usize, grad: Tensor, meta: &InputMeta) -> Tensor {
+/// input expects and adapts it, in the order of PyTorch's `validate_outputs`: a gradient of a
+/// larger shape that the input's shape broadcasts to is summed to it (any other shape is an
+/// error), a gradient of another dtype is converted, so that formulas don't have to undo type
+/// promotion, and then a gradient on another device is moved there if it is zero-dimensional
+/// (after the sum) and an error otherwise. The roots (`name` = `None`) are checked the same way;
+/// their errors, like PyTorch's, name no function.
+fn validate(name: Option<&str>, index: usize, grad: Tensor, meta: &InputMeta) -> Tensor {
+    let fail = |message: String| -> ! {
+        match name {
+            Some(name) => panic!("Function {name} returned an {message}"),
+            None => panic!("{message}"),
+        }
+    };
+    let mut grad = grad;
     let shape = grad.shape();
     if shape != meta.shape {
-        panic!(
-            "Function {name} returned an invalid gradient at index {index} - got {shape:?} but \
-             expected shape compatible with {:?}",
-            meta.shape
-        );
+        if !crate::shape::is_expandable_to(&meta.shape, &shape) {
+            fail(format!(
+                "invalid gradient at index {index} - got {shape:?} but expected shape compatible \
+                 with {:?}",
+                meta.shape
+            ));
+        }
+        grad = grad.sum_to_size(meta.shape.clone());
     }
-    if grad.dtype() == meta.dtype && grad.device() == meta.device {
-        grad
-    } else {
-        grad.to((meta.dtype, meta.device))
+    if grad.dtype() != meta.dtype {
+        grad = grad.to(meta.dtype);
     }
+    let device = grad.device();
+    if device != meta.device {
+        if grad.num_dims() != 0 {
+            fail(format!(
+                "invalid gradient at index {index} - expected device {} but got {device}",
+                meta.device
+            ));
+        }
+        grad = grad.to(meta.device);
+    }
+    grad
 }
 
 /// A node in the ready queue, ordered by sequence number: later nodes run first.

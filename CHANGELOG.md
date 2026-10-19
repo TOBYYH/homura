@@ -56,8 +56,24 @@ All notable changes to this project are documented in this file. The format is b
   slices `..` and an `Ellipsis`, recorded as `IndexPutBackward0`. Unlike PyTorch, the in-place
   version checks every position before it writes anything, and rejects a target whose elements
   may share memory instead of warning.
+- Custom differentiable functions: the `autograd::Function` trait (`forward`, `backward` and the
+  provided `apply`) with `ForwardContext` (`save_for_backward`, `mark_non_differentiable`,
+  `needs_input_grad`) and `BackwardContext` (`saved_tensors`, `needs_input_grad`), recorded as
+  one node named after the type (`MyReluBackward`), like PyTorch's `torch.autograd.Function`.
+  Saved inputs and outputs are checked, freed and differentiable again like the tensors of
+  built-in operations; other saved tensors keep their history, if any. Intermediates computed
+  with grad mode off are constants. Unlike PyTorch, outputs that share
+  memory with an input or another output, in-place modifications of the inputs and marking a
+  tensor that isn't an output panic; outputs without a gradient give `backward` `None` instead of
+  zeros, and `backward` isn't called when no output has one.
 
 ### Changed
+
+- A backward pass sums a gradient of a larger shape that its input's shape broadcasts to, as
+  PyTorch's engine does, and panics like PyTorch on a gradient on another device unless it is
+  zero-dimensional (which is moved there), also for the gradients given to `backward` and
+  `autograd::grad`; it used to panic on any other shape and move any gradient. Built-in
+  operations always return gradients of the input's shape and device.
 
 - `Tensor::index` with an integer tensor no longer records an `UnsafeViewBackward0` on top of
   `IndexBackward0`. A zero-dimensional integer index tensor now selects, like PyTorch: the result

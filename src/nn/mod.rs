@@ -92,10 +92,12 @@
 //!
 //! # Layers
 //!
-//! [`Linear`] and the activations [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and
-//! [`Softmax`] are modules with a `forward` method and implement [`Forward`]; [`Sequential`]
-//! applies such layers one after another. [`functional`] has their computations as functions of
-//! tensors, and [`init`] the initializations that layers use, with PyTorch's formulas.
+//! [`Linear`], [`Embedding`], [`LayerNorm`], [`RmsNorm`], [`Dropout`] and the activations
+//! [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and [`Softmax`] are modules with a
+//! `forward` method and implement [`Forward`]; [`Sequential`] applies such layers one after
+//! another. [`functional`] has their computations as functions of tensors, and [`init`] the
+//! initializations that layers use, with PyTorch's formulas. [`Dropout`] depends on the mode:
+//! it has a [`Training`] flag, which [`Module::eval`] clears.
 //!
 //! The losses are functions in [`functional`]: [`mse_loss`](functional::mse_loss),
 //! [`nll_loss`](functional::nll_loss), [`cross_entropy`](functional::cross_entropy) and
@@ -117,6 +119,10 @@
 //! | `F.cross_entropy(x, t)`, `F.cross_entropy(x, t, weight=w, label_smoothing=0.1)` | [`functional::cross_entropy(&x, &t, Default::default())`](functional::cross_entropy), `cross_entropy(&x, &t, CrossEntropyOptions { weight: Some(w), label_smoothing: 0.1, ..Default::default() })` |
 //! | `F.nll_loss(x, t)`, `F.mse_loss(x, y, reduction="sum")` | [`functional::nll_loss(&x, &t, None, -100, Reduction::Mean)`](functional::nll_loss), [`functional::mse_loss(&x, &y, Reduction::Sum)`](functional::mse_loss) |
 //! | `F.binary_cross_entropy_with_logits(x, y, pos_weight=p)` | [`functional::binary_cross_entropy_with_logits(&x, &y, None, Reduction::Mean, Some(&p))`](functional::binary_cross_entropy_with_logits) |
+//! | `nn.Embedding(10, 4, padding_idx=0)`, `F.embedding(i, w)` | [`Embedding::new(10, 4).padding_idx(0)`](Embedding::padding_idx), [`functional::embedding(&i, &w, None)`](functional::embedding) |
+//! | `nn.LayerNorm(4)`, `nn.LayerNorm(4, elementwise_affine=False)`, `F.layer_norm(x, [4])` | [`LayerNorm::new([4])`](LayerNorm::new), [`LayerNorm::new([4]).elementwise_affine(false)`](LayerNorm::elementwise_affine), [`functional::layer_norm(&x, [4], None, None, 1e-5)`](functional::layer_norm) |
+//! | `nn.RMSNorm(4, eps=1e-6)`, `F.rms_norm(x, [4])` | [`RmsNorm::new([4]).eps(1e-6)`](RmsNorm::eps), [`functional::rms_norm(&x, [4], None, None)`](functional::rms_norm) |
+//! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
@@ -142,9 +148,16 @@
 //!   parameters. The `.grad` of a converted tensor is replaced by a converted copy, where
 //!   PyTorch converts the gradient tensor itself; one that has a history must be cleared before
 //!   converting.
-//! - Initializations and layer constructors draw from homura's random number generator, whose
-//!   numbers differ from PyTorch's for the same seed; load a state dict to start from PyTorch's
-//!   values.
+//! - Initializations, layer constructors and dropout draw from homura's random number
+//!   generator, whose numbers differ from PyTorch's for the same seed; load a state dict to start
+//!   from PyTorch's values.
+//! - [`Embedding`] has no `max_norm`, `scale_grad_by_freq` or `sparse`. Its gradient adds the
+//!   rows of repeated indices in `F64` and rounds once, where PyTorch rounds after each addition;
+//!   [`layer_norm`](functional::layer_norm) computes its statistics with `F64` sums too, and
+//!   adds the rows of the weight and bias gradients without rounding them to half precision in
+//!   between. With create graph, the gradients of the gradients of a layer norm are recorded as
+//!   ordinary operations, where PyTorch has a `NativeLayerNormBackwardBackward0` node; they are
+//!   also right for a bias without a weight, which PyTorch gets wrong.
 //! - Parameters are not a tensor subclass: [`Parameter`] derefs to
 //!   [`Tensor`](crate::Tensor), so `&param` works where a `&Tensor` is expected, and `&*param`
 //!   where an operator needs the tensor (`&*param * 2.0`).
@@ -167,7 +180,10 @@ mod training;
 
 /// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
 pub use homura_derive::Module;
-pub use layers::{Forward, Gelu, Linear, Relu, Sequential, Sigmoid, Silu, Softmax, Tanh};
+pub use layers::{
+    Dropout, Embedding, Forward, Gelu, LayerNorm, Linear, Relu, RmsNorm, Sequential, Sigmoid, Silu,
+    Softmax, Tanh,
+};
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;
 pub use state_dict::{LoadError, LoadReport, StateDict, StateDictIter};

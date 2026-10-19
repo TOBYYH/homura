@@ -30,6 +30,14 @@ All notable changes to this project are documented in this file. The format is b
   `binary_cross_entropy_with_logits` (`weight`, `pos_weight`), with a `Reduction`, recording
   PyTorch's backward nodes and gradient formulas.
 - `Tensor::log_sigmoid` and `nn::functional::logsigmoid`, computed stably like PyTorch's kernel.
+- `nn::functional::embedding` (`padding_idx`) and the `nn::Embedding` layer, a single
+  `EmbeddingBackward0` node whose padding row gets no gradient, as in PyTorch.
+- `nn::functional::layer_norm` and the `nn::LayerNorm` layer, a single
+  `NativeLayerNormBackward0` node with PyTorch's CPU formulas (half precision inputs may have
+  `F32` parameters); `nn::functional::rms_norm` and the `nn::RmsNorm` layer, which record the
+  operations of PyTorch's CPU implementation (the default `eps` is the machine epsilon).
+- `nn::functional::dropout` and the `nn::Dropout` layer (with a `Training` flag), computed like
+  PyTorch's CPU implementation; the masks come from homura's random number generator.
 - The `optim` module: the `Optimizer` trait with `ParamGroup`s, and `Sgd` (momentum, dampening,
   weight decay, Nesterov, maximize), `Adam` and `AdamW` (betas, eps, weight decay, AMSGrad,
   maximize), with PyTorch's defaults, checks and update order. Each compound operation of a step

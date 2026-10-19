@@ -8,12 +8,14 @@
 mod addc;
 mod binary;
 mod clamp;
+pub(crate) mod embedding;
 mod index;
 mod inplace;
 mod lerp;
 pub(crate) mod loss;
 mod matmul;
 mod misc;
+pub(crate) mod norm;
 mod pow;
 mod reduce;
 mod shape;

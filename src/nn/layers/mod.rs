@@ -1,11 +1,17 @@
 //! Layers: modules with a forward computation.
 
 mod activation;
+mod dropout;
+mod embedding;
 mod linear;
+mod norm;
 mod sequential;
 
 pub use activation::{Gelu, Relu, Sigmoid, Silu, Softmax, Tanh};
+pub use dropout::Dropout;
+pub use embedding::Embedding;
 pub use linear::Linear;
+pub use norm::{LayerNorm, RmsNorm};
 pub use sequential::Sequential;
 
 use std::sync::Arc;

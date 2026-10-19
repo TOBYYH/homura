@@ -137,7 +137,15 @@
 //! The CPU reference backend accumulates floating point reductions and matrix inner products
 //! in f64. This differs from some PyTorch kernels: extreme cancellation can change finite,
 //! infinity and NaN results, even for finite inputs. Scaled matrix products also use rules
-//! independent of size and layout; see [`Tensor::addmm`].
+//! independent of size and layout; see [`Tensor::addmm`]. The sums at repeated positions of
+//! advanced indexing's backward pass and of `index_put` with `accumulate` are computed the same
+//! way, so they can differ from PyTorch's, which round after each addition, by more than the
+//! last bit.
+//!
+//! With `create_graph`, the gradient of advanced indexing ([`Tensor::index`] with index tensors)
+//! is recorded as `IndexPutBackward0`, where PyTorch records `IndexPutImplBackward0`.
+//! `IndexPutBackward0` sums the gradient of the values of [`Tensor::index_put`] to their shape
+//! itself; PyTorch's engine does, recording `SumBackward1` and `ViewBackward0`.
 //!
 //! Custom differentiable functions (PyTorch's `torch.autograd.Function`), hooks, anomaly
 //! detection, checkpointing and forward-mode differentiation are not available yet.

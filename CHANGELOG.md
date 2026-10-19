@@ -48,8 +48,23 @@ All notable changes to this project are documented in this file. The format is b
   afterwards (`options_mut`). Unlike PyTorch, a parameter listed twice in a group is an error, and
   `step` checks the options, the parameters and their state before it updates anything. Optimizer
   state can't be saved or loaded yet.
+- Advanced indexing with `Tensor::index`: any number of `i64` / `i32` index tensors and `bool`
+  masks, mixed with the other items and broadcast together, with PyTorch's rules for where the
+  indexed dimensions go; `bool` items (`x.index(true)`). The backward graph holds a single
+  `IndexBackward0`, as in PyTorch. Index tensors may be on the CPU for a tensor on any device.
+- `Tensor::index_put` and `Tensor::index_put_` (with `accumulate`), taking index tensors, full
+  slices `..` and an `Ellipsis`, recorded as `IndexPutBackward0`. Unlike PyTorch, the in-place
+  version checks every position before it writes anything, and rejects a target whose elements
+  may share memory instead of warning.
 
 ### Changed
+
+- `Tensor::index` with an integer tensor no longer records an `UnsafeViewBackward0` on top of
+  `IndexBackward0`. A zero-dimensional integer index tensor now selects, like PyTorch: the result
+  is a view, recorded as `SelectBackward0`. Index tensors of dtypes other than `I64`, `I32` and
+  `Bool` are rejected (`U8`, `I8` and `I16` used to index as integers; PyTorch takes `U8` tensors
+  as deprecated masks and zero-dimensional `I8` / `I16` tensors as positions). Out-of-range
+  messages name the position of the index tensor among the indexed dimensions, as PyTorch's do.
 
 - Subtraction (`sub`, `sub_`, the `-` operator) panics like PyTorch when either operand is a bool
   tensor or scalar; it used to promote a single bool operand (`[2, 3] - [true, false]` gave

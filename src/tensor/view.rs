@@ -404,6 +404,10 @@ mod tests {
                 ("narrow", x.narrow(1, 1, 2)),
                 ("select", x.select(0, 1)),
                 ("index", x.index((.., 1..3, NewAxis))),
+                (
+                    "index with a zero-dimensional integer tensor",
+                    x.index((.., crate::tensor(-1i64))),
+                ),
                 ("as_strided", x.as_strided([2, 2], [1, 2], 1)),
                 ("split", x.split(1, 0)[1].clone()),
                 ("chunk", x.chunk(2, 2)[0].clone()),
@@ -516,6 +520,20 @@ mod tests {
             ("repeat", x.repeat([2, 1, 1])),
             ("repeat once", x.repeat([1, 1, 1])),
             ("tensor index", x.index((.., crate::tensor([[2i64, 0]])))),
+            (
+                "two tensor indices",
+                x.index((crate::tensor([1i64]), .., crate::tensor([0i64, 3]))),
+            ),
+            ("mask", x.index(x.greater(0.5))),
+            ("bool item", x.index(true)),
+            (
+                "index_put",
+                x.index_put(
+                    (crate::tensor([1i64]), .., crate::tensor([0i64])),
+                    &x.index((0, 0, 0)),
+                    false,
+                ),
+            ),
             ("index_select", x.index_select(1, &crate::tensor([0i64]))),
             (
                 "tensor index of an empty layout",

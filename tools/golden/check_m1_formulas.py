@@ -116,7 +116,7 @@ for out, name, edges in [
     (other.slice_scatter(x, 0, 1, None, 1), "SliceScatterBackward0", [ACC, ACC]),
 ]:
     assert node(out) == (name, edges), (node(out), name, edges)
-assert chain(x[index]) == ["IndexBackward0", ACC]  # homura adds UnsafeViewBackward0 on top
+assert chain(x[index]) == ["IndexBackward0", ACC]  # homura records the same chain (M2 step 6)
 # homura builds split and chunk from narrow, one SliceBackward0 per piece.
 assert [t.grad_fn.name() for t in x.split(2, 1)] == ["SplitBackward0"] * 2
 # homura records every slice; PyTorch skips full ones among several indices.
@@ -1494,7 +1494,7 @@ assert x.grad.tolist() == [[[14.0] * 3]] * 2
 # indexing_skips_full_slices_like_pytorch
 x = counting(2, 3, 4)
 idx = torch.tensor([1, 0])
-INDEX = ["IndexBackward0"]  # homura: ["UnsafeViewBackward0", "IndexBackward0"]
+INDEX = ["IndexBackward0"]  # homura records the same chain (M2 step 6)
 for name, out, expected in [
     ("x[:]", x[:], ["SliceBackward0"]),
     ("x[0:2]", x[0:2], ["SliceBackward0"]),

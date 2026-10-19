@@ -262,11 +262,9 @@ fn views_save_nothing_so_backward_passes_can_repeat() {
 fn indexing_skips_full_slices_like_pytorch() {
     // Node chains measured on the pinned PyTorch: among several items, a slice starting at 0
     // with a step of 1 and an end at or past the size is skipped; a lone slice is recorded.
-    // The chains are the same except that homura reshapes the positions picked by an integer
-    // tensor with a recorded `unsafe_view` before PyTorch's `IndexBackward0`.
     let x = counting(&[2, 3, 4]);
     let idx = homura::tensor([1i64, 0]);
-    let index = &["UnsafeViewBackward0", "IndexBackward0"][..];
+    let index = &["IndexBackward0"][..];
     let cases: Vec<(&str, Tensor, &[&str])> = vec![
         ("x[:]", x.index(..), &["SliceBackward0"]),
         ("x[0:2]", x.index(0..2), &["SliceBackward0"]),
@@ -321,7 +319,6 @@ fn indexing_skips_full_slices_like_pytorch() {
             x.index((.., 1.., NewAxis)),
             &["UnsqueezeBackward0", "SliceBackward0"],
         ),
-        // homura reshapes the picked positions with a recorded `unsafe_view`.
         ("x[:, idx]", x.index((.., &idx)), index),
         ("x[idx, :]", x.index((&idx, ..)), index),
         ("x[idx]", x.index(&idx), index),

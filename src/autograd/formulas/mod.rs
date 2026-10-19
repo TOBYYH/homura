@@ -27,7 +27,7 @@ pub(crate) use addc::{addcdiv, addcmul};
 pub(crate) use binary::{binary, where_};
 pub(crate) use clamp::clamp;
 pub(crate) use index::{
-    gather, index, index_add, index_select, scatter_add, select_scatter, slice_scatter,
+    gather, index, index_add, index_put, index_select, scatter_add, select_scatter, slice_scatter,
 };
 pub(crate) use inplace::{copy, overwrite};
 pub(crate) use lerp::lerp;

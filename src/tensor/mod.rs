@@ -302,6 +302,22 @@ impl TensorData {
         !disjoint && !same
     }
 
+    /// Whether `self` and `other` may refer to the same memory: they share a storage and the
+    /// byte ranges they can touch intersect, including when they are the exact same view.
+    /// Conservative: views that interleave without sharing an element, such as the even and the
+    /// odd elements of a vector, count as sharing. Unlike
+    /// [`partially_overlaps`](TensorData::partially_overlaps), views of nothing share nothing.
+    pub fn may_share_memory(&self, other: &TensorData) -> bool {
+        if !Arc::ptr_eq(&self.storage, &other.storage) {
+            return false;
+        }
+        let (Some((a0, a1)), Some((b0, b1))) = (self.layout.span(), other.layout.span()) else {
+            return false;
+        };
+        let (sa, sb) = (self.dtype.size_in_bytes(), other.dtype.size_in_bytes());
+        a0 * sa < b1 * sb && b0 * sb < a1 * sa
+    }
+
     /// The same data broadcast to `shape`.
     pub fn expand_to(&self, shape: &Shape) -> TensorData {
         TensorData {

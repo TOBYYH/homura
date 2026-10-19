@@ -82,6 +82,50 @@ pub(crate) fn index_select(
     }
 }
 
+/// Copies slice `i` of `src` along `dim` into slice `index[i]` of `out`, in order, so that the
+/// last of repeated positions wins: the overwriting `index_put`. `out` is new memory that shares
+/// none with `src`, and the positions must be in range.
+pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &[usize], src: &TensorData) {
+    // An empty source writes nothing, and its strides and offset may be arbitrary.
+    if src.layout.num_elements() == 0 {
+        return;
+    }
+    for (i, &j) in index.iter().enumerate() {
+        let dst = TensorData {
+            layout: out.layout.select(dim, j),
+            ..out.clone()
+        };
+        let s = TensorData {
+            layout: src.layout.select(dim, i),
+            ..src.clone()
+        };
+        copy(&dst, &s);
+    }
+}
+
+/// The positions of the true elements of the bool tensor `mask` in row-major order, as one
+/// vector of coordinates per dimension: PyTorch's `nonzero`, transposed.
+pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<Vec<i64>> {
+    let shape = &mask.layout.shape;
+    let mut coords = vec![vec![]; shape.len()];
+    let mut index = vec![0usize; shape.len()];
+    for set in read_host::<bool>(mask) {
+        if set {
+            for (c, &i) in coords.iter_mut().zip(&index) {
+                c.push(i as i64);
+            }
+        }
+        for d in (0..shape.len()).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    coords
+}
+
 /// `out[o] += src[s]` for every pair of offsets that `pairs` reports, where `o` counts the
 /// elements of the contiguous `out` from its first one and `s` is a storage offset of `src`, which
 /// has the dtype of `out`. Like the reductions, each element of `out` is accumulated in `f64`

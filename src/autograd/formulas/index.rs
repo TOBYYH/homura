@@ -1,13 +1,14 @@
 //! Indexing, gathering and scattering. These operations come in pairs whose formulas use each
 //! other (`index_select` and `index_add`, `gather` and `scatter_add`, `select` and
-//! `select_scatter`, slicing and `slice_scatter`), so that every derivative can be
-//! differentiated again. Index tensors have no gradient: they are saved, never given an edge.
+//! `select_scatter`, slicing and `slice_scatter`, advanced indexing and `index_put`), so that
+//! every derivative can be differentiated again. Index tensors have no gradient: they are saved,
+//! never given an edge.
 
 use super::only;
-use crate::autograd::node::{ApplyContext, Node};
+use crate::autograd::node::{ApplyContext, Node, NodeBuilder};
 use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
-use crate::{DType, Shape, Tensor};
+use crate::{Shape, Tensor};
 
 /// Records the backward node of `out = x.index_select(dim, index)`.
 pub(crate) fn index_select(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor) {
@@ -18,14 +19,43 @@ pub(crate) fn index_select(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor)
     });
 }
 
-/// Records the backward node of indexing `x` with the integer tensor `index` along `dim`, whose
-/// result `out` has the positions along `dim` flattened (the caller reshapes it afterwards).
-/// Unlike `index_select`, negative positions count from the end.
-pub(crate) fn index(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor) {
+/// Saves the index tensors of an advanced indexing operation as given, so that modifying one
+/// in place before the backward pass is caught.
+fn save_indices(b: &mut NodeBuilder, indices: &[Option<Tensor>]) -> Vec<Option<SavedId>> {
+    indices
+        .iter()
+        .map(|t| t.as_ref().map(|t| b.save(t)))
+        .collect()
+}
+
+/// The saved index tensors, unpacked (and so checked) whichever gradients a pass needs.
+fn unpack_indices(ctx: &ApplyContext<'_>, indices: &[Option<SavedId>]) -> Vec<Option<Tensor>> {
+    indices
+        .iter()
+        .map(|id| id.map(|id| ctx.unpack(id)))
+        .collect()
+}
+
+/// Records the backward node of `out = x.index_tensors(indices)`, advanced indexing.
+pub(crate) fn index(x: &Tensor, indices: &[Option<Tensor>], out: &Tensor) {
     record(&[Some(x)], &[out], |b| IndexBackward0 {
         self_shape: x.shape(),
-        dim,
-        index: b.save(index),
+        indices: save_indices(b, indices),
+    });
+}
+
+/// Records the backward node of `out = x.index_put_tensors(indices, values, accumulate)`.
+pub(crate) fn index_put(
+    x: &Tensor,
+    indices: &[Option<Tensor>],
+    values: &Tensor,
+    accumulate: bool,
+    out: &Tensor,
+) {
+    record(&[Some(x), Some(values)], &[out], |b| IndexPutBackward0 {
+        indices: save_indices(b, indices),
+        accumulate,
+        values_shape: values.shape(),
     });
 }
 
@@ -108,12 +138,12 @@ impl Node for IndexSelectBackward0 {
     }
 }
 
-/// Indexing with an integer tensor: like `IndexSelectBackward0`, after flattening the index and
-/// wrapping its negative positions.
+/// Advanced indexing: the gradient added into zeros of the shape of `x` at the positions it came
+/// from, so that repeated positions add up. PyTorch records this backward as
+/// `IndexPutImplBackward0`, homura as `IndexPutBackward0`.
 struct IndexBackward0 {
     self_shape: Shape,
-    dim: usize,
-    index: SavedId,
+    indices: Vec<Option<SavedId>>,
 }
 
 impl Node for IndexBackward0 {
@@ -122,12 +152,44 @@ impl Node for IndexBackward0 {
     }
 
     fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
-        let index = ctx.unpack(self.index).reshape([-1]).to(DType::I64);
-        let size = self.self_shape[self.dim] as i64;
-        let index = crate::where_(&index.less(0), &index + size, &index);
+        let indices = unpack_indices(ctx, &self.indices);
         let g = only(grads);
         let zeros = g.new_zeros(&self.self_shape);
-        vec![Some(zeros.index_add(self.dim as i64, &index, &g))]
+        vec![Some(zeros.index_put_tensors(&indices, &g, true))]
+    }
+}
+
+/// `x.index_put(indices, values, accumulate)`: `x` gets `g`, with the overwritten positions set
+/// to zero unless `accumulate` (written, not multiplied by zero, so that an infinite or NaN
+/// gradient there gives zero too), and `values` the elements of `g` at the indexed positions,
+/// summed to its shape: PyTorch's engine sums them, homura's node does.
+struct IndexPutBackward0 {
+    indices: Vec<Option<SavedId>>,
+    accumulate: bool,
+    values_shape: Shape,
+}
+
+impl Node for IndexPutBackward0 {
+    fn name(&self) -> &'static str {
+        "IndexPutBackward0"
+    }
+
+    fn apply(&self, ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        let indices = unpack_indices(ctx, &self.indices);
+        let g = only(grads);
+        let values = ctx.needs_input_grad(1).then(|| {
+            g.index_tensors(&indices)
+                .sum_to_size(self.values_shape.clone())
+        });
+        let x = ctx.needs_input_grad(0).then(|| {
+            if self.accumulate {
+                g
+            } else {
+                let zeros = g.new_zeros(&self.values_shape);
+                g.index_put_tensors(&indices, &zeros, false)
+            }
+        });
+        vec![x, values]
     }
 }
 

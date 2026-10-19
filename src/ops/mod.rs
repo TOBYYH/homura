@@ -10,6 +10,7 @@ use crate::shape::compute_view_strides;
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
+mod advanced_index;
 mod binary;
 mod composite;
 mod matmul;
@@ -20,6 +21,7 @@ mod scatter;
 mod shape_ops;
 mod unary;
 
+pub(crate) use advanced_index::{META_VALUES, check_index_dtype, check_index_put_target};
 pub use binary::where_;
 pub(crate) use binary::{binary_op, copy_error};
 pub use overload::Number;
@@ -358,7 +360,7 @@ mod tests {
     #[test]
     fn each_in_place_op_bumps_the_version_exactly_once() {
         type InPlace = fn(&Tensor);
-        let ops: [(&str, InPlace); 24] = [
+        let ops: [(&str, InPlace); 26] = [
             ("add_ scalar", |x| {
                 x.add_(1.0);
             }),
@@ -435,6 +437,14 @@ mod tests {
             ("scatter_add_", |x| {
                 let index = crate::zeros_with([1, 1], (DType::I64, x.device()));
                 x.scatter_add_(1, &index, &crate::ones_with([1, 1], x.device()));
+            }),
+            ("index_put_", |x| {
+                let index = crate::tensor([2i64, 0, 2]);
+                x.index_put_((.., &index), &crate::ones_with([1], x.device()), false);
+            }),
+            ("index_put_ accumulate", |x| {
+                let mask = crate::tensor([true, false, true]);
+                x.index_put_((.., &mask), &crate::ones_with([2], x.device()), true);
             }),
         ];
         for device in [Device::Cpu, Device::Meta] {

@@ -207,10 +207,10 @@ fn node_names_and_edges_follow_pytorch() {
     ] {
         assert_eq!(node(&out), (name, edges), "{case}");
     }
-    // Integer indexing reshapes the selected slices with a recorded `unsafe_view`.
+    // Integer indexing records one `IndexBackward0`, as in PyTorch.
     assert_eq!(
         graph_names(&x.index(&index).grad_fn().unwrap()),
-        ["UnsafeViewBackward0", "IndexBackward0", "AccumulateGrad"]
+        ["IndexBackward0", "AccumulateGrad"]
     );
     // `split` and `chunk` are made of `narrow`, where PyTorch records one `SplitBackward0`.
     for piece in x.split(2, 1).iter().chain(&x.chunk(2, 0)) {

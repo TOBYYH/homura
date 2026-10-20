@@ -14,6 +14,7 @@ mod embedding;
 mod linear;
 mod loss;
 mod norm;
+mod pad;
 
 pub use activation::{gelu, log_softmax, logsigmoid, relu, sigmoid, silu, softmax, tanh};
 pub use dropout::dropout;
@@ -24,3 +25,4 @@ pub use loss::{
     nll_loss,
 };
 pub use norm::{layer_norm, rms_norm};
+pub use pad::pad;

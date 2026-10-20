@@ -34,12 +34,12 @@ pub(crate) use lerp::lerp;
 pub(crate) use matmul::{ScaledProduct, matmul, scaled_product};
 pub(crate) use misc::{deep_clone, to_copy};
 pub(crate) use reduce::{extremum, extremum_dim, mean, prod, sum, sum_dim, sum_to_size, var_std};
-pub(crate) use shape::{concat, flip, triangle};
+pub(crate) use shape::{concat, constant_pad_nd, flip, triangle, unfold_backward};
 pub(crate) use softmax::softmax;
 pub(crate) use unary::unary;
 pub(crate) use view::{
-    Squeeze, alias, as_strided, expand, permute, select, slice, squeeze, transpose, unsafe_view,
-    unsqueeze, view,
+    Squeeze, alias, as_strided, expand, permute, select, slice, squeeze, transpose, unfold,
+    unsafe_view, unsqueeze, view,
 };
 
 use crate::Tensor;

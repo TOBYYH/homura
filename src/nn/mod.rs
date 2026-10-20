@@ -122,6 +122,7 @@
 //! | `nn.Embedding(10, 4, padding_idx=0)`, `F.embedding(i, w)` | [`Embedding::new(10, 4).padding_idx(0)`](Embedding::padding_idx), [`functional::embedding(&i, &w, None)`](functional::embedding) |
 //! | `nn.LayerNorm(4)`, `nn.LayerNorm(4, elementwise_affine=False)`, `F.layer_norm(x, [4])` | [`LayerNorm::new([4])`](LayerNorm::new), [`LayerNorm::new([4]).elementwise_affine(false)`](LayerNorm::elementwise_affine), [`functional::layer_norm(&x, [4], None, None, 1e-5)`](functional::layer_norm) |
 //! | `nn.RMSNorm(4, eps=1e-6)`, `F.rms_norm(x, [4])` | [`RmsNorm::new([4]).eps(1e-6)`](RmsNorm::eps), [`functional::rms_norm(&x, [4], None, None)`](functional::rms_norm) |
+//! | `F.pad(x, (1, 1, 0, 2), value=v)` | [`functional::pad(&x, &[1, 1, 0, 2], v)`](functional::pad) |
 //! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
@@ -161,6 +162,8 @@
 //! - Parameters are not a tensor subclass: [`Parameter`] derefs to
 //!   [`Tensor`](crate::Tensor), so `&param` works where a `&Tensor` is expected, and `&*param`
 //!   where an operator needs the tensor (`&*param * 2.0`).
+//! - [`pad`](functional::pad) has only the constant mode, and always returns a contiguous
+//!   tensor; PyTorch keeps the strides of a non-contiguous input when nothing is padded.
 //! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
 //!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
 //!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`

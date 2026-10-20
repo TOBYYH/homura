@@ -1,12 +1,12 @@
 """Check the reference behavior that tests/autograd_function.rs encodes; does not write fixtures.
 
 Each block mirrors a test there, in the same order: node names, higher-order derivatives through
-saved inputs, outputs and hidden intermediates, mixed and marked outputs, outputs built under
-enable_grad, in-place writes into outputs, when a call is recorded, repeated and partially
+saved inputs, outputs and hidden intermediates, mixed and marked outputs (a saved output after
+an integer one, to the third derivative), outputs built under enable_grad, in-place writes into outputs, when a call is recorded, repeated and partially
 requested inputs, meta and mixed dtypes, the number, shape, dtype and device of returned
 gradients (and of root gradients), what forward may not do, marking and saving twice, missing
 gradients, calls without differentiable outputs, unrecorded calls, saved tensors and lifetimes,
-nested passes, exceptions and threads. Where homura differs on purpose, the reference behavior is
+nested passes, exceptions, training a parameter with SGD, and threads. Where homura differs on purpose, the reference behavior is
 asserted and the difference named in a comment. The crate-internal tests (names of generic types,
 Weak checks of saved slots) and the test of stale input views (PyTorch replays views on their
 base's new history instead) have no counterpart here.
@@ -254,6 +254,41 @@ def saved_non_differentiable_outputs_have_no_history():
     outputs = SaveNonDifferentiable.apply(x)
     assert grad1(outputs[0].sum(), x, True).tolist() == [2.0, 2.0]
     assert seen == [False, False, True, False, False, True]
+
+
+class ExpAndSquare(Function):
+    @staticmethod
+    def forward(ctx, x):
+        e = x.exp()
+        ctx.save_for_backward(x, e)
+        return x.argmax(), e, x * x
+
+    @staticmethod
+    def backward(ctx, g_index, g_exp, g_square):
+        x, e = ctx.saved_tensors
+        # The integer output's gradient is materialized as zeros (homura passes None).
+        assert not g_index.any()
+        return g_exp * e + g_square * x * 2
+
+
+@block
+def saved_outputs_after_integer_outputs_give_third_derivatives():
+    # PyTorch materializes the missing gradients as zeros; homura passes None (step 7, choice
+    # 3), which the Rust backward handles.
+    x = leaf(-0.5, 0.0, 0.5)
+    outputs = ExpAndSquare.apply(x)
+    e, two_x = x.detach().exp(), x.detach() * 2
+    dx = grad1((outputs[1] + outputs[2]).sum(), x, True)
+    assert torch.allclose(dx, e + two_x, rtol=1e-12, atol=1e-12)
+    d2x = grad1(dx.sum(), x, True)
+    assert torch.allclose(d2x, e + 2, rtol=1e-12, atol=1e-12)
+    d3x = grad1(d2x.sum(), x)
+    assert torch.allclose(d3x, e, rtol=1e-12, atol=1e-12)
+    x = leaf(0.2, 0.5)
+    square = ExpAndSquare.apply(x)[2]
+    dx = grad1(square.sum(), x, True)
+    assert torch.allclose(dx, torch.tensor([0.4, 1.0], dtype=d64), rtol=1e-12, atol=1e-12)
+    assert grad1(dx.sum(), x).tolist() == [2.0, 2.0]
 
 
 @block
@@ -795,6 +830,26 @@ def panics_leave_grad_mode_and_the_graph_usable():
     assert torch.is_grad_enabled()
     s.backward(retain_graph=True)
     assert x.grad.tolist() == [2.0]
+
+
+@block
+def custom_functions_train_parameters_with_sgd():
+    p = torch.nn.Parameter(torch.tensor([0.8], dtype=d64))
+    model = torch.nn.ParameterList([p])
+    opt = torch.optim.SGD(model.parameters(), 0.05, momentum=0.9)
+    expected, momentum = 0.8, 0.0
+    for step in range(5):
+        opt.zero_grad()
+        Square.apply(p).pow(2).sum().backward()
+        g = 4 * expected**3
+        assert abs(p.grad.item() - g) <= 1e-12 * max(abs(g), 1)
+        momentum = g if step == 0 else 0.9 * momentum + g
+        expected -= 0.05 * momentum
+        opt.step()
+        assert abs(p.item() - expected) <= 1e-12
+        assert abs(opt.state[p]["momentum_buffer"].item() - momentum) <= 1e-12 * max(momentum, 1)
+        assert p.is_leaf and p.requires_grad
+        assert abs(model.state_dict()["0"].item() - expected) <= 1e-12
 
 
 @block

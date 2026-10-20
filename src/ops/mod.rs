@@ -15,6 +15,7 @@ mod binary;
 mod composite;
 mod matmul;
 mod overload;
+mod pad;
 mod random;
 mod reduce;
 mod scatter;
@@ -25,10 +26,12 @@ pub(crate) use advanced_index::{META_VALUES, check_index_dtype, check_index_put_
 pub use binary::where_;
 pub(crate) use binary::{binary_op, copy_error};
 pub use overload::Number;
+pub(crate) use pad::constant_pad_nd;
 pub use random::{
     manual_seed, rand, rand_like, rand_with, randint, randint_with, randn, randn_like, randn_with,
 };
 pub(crate) use reduce::exclusive_cumprod;
+pub(crate) use shape_ops::unfold_backward;
 pub use shape_ops::{concat, stack};
 pub use unary::GeluApproximate;
 

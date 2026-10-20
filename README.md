@@ -17,10 +17,14 @@ Implemented so far:
 - `Tensor` with PyTorch's reference semantics, dtypes and type promotion, views, indexing,
   broadcasting and forward operators, on a CPU reference backend and on the meta device, which
   computes only shapes and dtypes.
+- Advanced indexing with integer tensors and bool masks, `index_put` / `index_put_`, constant
+  padding with `nn::functional::pad`, and window views with `Tensor::unfold`.
 - Automatic differentiation like PyTorch's autograd: backward passes, gradients of gradients to
   any order, in-place operations checked with version counters, `retain_grad`, and
   `gradcheck` / `gradgradcheck`. Gradients are checked against PyTorch, including for a Llama
   decoder layer.
+- Custom differentiable operations through `autograd::Function`, including higher-order
+  derivatives through saved inputs and outputs.
 - Minimal safetensors reading and writing.
 - The core of `nn` modules: `Parameter`, `#[derive(Module)]` and the `Module` trait with
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
@@ -32,7 +36,7 @@ Implemented so far:
   parameters and optimizer state at every step.
 
 Not available yet: GPU backends (ROCm comes first), most neural network layers, saving and
-loading optimizer state, custom autograd functions and hooks, and in-place operations on views
+loading optimizer state, autograd hooks, and in-place operations on views
 that require grad.
 
 ## Example

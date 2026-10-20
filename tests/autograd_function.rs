@@ -11,6 +11,8 @@ use std::thread;
 use homura::autograd::{
     self, BackwardContext, BackwardOptions, ForwardContext, Function, GradOptions, GradcheckOptions,
 };
+use homura::nn::{Module, Parameter};
+use homura::optim::{Optimizer, Sgd};
 use homura::{DType, Device, Tensor};
 
 fn f64s(values: &[f64]) -> Tensor {
@@ -68,10 +70,6 @@ fn grad1(y: &Tensor, x: &Tensor, create_graph: bool) -> Tensor {
 
 fn first(function: impl Function, inputs: &[&Tensor]) -> Tensor {
     function.apply(inputs).remove(0)
-}
-
-fn no_grad_options() -> GradcheckOptions {
-    GradcheckOptions::default()
 }
 
 // --- Functions shared by several tests ---
@@ -176,10 +174,10 @@ fn saved_inputs_give_second_derivatives() {
     let y = leaf(&[1.25, 0.75, -0.5]);
     let square = |xs: &[Tensor]| Square.apply(&[&xs[0]]);
     let product = |xs: &[Tensor]| Product.apply(&[&xs[0], &xs[1]]);
-    autograd::gradcheck(square, &[&x], no_grad_options()).unwrap();
-    autograd::gradgradcheck(square, &[&x], no_grad_options()).unwrap();
-    autograd::gradcheck(product, &[&x, &y], no_grad_options()).unwrap();
-    autograd::gradgradcheck(product, &[&x, &y], no_grad_options()).unwrap();
+    autograd::gradcheck(square, &[&x], GradcheckOptions::default()).unwrap();
+    autograd::gradgradcheck(square, &[&x], GradcheckOptions::default()).unwrap();
+    autograd::gradcheck(product, &[&x, &y], GradcheckOptions::default()).unwrap();
+    autograd::gradgradcheck(product, &[&x, &y], GradcheckOptions::default()).unwrap();
     let dx = grad1(&first(Square, &[&x]).sum(), &x, true);
     assert_close(&vals(&dx), &[1.0, -3.0, 4.0]);
     assert_close(&vals(&grad1(&dx.sum(), &x, false)), &[2.0, 2.0, 2.0]);
@@ -189,8 +187,8 @@ fn saved_inputs_give_second_derivatives() {
 fn saved_outputs_give_second_derivatives() {
     let x = leaf(&[0.0, 1.0, -0.5]);
     let f = |xs: &[Tensor]| SaveOut.apply(&[&xs[0]]);
-    autograd::gradcheck(f, &[&x], no_grad_options()).unwrap();
-    autograd::gradgradcheck(f, &[&x], no_grad_options()).unwrap();
+    autograd::gradcheck(f, &[&x], GradcheckOptions::default()).unwrap();
+    autograd::gradgradcheck(f, &[&x], GradcheckOptions::default()).unwrap();
     let dx = grad1(&first(SaveOut, &[&x]).sum(), &x, true);
     let d2x = grad1(&dx.sum(), &x, false);
     assert_close(&vals(&d2x), &vals(&x.detach().exp()));
@@ -241,7 +239,7 @@ fn hidden_intermediates_are_constants() {
     let dx = grad1(&first(HiddenExp { recompute: true }, &[&x]).sum(), &x, true);
     assert_close(&vals(&grad1(&dx.sum(), &x, false)), &expected);
     let f = |xs: &[Tensor]| HiddenExp { recompute: true }.apply(&[&xs[0]]);
-    autograd::gradgradcheck(f, &[&x], no_grad_options()).unwrap();
+    autograd::gradgradcheck(f, &[&x], GradcheckOptions::default()).unwrap();
 }
 
 /// `2x`, saving a product with a leaf weight that it computes under `enable_grad`.
@@ -370,6 +368,50 @@ fn saved_non_differentiable_outputs_have_no_history() {
         *seen.lock().unwrap(),
         [false, false, true, false, false, true]
     );
+}
+
+/// Three outputs: the position of the maximum (`I64`), `exp(x)` and `x * x`. Saves the input and
+/// the output `exp(x)`, which follows the integer output.
+struct ExpAndSquare;
+
+impl Function for ExpAndSquare {
+    fn forward(&mut self, ctx: &mut ForwardContext, inputs: &[&Tensor]) -> Vec<Tensor> {
+        let x = inputs[0];
+        let e = x.exp();
+        ctx.save_for_backward(&[x, &e]);
+        vec![x.argmax(), e, x * x]
+    }
+
+    fn backward(&self, ctx: &BackwardContext<'_>, grads: &[Option<Tensor>]) -> Vec<Option<Tensor>> {
+        let saved = ctx.saved_tensors();
+        assert!(grads[0].is_none(), "the integer output gets no gradient");
+        let from_exp = grads[1].as_ref().map(|g| g * &saved[1]);
+        let from_square = grads[2].as_ref().map(|g| g * &saved[0] * 2.0);
+        vec![match (from_exp, from_square) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        }]
+    }
+}
+
+#[test]
+fn saved_outputs_after_integer_outputs_give_third_derivatives() {
+    let x = leaf(&[-0.5, 0.0, 0.5]);
+    let outputs = ExpAndSquare.apply(&[&x]);
+    let (e, two_x) = (x.detach().exp(), x.detach() * 2.0);
+    let dx = grad1(&(&outputs[1] + &outputs[2]).sum(), &x, true);
+    assert_close(&vals(&dx), &vals(&(&e + &two_x)));
+    let d2x = grad1(&dx.sum(), &x, true);
+    assert_close(&vals(&d2x), &vals(&(&e + 2.0)));
+    let d3x = grad1(&d2x.sum(), &x, false);
+    assert_close(&vals(&d3x), &vals(&e));
+    // With the saved exp output dropped, unpacking it still succeeds; the square's second
+    // derivative uses the saved input.
+    let x = leaf(&[0.2, 0.5]);
+    let square = ExpAndSquare.apply(&[&x]).pop().unwrap();
+    let dx = grad1(&square.sum(), &x, true);
+    assert_close(&vals(&dx), &[0.4, 1.0]);
+    assert_close(&vals(&grad1(&dx.sum(), &x, false)), &[2.0, 2.0]);
 }
 
 /// Returns nothing, or a tensor computed from nothing.
@@ -1299,6 +1341,30 @@ fn panics_leave_grad_mode_and_the_graph_usable() {
     assert_eq!(Arc::strong_count(&token), 2);
     drop(s);
     assert_eq!(Arc::strong_count(&token), 1);
+}
+
+// --- With modules and optimizers ---
+
+#[test]
+fn custom_functions_train_parameters_with_sgd() {
+    let p = Parameter::new(f64s(&[0.8]));
+    let model = vec![p.clone()];
+    let mut opt = Sgd::new(model.parameters(), 0.05).momentum(0.9);
+    let (mut expected, mut momentum) = (0.8f64, 0.0f64);
+    for step in 0..5 {
+        opt.zero_grad();
+        // The loss (p²)², through the custom square.
+        first(Square, &[&p]).pow(2.0).sum().backward();
+        let g = 4.0 * expected.powi(3);
+        assert_close(&vals(&p.grad().unwrap()), &[g]);
+        momentum = if step == 0 { g } else { 0.9 * momentum + g };
+        expected -= 0.05 * momentum;
+        opt.step();
+        assert_close(&vals(&p), &[expected]);
+        assert_close(&vals(opt.state(&p).unwrap().momentum_buffer()), &[momentum]);
+        assert!(p.is_leaf() && p.requires_grad());
+        assert_close(&vals(&model.state_dict()["0"]), &[expected]);
+    }
 }
 
 // --- Threads ---

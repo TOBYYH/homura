@@ -334,6 +334,56 @@ impl Tensor {
         self.reshape(spec)
     }
 
+    /// A view of the windows of `size` elements along `dim` that start every `step` elements
+    /// (PyTorch's `unfold`): dimension `dim` counts the `(n - size) / step + 1` windows of its
+    /// `n` elements, and a new last dimension of `size` holds the elements of each window.
+    /// Elements left over after the last full window aren't in any. A zero-dimensional tensor
+    /// counts as one element (`dim` is `0` or `-1`).
+    ///
+    /// Multiple windows overlap when `step < size`: the view then refers to some elements more
+    /// than once, so in-place operations on it are rejected, where PyTorch writes such elements
+    /// several times. A single window introduces no overlap; a view can also inherit overlap
+    /// from its input. Gradients of elements in several windows add up, in the dtype and in
+    /// window order like PyTorch's CPU kernel; the gradient is recorded as
+    /// `UnfoldBackwardBackward0`, whose own gradient unfolds again.
+    ///
+    /// ```
+    /// let x = homura::arange(5.0);
+    /// let windows = x.unfold(0, 3, 2);
+    /// assert_eq!(windows.shape(), [2, 3]);
+    /// assert_eq!(windows.to_vec::<f32>(), [0.0, 1.0, 2.0, 2.0, 3.0, 4.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics with PyTorch's messages if `dim` is out of range, `size` exceeds the size of `dim`
+    /// or `step` is zero.
+    pub fn unfold(&self, dim: i64, size: usize, step: usize) -> Tensor {
+        let l = self.layout();
+        let nd = l.shape.len();
+        let d = normalize_dim(dim, nd);
+        let max = if nd == 0 { 1 } else { l.shape[d] };
+        if size > max {
+            panic!("maximum size for tensor at dimension {d} is {max} but size is {size}");
+        }
+        if step == 0 {
+            panic!("step is 0 but must be > 0");
+        }
+        let mut layout = l.clone();
+        layout.shape.insert(nd, size);
+        layout
+            .strides
+            .insert(nd, if nd == 0 { 1 } else { l.strides[d] });
+        if nd > 0 {
+            layout.shape[d] = (l.shape[d] - size) / step + 1;
+            // With a single window the stride is never used, and a huge step may not fit.
+            layout.strides[d] = l.strides[d].checked_mul(step).unwrap_or(l.strides[d]);
+        }
+        let out = self.make_view(layout);
+        formulas::unfold(self, d, size, step, &out);
+        out
+    }
+
     /// A view with an explicit shape, strides and storage offset (in elements).
     ///
     /// Gradients flow back to the elements of `self` that the view shares with it. Computing the

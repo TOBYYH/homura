@@ -56,10 +56,10 @@
 //! `matmul`, `addmm`, `addmv`, `addr`, `baddbmm`, `addbmm`, the reductions `sum`, `sum_dim`,
 //! `sum_to_size`, `mean`, `mean_dim`, `prod`, `prod_dim`, `max`, `min`, `max_dim`, `min_dim`,
 //! `var`, `var_dim`, `std` and `std_dim`, the views `expand`, `view`, `reshape`, `permute`,
-//! `transpose`, `squeeze`, `squeeze_dim`, `unsqueeze`, `select`, `narrow`, slicing and
-//! `as_strided`, `index_select`, indexing with an integer tensor, `index_add`, `gather`,
+//! `transpose`, `squeeze`, `squeeze_dim`, `unsqueeze`, `select`, `narrow`, slicing, `unfold`
+//! and `as_strided`, `index_select`, indexing with an integer tensor, `index_add`, `gather`,
 //! `scatter_add`, `select_scatter`, `slice_scatter`, the copies `deep_clone`, `to`, `concat`,
-//! `flip`, `triu` and `tril`, and what is built from them, such as `flatten`, `contiguous`,
+//! `flip`, `triu`, `tril` and `nn::functional::pad`, and what is built from them, such as `flatten`, `contiguous`,
 //! `repeat`, `stack`, `split`, `chunk` and `masked_fill`. Comparisons, logical operations,
 //! integer results, creation and random functions and `detach` record nothing.
 //!

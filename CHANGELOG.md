@@ -66,6 +66,12 @@ All notable changes to this project are documented in this file. The format is b
   memory with an input or another output, in-place modifications of the inputs and marking a
   tensor that isn't an output panic; outputs without a gradient give `backward` `None` instead of
   zeros, and `backward` isn't called when no output has one.
+- `nn::functional::pad` in PyTorch's constant mode, with negative pads that crop, recorded as
+  `ConstantPadNdBackward0` (its gradient pads again). The fill value is converted and checked
+  like `fill_`, only when something is filled. Unlike PyTorch, the result is always contiguous.
+- `Tensor::unfold`, a view of the windows along a dimension, recorded as `UnfoldBackward0`. Its
+  gradient adds overlapping windows in the dtype in PyTorch's order and is recorded as
+  `UnfoldBackwardBackward0`. Unlike PyTorch, in-place writes into overlapping windows panic.
 
 ### Changed
 

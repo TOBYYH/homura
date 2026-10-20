@@ -84,6 +84,16 @@ pub(crate) fn slice(x: &Tensor, dim: usize, start: usize, end: usize, step: usiz
     });
 }
 
+/// Records the backward node of `out = x.unfold(dim, size, step)`, with `dim` already wrapped.
+pub(crate) fn unfold(x: &Tensor, dim: usize, size: usize, step: usize, out: &Tensor) {
+    record(&[Some(x)], &[out], |_| UnfoldBackward0 {
+        self_shape: x.shape(),
+        dim,
+        size,
+        step,
+    });
+}
+
 /// Records the backward node of `out = x.as_strided(..)`.
 pub(crate) fn as_strided(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |_| {
@@ -275,6 +285,33 @@ impl Node for SliceBackward0 {
             Some(self.start as i64),
             Some(self.end as i64),
             self.step as i64,
+        ))]
+    }
+}
+
+/// `x.unfold(dim, size, step)`: each element of the gradient goes to the element of `x` it
+/// views, and elements in several windows add up, see `ops::unfold_backward`. Unlike
+/// `as_strided`, this works with the logical positions, so it doesn't matter how `x` lies in
+/// memory.
+struct UnfoldBackward0 {
+    self_shape: Shape,
+    dim: usize,
+    size: usize,
+    step: usize,
+}
+
+impl Node for UnfoldBackward0 {
+    fn name(&self) -> &'static str {
+        "UnfoldBackward0"
+    }
+
+    fn apply(&self, _ctx: &ApplyContext<'_>, grads: Vec<Option<Tensor>>) -> Vec<Option<Tensor>> {
+        vec![Some(crate::ops::unfold_backward(
+            &only(grads),
+            &self.self_shape,
+            self.dim,
+            self.size,
+            self.step,
         ))]
     }
 }

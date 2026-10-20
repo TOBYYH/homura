@@ -247,3 +247,24 @@ impl Tensor {
         out
     }
 }
+
+/// The gradient of `x.unfold(dim, size, step)` for the upstream gradient `grad`, where `x` has
+/// `input_shape` and `dim` is wrapped (PyTorch's `unfold_backward`): a new tensor of
+/// `input_shape` in which each element of `grad` lands on the element of `x` it views. See
+/// [`cpu::unfold_backward`] for how overlapping windows add up. Recorded as a node of its own,
+/// whose derivative unfolds again.
+pub(crate) fn unfold_backward(
+    grad: &Tensor,
+    input_shape: &Shape,
+    dim: usize,
+    size: usize,
+    step: usize,
+) -> Tensor {
+    let g = grad.data();
+    let out = Tensor::empty_on(input_shape.clone(), g.dtype, g.device());
+    if g.device() == Device::Cpu {
+        cpu::unfold_backward(&out.data(), &g, dim, size, step);
+    }
+    formulas::unfold_backward(grad, dim, size, step, &out);
+    out
+}

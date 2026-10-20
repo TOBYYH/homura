@@ -1,6 +1,6 @@
 //! Kernels that don't fit the elementwise or reduction patterns.
 
-use super::{Plan, base, copy, dispatch_all, dispatch_float, exec, read_host};
+use super::{Float, FloatElement, Plan, base, copy, dispatch_all, dispatch_float, exec, read_host};
 use crate::dtype::sealed::Sealed;
 use crate::shape::contiguous_strides;
 use crate::tensor::TensorData;
@@ -310,6 +310,74 @@ pub(crate) fn flip(out: &TensorData, src: &TensorData, mask: &[bool]) {
                     idx[d] = 0;
                 }
             }
+        });
+    });
+}
+
+/// The gradient of `x.unfold(dim, size, step)` for the upstream gradient `grad` (PyTorch's
+/// `unfold_backward`): `out` has the shape of `x` and is zero-filled; each of its positions along
+/// `dim` gets the elements of `grad` that view it. Where windows overlap (`step < size`), a
+/// position adds the windows covering it to zero one at a time in window order, in the dtype
+/// (`f16` and `bf16` round after each addition), like PyTorch's CPU kernel; otherwise it copies
+/// the element of the one window covering it, keeping `-0.0`, like PyTorch's copy. A
+/// zero-dimensional `x` is viewed by one window of `size` (0 or 1) elements. Floating point only.
+pub(crate) fn unfold_backward(
+    out: &TensorData,
+    grad: &TensorData,
+    dim: usize,
+    size: usize,
+    step: usize,
+) {
+    let (lo, lg) = (&out.layout, &grad.layout);
+    // Without elements on either side nothing is written, and the strides may be arbitrary.
+    if lo.num_elements() == 0 || lg.num_elements() == 0 {
+        return;
+    }
+    if lo.shape.is_empty() {
+        debug_assert_eq!(&lg.shape[..], [1]);
+        copy(
+            out,
+            &TensorData {
+                layout: lg.select(0, 0),
+                ..grad.clone()
+            },
+        );
+        return;
+    }
+    let last = lg.shape.len() - 1;
+    debug_assert_eq!(last, lo.shape.len());
+    let (n, windows) = (lo.shape[dim], lg.shape[dim]);
+    let (od, gd, gl) = (lo.strides[dim], lg.strides[dim], lg.strides[last]);
+    // The positions of all dimensions but `dim` (and the window's last one).
+    let (ko, kg) = (lo.select(dim, 0), lg.select(last, 0).select(dim, 0));
+    dispatch_float!(out.dtype, T => {
+        let (po, pg) = (base::<T>(out), base::<T>(grad));
+        exec(|| {
+            Plan::new(&ko.shape, [&ko.strides, &kg.strides]).for_each(
+                [ko.offset, kg.offset],
+                |[o, g]| {
+                    // SAFETY: `w < windows` and `j < size` stay inside `grad`.
+                    let read = |w: usize, j: usize| unsafe { *pg.add(g + w * gd + j * gl) };
+                    for i in 0..n {
+                        let value = if step >= size {
+                            let (w, j) = (i / step, i % step);
+                            if w >= windows || j >= size {
+                                continue;
+                            }
+                            read(w, j)
+                        } else {
+                            // The windows `first..=last` cover position `i`.
+                            let first = if i >= size { (i - size) / step + 1 } else { 0 };
+                            let last = (i / step).min(windows - 1);
+                            (first..=last).fold(T::down(Float::ZERO), |acc, w| {
+                                T::down(acc.up() + read(w, i - w * step).up())
+                            })
+                        };
+                        // SAFETY: `i < n` stays inside `out`.
+                        unsafe { *po.add(o + i * od) = value };
+                    }
+                },
+            )
         });
     });
 }

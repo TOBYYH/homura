@@ -59,8 +59,9 @@
 //! `transpose`, `squeeze`, `squeeze_dim`, `unsqueeze`, `select`, `narrow`, slicing, `unfold`
 //! and `as_strided`, `index_select`, indexing with an integer tensor, `index_add`, `gather`,
 //! `scatter_add`, `select_scatter`, `slice_scatter`, the copies `deep_clone`, `to`, `concat`,
-//! `flip`, `triu`, `tril` and `nn::functional::pad`, and what is built from them, such as `flatten`, `contiguous`,
-//! `repeat`, `stack`, `split`, `chunk` and `masked_fill`. Comparisons, logical operations,
+//! `flip`, `triu`, `tril` and `nn::functional::pad`, the poolings `nn::functional::max_pool2d`
+//! and `adaptive_avg_pool2d`, and what is built from them, such as `flatten`, `contiguous`,
+//! `repeat`, `stack`, `split`, `chunk`, `masked_fill` and `nn::functional::conv2d`. Comparisons, logical operations,
 //! integer results, creation and random functions and `detach` record nothing.
 //!
 //! The gradient of `prod` for an input that contains zeros can't be differentiated again yet: a

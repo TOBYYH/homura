@@ -16,6 +16,7 @@ pub(crate) mod loss;
 mod matmul;
 mod misc;
 pub(crate) mod norm;
+pub(crate) mod pool;
 mod pow;
 mod reduce;
 mod shape;

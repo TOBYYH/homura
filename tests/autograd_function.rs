@@ -412,6 +412,16 @@ fn saved_outputs_after_integer_outputs_give_third_derivatives() {
     let dx = grad1(&square.sum(), &x, true);
     assert_close(&vals(&dx), &[0.4, 1.0]);
     assert_close(&vals(&grad1(&dx.sum(), &x, false)), &[2.0, 2.0]);
+    // With only the saved exp output kept, the higher derivatives go through its slot (review
+    // round 65, R80).
+    let x = leaf(&[-0.5, 0.0, 0.5]);
+    let exp = ExpAndSquare.apply(&[&x]).swap_remove(1);
+    let e = vals(&x.detach().exp());
+    let dx = grad1(&exp.sum(), &x, true);
+    assert_close(&vals(&dx), &e);
+    let d2x = grad1(&dx.sum(), &x, true);
+    assert_close(&vals(&d2x), &e);
+    assert_close(&vals(&grad1(&d2x.sum(), &x, false)), &e);
 }
 
 /// Returns nothing, or a tensor computed from nothing.

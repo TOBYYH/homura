@@ -100,6 +100,7 @@ impl FloatElement for bf16 {
 pub(crate) trait IntElement: Element + Ord {
     const ZERO: Self;
     const ONE: Self;
+    const MIN: Self;
     fn wadd(self, o: Self) -> Self;
     fn wsub(self, o: Self) -> Self;
     fn wmul(self, o: Self) -> Self;
@@ -112,6 +113,7 @@ macro_rules! impl_int {
         impl IntElement for $t {
             const ZERO: Self = 0;
             const ONE: Self = 1;
+            const MIN: Self = <$t>::MIN;
             #[inline]
             fn wadd(self, o: Self) -> Self {
                 self.wrapping_add(o)

@@ -72,6 +72,20 @@ All notable changes to this project are documented in this file. The format is b
 - `Tensor::unfold`, a view of the windows along a dimension, recorded as `UnfoldBackward0`. Its
   gradient adds overlapping windows in the dtype in PyTorch's order and is recorded as
   `UnfoldBackwardBackward0`. Unlike PyTorch, in-place writes into overlapping windows panic.
+- `nn::functional::conv2d` with `Conv2dOptions` (stride, `Conv2dPadding::Explicit` / `Valid` /
+  `Same`, dilation, groups), for batched and unbatched inputs, floating point and integer
+  dtypes, computed from padding, `unfold` and a matrix product, so it is differentiable to any
+  order; half precision is computed in `F32` and rounded once, as in PyTorch. Unlike PyTorch,
+  the graph holds those operations rather than one `ConvolutionBackward0`, and inputs without
+  channels panic.
+- `nn::functional::max_pool2d` and `max_pool2d_with_indices` with `MaxPool2dOptions` (kernel
+  size, stride, padding, dilation, `ceil_mode`), with PyTorch's selection rules (the first of
+  equal maxima, the last NaN, never the padding) and checks, recorded as
+  `MaxPool2DWithIndicesBackward0`, whose gradient adds in PyTorch's order and is differentiable
+  again. Unlike PyTorch, windows that cover only padding panic.
+- `nn::functional::adaptive_avg_pool2d`, a mean over the last two dimensions for an output of
+  `[1, 1]` and otherwise PyTorch's kernel, recorded as `AdaptiveAvgPool2DBackward0`, with
+  PyTorch's order of operations in both directions.
 
 ### Changed
 

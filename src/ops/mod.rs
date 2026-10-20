@@ -16,6 +16,7 @@ mod composite;
 mod matmul;
 mod overload;
 mod pad;
+mod pool;
 mod random;
 mod reduce;
 mod scatter;
@@ -27,6 +28,10 @@ pub use binary::where_;
 pub(crate) use binary::{binary_op, copy_error};
 pub use overload::Number;
 pub(crate) use pad::constant_pad_nd;
+pub(crate) use pool::{
+    AdaptiveWindows, Pool2d, adaptive_avg_pool2d, adaptive_avg_pool2d_backward,
+    max_pool2d_backward, max_pool2d_with_indices,
+};
 pub use random::{
     manual_seed, rand, rand_like, rand_with, randint, randint_with, randn, randn_like, randn_with,
 };

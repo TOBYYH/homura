@@ -22,6 +22,7 @@ mod iter;
 mod linalg;
 mod misc;
 mod num;
+mod pool;
 mod reduce;
 
 pub(crate) use iter::{Plan, walk_strides};
@@ -31,6 +32,9 @@ pub(crate) use misc::{
     triangle, unfold_backward,
 };
 pub(crate) use num::{Float, FloatElement, IntElement};
+pub(crate) use pool::{
+    adaptive_avg_pool2d, adaptive_avg_pool2d_backward, max_pool2d, max_pool2d_backward,
+};
 pub(crate) use reduce::{arg_reduce, exclusive_cumprod, reduce, var};
 
 static EXEC: Mutex<()> = Mutex::new(());

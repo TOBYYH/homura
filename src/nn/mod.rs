@@ -123,6 +123,9 @@
 //! | `nn.LayerNorm(4)`, `nn.LayerNorm(4, elementwise_affine=False)`, `F.layer_norm(x, [4])` | [`LayerNorm::new([4])`](LayerNorm::new), [`LayerNorm::new([4]).elementwise_affine(false)`](LayerNorm::elementwise_affine), [`functional::layer_norm(&x, [4], None, None, 1e-5)`](functional::layer_norm) |
 //! | `nn.RMSNorm(4, eps=1e-6)`, `F.rms_norm(x, [4])` | [`RmsNorm::new([4]).eps(1e-6)`](RmsNorm::eps), [`functional::rms_norm(&x, [4], None, None)`](functional::rms_norm) |
 //! | `F.pad(x, (1, 1, 0, 2), value=v)` | [`functional::pad(&x, &[1, 1, 0, 2], v)`](functional::pad) |
+//! | `F.conv2d(x, w, b, stride=2, padding=1)` | [`functional::conv2d(&x, &w, Some(&b), Conv2dOptions { stride: [2, 2], padding: 1.into(), ..Default::default() })`](functional::conv2d) |
+//! | `F.max_pool2d(x, 2)`, `F.max_pool2d(x, 3, 2, 1, return_indices=True)` | [`functional::max_pool2d(&x, MaxPool2dOptions::new([2, 2]))`](functional::max_pool2d), [`functional::max_pool2d_with_indices(&x, MaxPool2dOptions { stride: Some([2, 2]), padding: [1, 1], ..MaxPool2dOptions::new([3, 3]) })`](functional::max_pool2d_with_indices) |
+//! | `F.adaptive_avg_pool2d(x, (1, 1))` | [`functional::adaptive_avg_pool2d(&x, [1, 1])`](functional::adaptive_avg_pool2d) |
 //! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
@@ -164,6 +167,17 @@
 //!   where an operator needs the tensor (`&*param * 2.0`).
 //! - [`pad`](functional::pad) has only the constant mode, and always returns a contiguous
 //!   tensor; PyTorch keeps the strides of a non-contiguous input when nothing is padded.
+//! - [`conv2d`](functional::conv2d) records the operations it is computed with (padding,
+//!   unfolding, a matrix product) instead of PyTorch's `ConvolutionBackward0`, and its `F32`
+//!   matrix product accumulates in `F64`. It rejects inputs without channels, tensors on
+//!   different devices, and a bias of another dtype also with `Valid` or `Same` padding, which
+//!   PyTorch accepts.
+//! - [`max_pool2d`](functional::max_pool2d) rejects windows that cover only padding (possible
+//!   with a dilation above 1), where PyTorch returns `-inf` with an index outside the input,
+//!   and bool inputs also on the meta device. An [`adaptive_avg_pool2d`](functional::adaptive_avg_pool2d)
+//!   with an output size of 0 has a gradient of zeros, where PyTorch's backward pass fails, and
+//!   integer inputs are rejected also where nothing is computed. `output_size` has no `None`
+//!   entries: pass the input's size.
 //! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
 //!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
 //!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`

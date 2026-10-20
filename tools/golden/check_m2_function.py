@@ -289,6 +289,14 @@ def saved_outputs_after_integer_outputs_give_third_derivatives():
     dx = grad1(square.sum(), x, True)
     assert torch.allclose(dx, torch.tensor([0.4, 1.0], dtype=d64), rtol=1e-12, atol=1e-12)
     assert grad1(dx.sum(), x).tolist() == [2.0, 2.0]
+    # Only the saved exp output kept (review round 65, R80).
+    x = leaf(-0.5, 0.0, 0.5)
+    exp = ExpAndSquare.apply(x)[1]
+    e = x.detach().exp()
+    dx = grad1(exp.sum(), x, True)
+    d2x = grad1(dx.sum(), x, True)
+    for t in [dx, d2x, grad1(d2x.sum(), x)]:
+        assert torch.allclose(t, e, rtol=1e-12, atol=1e-12)
 
 
 @block

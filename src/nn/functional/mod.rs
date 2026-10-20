@@ -9,14 +9,17 @@
 //! has more of them.
 
 mod activation;
+mod conv;
 mod dropout;
 mod embedding;
 mod linear;
 mod loss;
 mod norm;
 mod pad;
+mod pool;
 
 pub use activation::{gelu, log_softmax, logsigmoid, relu, sigmoid, silu, softmax, tanh};
+pub use conv::{Conv2dOptions, Conv2dPadding, conv2d};
 pub use dropout::dropout;
 pub use embedding::embedding;
 pub use linear::linear;
@@ -26,3 +29,4 @@ pub use loss::{
 };
 pub use norm::{layer_norm, rms_norm};
 pub use pad::pad;
+pub use pool::{MaxPool2dOptions, adaptive_avg_pool2d, max_pool2d, max_pool2d_with_indices};

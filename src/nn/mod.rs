@@ -92,12 +92,34 @@
 //!
 //! # Layers
 //!
-//! [`Linear`], [`Embedding`], [`LayerNorm`], [`RmsNorm`], [`Dropout`] and the activations
-//! [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and [`Softmax`] are modules with a
-//! `forward` method and implement [`Forward`]; [`Sequential`] applies such layers one after
-//! another. [`functional`] has their computations as functions of tensors, and [`init`] the
-//! initializations that layers use, with PyTorch's formulas. [`Dropout`] depends on the mode:
-//! it has a [`Training`] flag, which [`Module::eval`] clears.
+//! [`Linear`], [`Embedding`], [`LayerNorm`], [`RmsNorm`], [`Dropout`], the activations
+//! [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and [`Softmax`], and the CNN layers
+//! [`Conv2d`], [`BatchNorm2d`], [`MaxPool2d`], [`AdaptiveAvgPool2d`] and [`Flatten`] are modules
+//! with a `forward` method and implement [`Forward`]; [`Sequential`] applies such layers one
+//! after another. [`functional`] has their computations as functions of tensors, and [`init`] the
+//! initializations that layers use, with PyTorch's formulas. [`Dropout`] and [`BatchNorm2d`]
+//! depend on the mode: they have a [`Training`] flag, which [`Module::eval`] clears. Options are
+//! set one after another, starting from PyTorch's defaults: `Conv2d::new(3, 8, 3).padding(1)`;
+//! sizes of 2-D layers are a number or a pair ([`IntoPair`]).
+//!
+//! ```
+//! use homura::nn::{
+//!     AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Flatten, Linear, MaxPool2d, Module, Relu, Sequential,
+//! };
+//!
+//! let model = Sequential::new()
+//!     .append(Conv2d::new(3, 8, 3).padding(1))
+//!     .append(BatchNorm2d::new(8))
+//!     .append(Relu)
+//!     .append(MaxPool2d::new(2))
+//!     .append(Conv2d::new(8, 16, 3).padding(1))
+//!     .append(AdaptiveAvgPool2d::new(1))
+//!     .append(Flatten::default())
+//!     .append(Linear::new(16, 4));
+//! assert_eq!(model.forward(&homura::randn([4, 3, 8, 8])).shape(), [4, 4]);
+//! assert_eq!(model.state_dict().len(), 11);
+//! model.eval();
+//! ```
 //!
 //! The losses are functions in [`functional`]: [`mse_loss`](functional::mse_loss),
 //! [`nll_loss`](functional::nll_loss), [`cross_entropy`](functional::cross_entropy) and
@@ -126,6 +148,10 @@
 //! | `F.conv2d(x, w, b, stride=2, padding=1)` | [`functional::conv2d(&x, &w, Some(&b), Conv2dOptions { stride: [2, 2], padding: 1.into(), ..Default::default() })`](functional::conv2d) |
 //! | `F.max_pool2d(x, 2)`, `F.max_pool2d(x, 3, 2, 1, return_indices=True)` | [`functional::max_pool2d(&x, MaxPool2dOptions::new([2, 2]))`](functional::max_pool2d), [`functional::max_pool2d_with_indices(&x, MaxPool2dOptions { stride: Some([2, 2]), padding: [1, 1], ..MaxPool2dOptions::new([3, 3]) })`](functional::max_pool2d_with_indices) |
 //! | `F.adaptive_avg_pool2d(x, (1, 1))` | [`functional::adaptive_avg_pool2d(&x, [1, 1])`](functional::adaptive_avg_pool2d) |
+//! | `nn.Conv2d(3, 8, 3, stride=2, padding=1, bias=False)` | [`Conv2d::new(3, 8, 3).stride(2).padding(1).bias(false)`](Conv2d) |
+//! | `nn.BatchNorm2d(8, momentum=None, affine=False)` | [`BatchNorm2d::new(8).momentum(None).affine(false)`](BatchNorm2d) |
+//! | `nn.MaxPool2d(3, 2, 1)`, `nn.MaxPool2d(2, return_indices=True)` | [`MaxPool2d::new(3).stride(2).padding(1)`](MaxPool2d), [`MaxPool2d::new(2).forward_with_indices(&x)`](MaxPool2d::forward_with_indices) |
+//! | `nn.AdaptiveAvgPool2d(1)`, `nn.Flatten()` | [`AdaptiveAvgPool2d::new(1)`](AdaptiveAvgPool2d::new), [`Flatten::default()`](Flatten) |
 //! | `F.batch_norm(x, rm, rv, w, b, training=True)` | [`functional::batch_norm(&x, Some(&rm), Some(&rv), Some(&w), Some(&b), BatchNormOptions { training: true, ..Default::default() })`](functional::batch_norm) |
 //! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
@@ -192,6 +218,15 @@
 //!   accumulate in `F64`, and its gradients of gradients are recorded as operations, which are
 //!   also right for a bias without a weight, where PyTorch's `NativeBatchNormBackwardBackward0`
 //!   fails.
+//! - The options of [`Conv2d`] and [`BatchNorm2d`] are set after construction, so homura checks
+//!   each when it is set, with PyTorch's messages; [`Conv2d::groups`] gives the layer new
+//!   parameters, which PyTorch sets only when it creates the layer. [`Conv2d`] has no
+//!   `padding_mode`, [`MaxPool2d`] returns the indices from
+//!   [`forward_with_indices`](MaxPool2d::forward_with_indices) instead of a `return_indices`
+//!   option, and [`AdaptiveAvgPool2d`] has no `None` sizes.
+//! - [`BatchNorm2d`]'s state dict must have `num_batches_tracked`: homura's state dicts have no
+//!   versions, and PyTorch takes one without version metadata for one of an old version and
+//!   keeps the count.
 //! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
 //!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
 //!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`
@@ -212,8 +247,8 @@ mod training;
 /// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
 pub use homura_derive::Module;
 pub use layers::{
-    Dropout, Embedding, Forward, Gelu, LayerNorm, Linear, Relu, RmsNorm, Sequential, Sigmoid, Silu,
-    Softmax, Tanh,
+    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, IntoPair,
+    LayerNorm, Linear, MaxPool2d, Relu, RmsNorm, Sequential, Sigmoid, Silu, Softmax, Tanh,
 };
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;

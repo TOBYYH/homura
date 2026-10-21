@@ -95,6 +95,14 @@ All notable changes to this project are documented in this file. The format is b
   and share no memory with the input, the parameters or each other; parameters and statistics
   need only `C` elements, also in the backward pass; inputs without elements are checked like
   others.
+- The layers `nn::Conv2d` (stride, padding, dilation, groups, bias), initialized like PyTorch's;
+  `nn::BatchNorm2d` with PyTorch's buffers `running_mean`, `running_var` and
+  `num_batches_tracked`, momentum or a cumulative average (`momentum(None)`), and the options
+  `affine`, `bias` and `track_running_stats`; `nn::MaxPool2d` (with `forward_with_indices`),
+  `nn::AdaptiveAvgPool2d` and `nn::Flatten`. Their options are set one after another
+  (`Conv2d::new(3, 8, 3).padding(1)`), with sizes as a number or a pair (`nn::IntoPair`), and
+  checked like PyTorch's constructors when they are set. Unlike PyTorch, a `BatchNorm2d` state
+  dict without `num_batches_tracked` is missing a key.
 
 ### Changed
 

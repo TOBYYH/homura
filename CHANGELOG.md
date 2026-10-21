@@ -86,6 +86,15 @@ All notable changes to this project are documented in this file. The format is b
 - `nn::functional::adaptive_avg_pool2d`, a mean over the last two dimensions for an output of
   `[1, 1]` and otherwise PyTorch's kernel, recorded as `AdaptiveAvgPool2DBackward0`, with
   PyTorch's order of operations in both directions.
+- `nn::functional::batch_norm` with `BatchNormOptions` (`training`, `momentum`, `eps`), with or
+  without running statistics, weight and bias, for inputs of 2 or more dimensions; half
+  precision inputs may have `F32` parameters and statistics. It is a single
+  `NativeBatchNormBackward0` node with PyTorch's CPU formulas, differentiable again. Unlike
+  PyTorch, updating the running statistics increments their versions, so an evaluation graph
+  that saved them can't run backward after an update, and statistics to update must be writable
+  and share no memory with the input, the parameters or each other; parameters and statistics
+  need only `C` elements, also in the backward pass; inputs without elements are checked like
+  others.
 
 ### Changed
 

@@ -27,6 +27,6 @@ pub use loss::{
     CrossEntropyOptions, Reduction, binary_cross_entropy_with_logits, cross_entropy, mse_loss,
     nll_loss,
 };
-pub use norm::{layer_norm, rms_norm};
+pub use norm::{BatchNormOptions, batch_norm, layer_norm, rms_norm};
 pub use pad::pad;
 pub use pool::{MaxPool2dOptions, adaptive_avg_pool2d, max_pool2d, max_pool2d_with_indices};

@@ -25,7 +25,7 @@ mod unary;
 
 pub(crate) use advanced_index::{META_VALUES, check_index_dtype, check_index_put_target};
 pub use binary::where_;
-pub(crate) use binary::{binary_op, copy_error};
+pub(crate) use binary::{binary_op, check_no_overlap, check_writable, copy_error};
 pub use overload::Number;
 pub(crate) use pad::constant_pad_nd;
 pub(crate) use pool::{

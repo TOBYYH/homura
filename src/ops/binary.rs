@@ -577,6 +577,21 @@ pub(crate) fn check_writable(dst: &TensorData) {
     }
 }
 
+/// Panics if `dst`, a tensor about to be written, may share memory with one of `others`, the
+/// tensors the write reads or that must keep their values (see
+/// [`TensorData::may_share_memory`]).
+pub(crate) fn check_no_overlap(dst: &TensorData, others: impl IntoIterator<Item = TensorData>) {
+    for t in others {
+        if dst.may_share_memory(&t) {
+            panic!(
+                "unsupported operation: some elements of the input tensor and the written-to \
+                 tensor refer to a single memory location. Please deep_clone() the tensor before \
+                 performing the operation."
+            );
+        }
+    }
+}
+
 fn writable_error(dst: &TensorData) -> Option<&'static str> {
     dst.layout.may_overlap_internally().then_some(
         "unsupported operation: more than one element of the written-to tensor may refer to a \

@@ -3,8 +3,12 @@
 //! The data, the initial weights and PyTorch's values are in
 //! `tests/golden/m2_training.safetensors` from `tools/golden/gen_m2_training.py`;
 //! `tools/golden/check_m2_training.py` checks the file against a fresh run.
+//! `tools/golden/measure_m2_tolerances.py` measures how much of the tolerances the errors use
+//! (with `HOMURA_TOLERANCE_LOG` set, this test writes its measurements there).
 
 mod common;
+
+use std::io::Write;
 
 use common::{Case, Golden, assert_close_tol};
 use homura::nn::functional::{CrossEntropyOptions, cross_entropy};
@@ -117,6 +121,39 @@ fn tolerance(dtype: DType) -> (f64, f64) {
     }
 }
 
+/// Appends the largest errors of `actual` against `expected` (absolute, relative to nonzero
+/// expected values, relative to the largest expected magnitude, and the fraction of the
+/// allowance `atol + rtol·|expected|` used) as a line of JSON to the file that
+/// `HOMURA_TOLERANCE_LOG` names, if it is set.
+fn log_measurement(case: &str, tensor: &str, actual: &Tensor, expected: &Tensor, tol: (f64, f64)) {
+    let Ok(path) = std::env::var("HOMURA_TOLERANCE_LOG") else {
+        return;
+    };
+    let a = actual.to(DType::F64).to_vec::<f64>();
+    let e = expected.to(DType::F64).to_vec::<f64>();
+    let scale = e.iter().fold(0.0, |m: f64, v| m.max(v.abs()));
+    let (mut abs, mut rel, mut used) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(&e) {
+        let error = (x - y).abs();
+        abs = abs.max(error);
+        if *y != 0.0 {
+            rel = rel.max(error / y.abs());
+        }
+        used = used.max(error / (tol.1 + tol.0 * y.abs()));
+    }
+    let norm = if scale > 0.0 { abs / scale } else { 0.0 };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("can't open the tolerance log");
+    writeln!(
+        file,
+        r#"{{"case": "{case}", "tensor": "{tensor}", "abs": {abs:e}, "rel": {rel:e}, "norm": {norm:e}, "used": {used:e}}}"#
+    )
+    .unwrap();
+}
+
 #[test]
 fn mlp_training_matches_pytorch() {
     let golden = Golden::load("m2_training.safetensors");
@@ -128,7 +165,8 @@ fn mlp_training_matches_pytorch() {
             let (rtol, atol) = tolerance(dtype);
             let check = |key: &str, t: &Tensor| {
                 c.check_with(key, t, |a, e| {
-                    assert_close_tol(a, e, rtol, atol, &format!("{name}/{key}"))
+                    assert_close_tol(a, e, rtol, atol, &format!("{name}/{key}"));
+                    log_measurement(&name, key, a, e, (rtol, atol));
                 })
             };
 

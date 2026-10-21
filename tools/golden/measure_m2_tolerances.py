@@ -1,19 +1,33 @@
 """Measures the error budgets behind the floating point tolerances of the M2 golden tests and
-prints a report (M2 step 8b: convolutions; pooling has no allowance to measure).
+prints a report: convolutions (M2 step 8b), batch norm (step 8c) and the MLP training of step 4b;
+pooling has no allowance to measure. The report is the basis of the F32 tolerances of the CNN
+training acceptance of step 9.
 
-For every floating point convolution case of tests/golden/m2_conv_pool.safetensors it reports:
+For every floating point convolution case of tests/golden/m2_conv_pool.safetensors and batch
+norm case of tests/golden/m2_batch_norm.safetensors it reports:
 
-- PyTorch's own drift: its F32 / half precision results (half precision gradients: the derived
-  ones that the fixture stores) against PyTorch evaluated in F64 on the same rounded inputs;
-- homura's errors against the stored results, as tests/nn_conv.rs measures them (the tool runs
-  that test with HOMURA_TOLERANCE_LOG), and the fraction of the test's allowance they use.
+- PyTorch's own drift: its F32 / half precision results (half precision convolution gradients:
+  the derived ones that the fixture stores) against PyTorch evaluated in F64 on the same rounded
+  inputs;
+- homura's errors against the stored results, as tests/nn_conv.rs and tests/nn_batch_norm.rs
+  measure them (the tool runs those tests with HOMURA_TOLERANCE_LOG), and the fraction of the
+  test's allowance they use.
 
 Errors are the largest absolute error, the largest error relative to the expected value, and the
-largest error relative to the magnitude bound conv2d(|x|, |w|) + |b| (and the gradients of that
-for |g|), which shows how close to zero results behave. Random cases and special ones
-(cancellation) are reported separately. tests/nn_pool.rs compares max_pool2d and the local
-adaptive_avg_pool2d kernels bit for bit, and the [1, 1] mean path of adaptive_avg_pool2d within
-twice the default tolerance; the tool runs those golden tests too and fails if they do.
+largest error relative to a magnitude bound, which shows how close to zero results behave: for a
+convolution conv2d(|x|, |w|) + |b| (and the gradients of that for |g|), for a batch norm the
+formula with |x| + |mean| for the centered input and absolute values elsewhere (see
+tests/nn_batch_norm.rs). Random cases and special ones (cancellation, offsets, constant
+channels, eps 0) are reported separately.
+
+For the MLP of tests/golden/m2_training.safetensors it reports PyTorch's F32 run against its F64
+run (losses, gradients, parameters and optimizer state of all ten steps; the magnitude is the
+largest of each tensor) and homura's F32 and F64 errors against PyTorch's, from
+tests/m2_training.rs.
+
+tests/nn_pool.rs compares max_pool2d and the local adaptive_avg_pool2d kernels bit for bit, and
+the [1, 1] mean path of adaptive_avg_pool2d within twice the default tolerance; the tool runs
+those golden tests too and fails if they do.
 
 Usage: python tools/golden/measure_m2_tolerances.py (needs torch, safetensors and cargo).
 """
@@ -33,7 +47,9 @@ import reference
 
 ROOT = Path(__file__).resolve().parents[2]
 GOLDEN = ROOT / "tests" / "golden" / "m2_conv_pool.safetensors"
-SPECIAL = {"cancellation"}
+BATCH_NORM = ROOT / "tests" / "golden" / "m2_batch_norm.safetensors"
+TRAINING = ROOT / "tests" / "golden" / "m2_training.safetensors"
+SPECIAL = {"cancellation", "train_offset", "train_constant", "eval_eps_zero"}
 
 reference.check()
 # "same" padding warns about even kernels.
@@ -89,22 +105,98 @@ def reference_drift(data):
     return out
 
 
+def channel(t, dims):
+    return t.double().view([1, -1] + [1] * (dims - 2))
+
+
+def batch_norm_drift(data):
+    """{(case, tensor): (abs, rel, norm)} of PyTorch's low precision batch norms against F64."""
+    out = {}
+    for name, c in cases(data, "bn_").items():
+        if c["x"].dtype == torch.float64:
+            continue
+        keys = [k for k in ("x", "weight", "bias") if k in c]
+        exact = {k: c[k].double().requires_grad_() for k in keys}
+        running = [c[k].double() if k in c else None for k in ("running_mean", "running_var")]
+        training = bool(c["opt.training"])
+        options = dict(training=training, momentum=float(c["opt.momentum"]), eps=float(c["opt.eps"]))
+        for _ in range(int(c["opt.steps"])):
+            y = F.batch_norm(exact["x"], *running, exact.get("weight"), exact.get("bias"), **options)
+        grads = torch.autograd.grad(y, [exact[k] for k in keys], c["g"].double())
+        for k, (bound, t) in zip(["out"] + [f"grad_{k}" for k in keys],
+                                 zip(batch_norm_bounds(c), [y, *grads])):
+            out[(name, k)] = errors(c[k], t, bound)
+    return out
+
+
+def batch_norm_bounds(c):
+    """The magnitude bounds of tests/nn_batch_norm.rs: of the output and of the gradients of the
+    floating point inputs."""
+    x = c["x"].double()
+    dims = x.dim()
+    axes = [0] + list(range(2, dims))
+    n = x.numel() // x.shape[1] if x.shape[1] else 0
+    if bool(c["opt.training"]):
+        mean, variance = x.mean(axes, keepdim=True), x.var(axes, correction=0, keepdim=True)
+    else:
+        mean, variance = channel(c["running_mean"], dims), channel(c["running_var"], dims)
+    invstd = 1 / (variance + float(c["opt.eps"])).sqrt()
+    w = channel(c["weight"], dims).abs() if "weight" in c else 1
+    big_x = (x.abs() + mean.abs()) * invstd
+    out = big_x * w + (channel(c["bias"], dims).abs() if "bias" in c else 0)
+    g = c["g"].double().abs()
+    total, dotp = g.sum(axes, keepdim=True), (g * big_x).sum(axes, keepdim=True)
+    if bool(c["opt.training"]):
+        grad_x = (g + total / max(n, 1) + big_x * dotp / max(n, 1)) * invstd
+    else:
+        grad_x = g * invstd
+    result = [out, grad_x * w]
+    if "weight" in c:
+        result.append(dotp.reshape(-1))
+    if "bias" in c:
+        result.append(total.reshape(-1))
+    return result
+
+
+def mlp_drift(data):
+    """{(case, tensor): (abs, rel, norm)} of PyTorch's F32 MLP training against its F64 run; the
+    magnitude is the largest of each tensor."""
+    out = {}
+    for kind in ("sgd", "adamw"):
+        low, high = cases(data, f"{kind}_f32")[f"{kind}_f32"], cases(data, f"{kind}_f64")[f"{kind}_f64"]
+        for k, t in low.items():
+            if k.startswith("opt."):
+                continue
+            e = high[k]
+            out[(f"{kind}_f32", k)] = errors(t, e, torch.full_like(e, e.double().abs().max().item()))
+    return out
+
+
 def homura_errors():
-    """{(case, tensor): (abs, rel, norm, used)} from tests/nn_conv.rs; exits if it or the pooling
-    golden tests fail."""
+    """{(case, tensor): (abs, rel, norm, used)} from tests/nn_conv.rs, tests/nn_batch_norm.rs and
+    tests/m2_training.rs; exits if they or the pooling golden tests fail."""
     with tempfile.TemporaryDirectory() as tmp:
         log = Path(tmp) / "tolerances.jsonl"
         env = dict(os.environ, HOMURA_TOLERANCE_LOG=str(log))
         run = lambda *args: subprocess.run(["cargo", "test", "--release", "-q", *args], cwd=ROOT, env=env,
                                            capture_output=True, text=True)
-        conv_run = run("--test", "nn_conv", "conv2d_matches_pytorch")
-        if conv_run.returncode != 0:
-            raise SystemExit(f"tests/nn_conv.rs failed:\n{conv_run.stdout}\n{conv_run.stderr}")
-        pool_run = run("--test", "nn_pool", "matches_pytorch")
-        if pool_run.returncode != 0:
-            raise SystemExit(f"tests/nn_pool.rs failed:\n{pool_run.stdout}\n{pool_run.stderr}")
+        for test, name in [("nn_conv", "conv2d_matches_pytorch"), ("nn_batch_norm", "batch_norm_matches_pytorch"),
+                           ("m2_training", "mlp_training_matches_pytorch"), ("nn_pool", "matches_pytorch")]:
+            result = run("--test", test, name)
+            if result.returncode != 0:
+                raise SystemExit(f"tests/{test}.rs failed:\n{result.stdout}\n{result.stderr}")
         rows = [json.loads(line) for line in log.read_text().splitlines()]
     return {(r["case"], r["tensor"]): (r["abs"], r["rel"], r["norm"], r["used"]) for r in rows}
+
+
+def group(name, tensor):
+    """(dtype, random or special, out or grad or the MLP's tensor kind) of a row."""
+    family, rest = name.split("_", 1)
+    if family in ("sgd", "adamw"):
+        return rest, family, tensor.split(".")[0].rstrip("0123456789")
+    dtype, case = rest.split(".", 1)
+    kind = "out" if tensor == "out" else "running" if tensor.startswith("running") else "grad"
+    return dtype, "special" if case in SPECIAL else "random", kind
 
 
 def report(title, rows, columns):
@@ -112,9 +204,7 @@ def report(title, rows, columns):
     print(f"  {'dtype':5} {'group':8} {'tensor':7} " + " ".join(f"{c:>10}" for c in columns) + "  worst case")
     groups = {}
     for (name, tensor), values in rows.items():
-        dtype = name.split("_")[1].split(".")[0]
-        kind = "special" if name.split(".", 1)[1] in SPECIAL else "random"
-        groups.setdefault((dtype, kind, "out" if tensor == "out" else "grad"), []).append((name, tensor, values))
+        groups.setdefault(group(name, tensor), []).append((name, tensor, values))
     for (dtype, kind, tensor), entries in sorted(groups.items()):
         worst = [max(v[i] for _, _, v in entries) for i in range(len(columns))]
         name, t, _ = max(entries, key=lambda e: e[2][-1])
@@ -122,12 +212,22 @@ def report(title, rows, columns):
 
 
 def main():
-    data = load_file(str(GOLDEN))
-    drift = reference_drift(data)
-    report("PyTorch: low precision against F64 (largest errors)", drift, ["abs", "rel", "norm"])
+    conv = load_file(str(GOLDEN))
+    batch_norm = load_file(str(BATCH_NORM))
+    training = load_file(str(TRAINING))
     ours = homura_errors()
-    report("homura against PyTorch (largest errors and fraction of the test's allowance)", ours,
-           ["abs", "rel", "norm", "used"])
+    columns = ["abs", "rel", "norm", "used"]
+    pick = lambda prefix: {k: v for k, v in ours.items() if k[0].startswith(prefix)}
+    report("conv2d: PyTorch's low precision against F64 (largest errors)", reference_drift(conv),
+           ["abs", "rel", "norm"])
+    report("conv2d: homura against PyTorch (largest errors and fraction of the test's allowance)",
+           pick("conv_"), columns)
+    report("batch_norm: PyTorch's low precision against F64", batch_norm_drift(batch_norm), ["abs", "rel", "norm"])
+    report("batch_norm: homura against PyTorch", pick("bn_"), columns)
+    report("MLP training: PyTorch's F32 run against its F64 run (norm: relative to each tensor's largest "
+           "magnitude)", mlp_drift(training), ["abs", "rel", "norm"])
+    report("MLP training: homura against PyTorch", {k: v for k, v in ours.items() if k[0].startswith(("sgd", "adamw"))},
+           columns)
     print("\npooling golden tests pass: max_pool2d and the local adaptive_avg_pool2d kernels bit for bit, "
           "the [1, 1] mean path within twice the default tolerance")
 

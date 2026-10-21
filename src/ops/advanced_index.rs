@@ -9,7 +9,7 @@
 //! its dimensions in that order, into `[before, indexed, after]` and pick or write slices along
 //! the middle dimension at the linear positions that the indices give in the indexed subspace.
 
-use super::binary::check_writable;
+use super::binary::{check_no_overlap, check_writable};
 use super::{clone_data, common_device, reshape_data};
 use crate::autograd::formulas;
 use crate::backend::cpu;
@@ -380,15 +380,8 @@ impl AdvancedIndex {
 pub(crate) fn check_index_put_target(target: &Tensor, indices: &[Option<Tensor>], values: &Tensor) {
     let dst = target.data();
     check_writable(&dst);
-    for t in std::iter::once(values).chain(indices.iter().flatten()) {
-        if dst.may_share_memory(&t.data()) {
-            panic!(
-                "unsupported operation: some elements of the input tensor and the written-to \
-                 tensor refer to a single memory location. Please deep_clone() the tensor before \
-                 performing the operation."
-            );
-        }
-    }
+    let others = std::iter::once(values).chain(indices.iter().flatten());
+    check_no_overlap(&dst, others.map(|t| t.data()));
 }
 
 impl Tensor {

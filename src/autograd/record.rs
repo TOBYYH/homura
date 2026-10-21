@@ -15,6 +15,16 @@ pub(crate) fn needs_grad(inputs: &[Option<&Tensor>]) -> bool {
     is_grad_enabled() && inputs.iter().flatten().any(|t| t.requires_grad())
 }
 
+/// The checks [`record`] makes on `inputs` when it looks up their edges, for operations that
+/// have side effects before they record (`nn::functional::batch_norm` writes its running
+/// statistics): if the operation will be recorded, panics like [`gradient_edge`] for a stale
+/// input view, so that it fails before anything is written.
+pub(crate) fn check_recordable(inputs: &[Option<&Tensor>]) {
+    if needs_grad(inputs) {
+        inputs.iter().flatten().for_each(|t| check_not_stale(t));
+    }
+}
+
 /// Records the backward node of an operation, the one place where operations connect their
 /// results to the graph. Does nothing unless [`needs_grad`] holds for `inputs` and every one of
 /// `outputs` is floating point. Then the outputs become the outputs of a new node built by

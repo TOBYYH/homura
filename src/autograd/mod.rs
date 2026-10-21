@@ -338,7 +338,7 @@ pub(crate) use meta::{
     AutogradMeta, ViewInfo, forget_accumulator, replace_leaf_data, repr_suffix, view_of,
 };
 pub use node::GradFn;
-pub(crate) use record::{check_in_place, original_value, record_in_place};
+pub(crate) use record::{check_in_place, check_recordable, original_value, record_in_place};
 
 thread_local! {
     static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };

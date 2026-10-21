@@ -126,6 +126,7 @@
 //! | `F.conv2d(x, w, b, stride=2, padding=1)` | [`functional::conv2d(&x, &w, Some(&b), Conv2dOptions { stride: [2, 2], padding: 1.into(), ..Default::default() })`](functional::conv2d) |
 //! | `F.max_pool2d(x, 2)`, `F.max_pool2d(x, 3, 2, 1, return_indices=True)` | [`functional::max_pool2d(&x, MaxPool2dOptions::new([2, 2]))`](functional::max_pool2d), [`functional::max_pool2d_with_indices(&x, MaxPool2dOptions { stride: Some([2, 2]), padding: [1, 1], ..MaxPool2dOptions::new([3, 3]) })`](functional::max_pool2d_with_indices) |
 //! | `F.adaptive_avg_pool2d(x, (1, 1))` | [`functional::adaptive_avg_pool2d(&x, [1, 1])`](functional::adaptive_avg_pool2d) |
+//! | `F.batch_norm(x, rm, rv, w, b, training=True)` | [`functional::batch_norm(&x, Some(&rm), Some(&rv), Some(&w), Some(&b), BatchNormOptions { training: true, ..Default::default() })`](functional::batch_norm) |
 //! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
@@ -178,6 +179,19 @@
 //!   with an output size of 0 has a gradient of zeros, where PyTorch's backward pass fails, and
 //!   integer inputs are rejected also where nothing is computed. `output_size` has no `None`
 //!   entries: pass the input's size.
+//! - [`batch_norm`](functional::batch_norm) increments the versions of the running statistics
+//!   when it updates them, so a graph that saved them in evaluation mode can't run backward
+//!   after a training pass; PyTorch's update counts as no modification, and the old graph uses
+//!   the new values. It checks every argument before it writes them, where PyTorch updates them
+//!   before it checks the dtypes of the parameters, and rejects running statistics to update
+//!   that are expanded or share memory with the input, the parameters or each other, which
+//!   PyTorch writes and reads in its order. It takes parameters and statistics of any
+//!   shape with `C` elements, whose gradients have their shapes (PyTorch takes statistics of
+//!   one dimension only, and its backward pass fails for other shapes), and checks inputs
+//!   without elements like others (PyTorch skips the checks after `eps` for them). Its sums
+//!   accumulate in `F64`, and its gradients of gradients are recorded as operations, which are
+//!   also right for a bias without a weight, where PyTorch's `NativeBatchNormBackwardBackward0`
+//!   fails.
 //! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
 //!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
 //!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`

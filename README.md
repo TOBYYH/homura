@@ -34,8 +34,9 @@ Implemented so far:
   `nll_loss`, `cross_entropy` and `binary_cross_entropy_with_logits`; the functions `conv2d`,
   `max_pool2d`, `adaptive_avg_pool2d` and `batch_norm`.
 - The optimizers `optim::Sgd`, `Adam` and `AdamW`, with parameter groups, checked step by step
-  against PyTorch's. Ten steps of training a small MLP give PyTorch's losses, gradients,
-  parameters and optimizer state at every step.
+  against PyTorch's. Ten steps of training a small MLP, and a small CNN with batch
+  normalization, give PyTorch's losses, gradients, parameters and optimizer state (and the
+  batch norm statistics) at every step.
 
 Not available yet: GPU backends (ROCm comes first), most neural network layers, saving and
 loading optimizer state, autograd hooks, and in-place operations on views

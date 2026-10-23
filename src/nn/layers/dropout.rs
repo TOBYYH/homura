@@ -29,6 +29,7 @@ impl Dropout {
     ///
     /// Panics if `p` is less than 0 or more than 1, like PyTorch; a NaN `p` is accepted here and
     /// rejected by the forward computation, also like PyTorch.
+    #[track_caller]
     pub fn new(p: f64) -> Dropout {
         if p < 0.0 || p > 1.0 {
             panic!("dropout probability has to be between 0 and 1, but got {p}");
@@ -40,6 +41,7 @@ impl Dropout {
     }
 
     /// `input` with dropout in training mode, `input` itself in evaluation mode.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::dropout(input, self.p, self.training.get())
     }

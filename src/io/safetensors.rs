@@ -105,6 +105,7 @@ fn parse_entry<'a>(name: &'a str, info: &Json) -> Result<Entry<'a>> {
 /// The whole header is validated before any tensor is created: names must be unique,
 /// `__metadata__` must map strings to strings, and the tensors' byte ranges must exactly tile
 /// the data section without overlaps, holes or trailing bytes.
+#[track_caller]
 pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>> {
     let len_bytes: [u8; 8] = bytes
         .get(..8)
@@ -174,6 +175,7 @@ pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>
 /// Loads every tensor of a safetensors file onto the CPU, in header order.
 ///
 /// The whole file is read into memory; memory mapping and sharded checkpoints come later.
+#[track_caller]
 pub fn load_safetensors(path: impl AsRef<Path>) -> Result<Vec<(String, Tensor)>> {
     load_safetensors_from_bytes(&std::fs::read(path)?)
 }
@@ -184,6 +186,7 @@ pub fn load_safetensors(path: impl AsRef<Path>) -> Result<Vec<(String, Tensor)>>
 ///
 /// Returns an error for meta tensors (they have no data), duplicate names and the name
 /// `__metadata__`, which the format reserves.
+#[track_caller]
 pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
     tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
 ) -> Result<Vec<u8>> {
@@ -247,6 +250,7 @@ pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
 /// homura::save_safetensors([("weight", &w)], "weights.safetensors")?;
 /// # Ok::<(), homura::Error>(())
 /// ```
+#[track_caller]
 pub fn save_safetensors<'a, K: AsRef<str>>(
     tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
     path: impl AsRef<Path>,

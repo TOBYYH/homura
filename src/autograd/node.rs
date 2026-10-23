@@ -451,6 +451,7 @@ pub struct GradFn(pub(crate) NodeRef);
 
 impl GradFn {
     /// The name PyTorch gives this kind of node, such as `"MulBackward0"` or `"AccumulateGrad"`.
+    #[track_caller]
     pub fn name(&self) -> &'static str {
         self.0.name()
     }
@@ -458,6 +459,7 @@ impl GradFn {
     /// Where the gradients computed by this node go, one entry per input of the forward
     /// operation: the next node and which of its inputs the gradient is, or `None` where the
     /// input needs no gradient.
+    #[track_caller]
     pub fn next_functions(&self) -> Vec<Option<(GradFn, usize)>> {
         self.0
             .next_edges()
@@ -470,6 +472,7 @@ impl GradFn {
     }
 
     /// Whether `self` and `other` are handles to the same node (Python's `a is b`).
+    #[track_caller]
     pub fn is_same(&self, other: &GradFn) -> bool {
         self.0.ptr_eq(&other.0)
     }

@@ -53,6 +53,7 @@ impl DType {
     ];
 
     /// Size of one element in bytes.
+    #[track_caller]
     pub fn size_in_bytes(self) -> usize {
         match self {
             DType::Bool | DType::U8 | DType::I8 => 1,
@@ -63,21 +64,25 @@ impl DType {
     }
 
     /// Whether this is a floating point type.
+    #[track_caller]
     pub fn is_floating_point(self) -> bool {
         self.kind() == Kind::Float
     }
 
     /// Whether this is an integer type (`bool` is not counted as an integer).
+    #[track_caller]
     pub fn is_integral(self) -> bool {
         self.kind() == Kind::Int
     }
 
     /// Whether this type can represent negative values.
+    #[track_caller]
     pub fn is_signed(self) -> bool {
         !matches!(self, DType::Bool | DType::U8)
     }
 
     /// Short lowercase name, such as `"f32"` or `"bf16"`.
+    #[track_caller]
     pub fn name(self) -> &'static str {
         match self {
             DType::Bool => "bool",
@@ -281,6 +286,7 @@ pub enum Scalar {
 
 impl Scalar {
     /// The value as `f64`.
+    #[track_caller]
     pub fn to_f64(self) -> f64 {
         match self {
             Scalar::Bool(v) => v as u8 as f64,
@@ -290,6 +296,7 @@ impl Scalar {
     }
 
     /// The value as `i64` (floats are truncated toward zero).
+    #[track_caller]
     pub fn to_i64(self) -> i64 {
         match self {
             Scalar::Bool(v) => v as i64,
@@ -299,6 +306,7 @@ impl Scalar {
     }
 
     /// Whether the value is nonzero.
+    #[track_caller]
     pub fn to_bool(self) -> bool {
         match self {
             Scalar::Bool(v) => v,
@@ -411,6 +419,7 @@ impl From<bf16> for Scalar {
 }
 
 /// The smallest dtype both `a` and `b` can be converted to, following `torch.promote_types`.
+#[track_caller]
 pub fn promote_types(a: DType, b: DType) -> DType {
     use DType::*;
     if a == b {
@@ -455,6 +464,7 @@ pub fn promote_types(a: DType, b: DType) -> DType {
 
 /// Whether a value of dtype `from` may be written into a tensor of dtype `to` by an in-place
 /// operation (`torch.can_cast`): floats can't go to integers, and only `bool` can go to `bool`.
+#[track_caller]
 pub fn can_cast(from: DType, to: DType) -> bool {
     !(from.is_floating_point() && !to.is_floating_point()
         || from != DType::Bool && to == DType::Bool)

@@ -28,6 +28,7 @@ impl LayerNorm {
 
     /// The mean and `rstd = 1 / √(var + eps)` (biased variance) of `x`, which has the dtype
     /// `opmath`, over the normalized dimensions, which are kept. The forward pass uses them.
+    #[track_caller]
     pub fn stats(&self, x: &Tensor) -> (Tensor, Tensor) {
         let dims = self.dims(x.num_dims());
         let mean = x.mean_dim(dims.clone(), true);
@@ -47,6 +48,7 @@ impl LayerNorm {
 
 /// Records `out = layer_norm(input, weight, bias)`. `weight` and `bias` are saved, as in
 /// PyTorch, so that changing them before the backward pass is an error.
+#[track_caller]
 pub(crate) fn layer_norm(
     input: &Tensor,
     weight: Option<&Tensor>,
@@ -238,6 +240,7 @@ pub(crate) struct Running<'a> {
 /// Records `out = batch_norm(input, weight, bias)`. `weight` is saved, as in PyTorch, and the
 /// running statistics in evaluation mode (`running`), which the gradients use; the batch
 /// statistics are computed again from the saved input.
+#[track_caller]
 pub(crate) fn batch_norm(
     input: &Tensor,
     weight: Option<&Tensor>,

@@ -60,11 +60,13 @@ impl Resolved {
     }
 }
 
+#[track_caller]
 fn device_of(operands: &[&Resolved]) -> Device {
     common_device(operands.iter().filter_map(|o| o.tensor()))
 }
 
 /// `op(lhs, rhs)` with broadcasting and type promotion. At least one operand must be a tensor.
+#[track_caller]
 pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
     use BinaryOp::*;
     let (a, b) = (Resolved::new(&lhs), Resolved::new(&rhs));
@@ -151,6 +153,7 @@ fn tensor_of(o: &Operand) -> Option<&Tensor> {
 /// # Panics
 ///
 /// Panics if `condition` is not a `Bool` tensor.
+#[track_caller]
 pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) -> Tensor {
     let cond = condition.data();
     if cond.dtype != DType::Bool {
@@ -187,10 +190,12 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
 }
 
 impl Tensor {
+    #[track_caller]
     fn binary(&self, op: BinaryOp, other: impl Into<Operand>) -> Tensor {
         binary_op(op, Operand::Tensor(self.clone()), other.into())
     }
 
+    #[track_caller]
     fn binary_(&self, op: BinaryOp, other: impl Into<Operand>) -> &Self {
         let other = other.into();
         let other_tensor = tensor_of(&other);
@@ -200,18 +205,16 @@ impl Tensor {
             BinaryOp::Pow => true,
             _ => false,
         };
-        self.in_place(
-            &[other_tensor],
-            saves_self,
-            || (self.binary(op, other.clone()), ()),
-            |original, ()| {
-                let lhs = Operand::Tensor(original.clone());
-                crate::autograd::formulas::binary(op, &lhs, &other, self)
-            },
-        )
+        let begun = self.begin_in_place(&[other_tensor]);
+        let computed = (self.binary(op, other.clone()), ());
+        self.finish_in_place(begun, computed, saves_self, |original, ()| {
+            let lhs = Operand::Tensor(original.clone());
+            crate::autograd::formulas::binary(op, &lhs, &other, self)
+        })
     }
 
     /// `self + other`, with broadcasting and type promotion.
+    #[track_caller]
     pub fn add(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Add, other)
     }
@@ -222,97 +225,116 @@ impl Tensor {
     ///
     /// Panics if either operand is a bool tensor or scalar, as PyTorch does (for meta tensors
     /// too, where PyTorch skips the check); [`logical_not`](Tensor::logical_not) inverts a mask.
+    #[track_caller]
     pub fn sub(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Sub, other)
     }
 
     /// `self * other`.
+    #[track_caller]
     pub fn mul(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Mul, other)
     }
 
     /// `self / other`. Always true division: integer inputs give the default float dtype.
+    #[track_caller]
     pub fn div(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Div, other)
     }
 
     /// `self` raised to the power `exponent` (a tensor or a scalar).
+    #[track_caller]
     pub fn pow(&self, exponent: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Pow, exponent)
     }
 
     /// Elementwise maximum. NaN propagates.
+    #[track_caller]
     pub fn maximum(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Maximum, other)
     }
 
     /// Elementwise minimum. NaN propagates.
+    #[track_caller]
     pub fn minimum(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Minimum, other)
     }
 
     /// `self > other` as a `Bool` tensor.
+    #[track_caller]
     pub fn greater(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Greater, other)
     }
 
     /// `self >= other` as a `Bool` tensor.
+    #[track_caller]
     pub fn greater_equal(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::GreaterEqual, other)
     }
 
     /// `self < other` as a `Bool` tensor.
+    #[track_caller]
     pub fn less(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Less, other)
     }
 
     /// `self <= other` as a `Bool` tensor.
+    #[track_caller]
     pub fn less_equal(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::LessEqual, other)
     }
 
     /// `self == other` elementwise, as a `Bool` tensor. Use `x.equal(&y).all()` to compare whole
     /// tensors.
+    #[track_caller]
     pub fn equal(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::Equal, other)
     }
 
     /// `self != other` elementwise, as a `Bool` tensor.
+    #[track_caller]
     pub fn not_equal(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::NotEqual, other)
     }
 
     /// Elementwise logical and; nonzero values count as true.
+    #[track_caller]
     pub fn logical_and(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::LogicalAnd, other)
     }
 
     /// Elementwise logical or; nonzero values count as true.
+    #[track_caller]
     pub fn logical_or(&self, other: impl Into<Operand>) -> Tensor {
         self.binary(BinaryOp::LogicalOr, other)
     }
 
     /// In-place [`add`](Tensor::add).
+    #[track_caller]
     pub fn add_(&self, other: impl Into<Operand>) -> &Self {
         self.binary_(BinaryOp::Add, other)
     }
 
     /// In-place [`sub`](Tensor::sub).
+    #[track_caller]
     pub fn sub_(&self, other: impl Into<Operand>) -> &Self {
         self.binary_(BinaryOp::Sub, other)
     }
 
     /// In-place [`mul`](Tensor::mul).
+    #[track_caller]
     pub fn mul_(&self, other: impl Into<Operand>) -> &Self {
         self.binary_(BinaryOp::Mul, other)
     }
 
     /// In-place [`div`](Tensor::div).
+    #[track_caller]
     pub fn div_(&self, other: impl Into<Operand>) -> &Self {
         self.binary_(BinaryOp::Div, other)
     }
 
     /// In-place [`pow`](Tensor::pow).
+    #[track_caller]
     pub fn pow_(&self, exponent: impl Into<Operand>) -> &Self {
         self.binary_(BinaryOp::Pow, exponent)
     }
@@ -322,6 +344,7 @@ impl Tensor {
     /// Scalar bounds have zero gradients at equality; tensor bounds split ordinary ties.
     /// Unlike PyTorch, one bound may be a scalar and the other a tensor; its gradient follows
     /// the tensor-bound rule with the scalar rounded as in the corresponding forward step.
+    #[track_caller]
     pub fn clamp(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> Tensor {
         let (min, max) = (min.into(), max.into());
         // Computed without recording the two steps: clamp gets a node of its own.
@@ -335,6 +358,7 @@ impl Tensor {
 
     /// `self.maximum(min).minimum(max)` and the dtypes the two steps compute in, which the
     /// gradient of mixed scalar and tensor bounds depends on.
+    #[track_caller]
     fn clamp_values(&self, min: &Operand, max: &Operand) -> (Tensor, [DType; 2]) {
         let lower = self.maximum(min.clone());
         let out = lower.minimum(max.clone());
@@ -343,6 +367,7 @@ impl Tensor {
     }
 
     /// Clamps every element to at least `min`.
+    #[track_caller]
     pub fn clamp_min(&self, min: impl Into<Operand>) -> Tensor {
         let min = min.into();
         let out = {
@@ -354,6 +379,7 @@ impl Tensor {
     }
 
     /// Clamps every element to at most `max`.
+    #[track_caller]
     pub fn clamp_max(&self, max: impl Into<Operand>) -> Tensor {
         let max = max.into();
         let out = {
@@ -365,17 +391,15 @@ impl Tensor {
     }
 
     /// In-place [`clamp`](Tensor::clamp).
+    #[track_caller]
     pub fn clamp_(&self, min: impl Into<Operand>, max: impl Into<Operand>) -> &Self {
         let (min, max) = (min.into(), max.into());
         // The formula computes in the dtypes of the computation, not in the dtype of `self`.
-        self.in_place(
-            &[tensor_of(&min), tensor_of(&max)],
-            true,
-            || self.clamp_values(&min, &max),
-            |original, dtypes| {
-                crate::autograd::formulas::clamp(original, Some(&min), Some(&max), dtypes, self)
-            },
-        )
+        let begun = self.begin_in_place(&[tensor_of(&min), tensor_of(&max)]);
+        let computed = self.clamp_values(&min, &max);
+        self.finish_in_place(begun, computed, true, |original, dtypes| {
+            crate::autograd::formulas::clamp(original, Some(&min), Some(&max), dtypes, self)
+        })
     }
 
     /// A copy of `self` with `value` written where `mask` is true. `value` must be a scalar or a
@@ -388,12 +412,14 @@ impl Tensor {
     /// overflows the dtype of `self` (see [`fill_`](Tensor::fill_)), whether it is a scalar or a
     /// tensor, before anything is computed. Meta tensors take any value; PyTorch's meta
     /// `masked_fill` rejects infinities and NaN for integer dtypes.
+    #[track_caller]
     pub fn masked_fill(&self, mask: &Tensor, value: impl Into<Operand>) -> Tensor {
         where_(mask, self.masked_fill_value(mask, value.into()), self)
     }
 
     /// Checks the arguments of [`masked_fill`](Tensor::masked_fill) and returns `value` as a
     /// zero-dimensional tensor of the dtype of `self`, converted with a recorded `to`.
+    #[track_caller]
     fn masked_fill_value(&self, mask: &Tensor, value: Operand) -> Tensor {
         let m = mask.dtype();
         if m != DType::Bool {
@@ -423,18 +449,16 @@ impl Tensor {
     }
 
     /// In-place [`masked_fill`](Tensor::masked_fill).
+    #[track_caller]
     pub fn masked_fill_(&self, mask: &Tensor, value: impl Into<Operand>) -> &Self {
         let value = value.into();
-        self.in_place(
-            &[Some(mask), tensor_of(&value)],
-            false,
-            || (self.masked_fill(mask, value.clone()), ()),
-            |original, ()| {
-                let value = Operand::Tensor(self.masked_fill_value(mask, value.clone()));
-                let original = Operand::Tensor(original.clone());
-                crate::autograd::formulas::where_(mask, &value, &original, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(mask), tensor_of(&value)]);
+        let computed = (self.masked_fill(mask, value.clone()), ());
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            let value = Operand::Tensor(self.masked_fill_value(mask, value.clone()));
+            let original = Operand::Tensor(original.clone());
+            crate::autograd::formulas::where_(mask, &value, &original, self)
+        })
     }
 
     /// Copies the elements of `src` into `self`, broadcasting `src` and converting its dtype.
@@ -450,6 +474,7 @@ impl Tensor {
     /// broadcast to the shape of `self`, if the elements of `self` can't be proven to occupy
     /// distinct memory (an expanded tensor, for example), or if `src` is a meta tensor and
     /// `self` is not.
+    #[track_caller]
     pub fn copy_(&self, src: &Tensor) -> &Self {
         let recorded = crate::autograd::check_in_place(self, &[Some(src)]);
         self.check_copy(src);
@@ -476,16 +501,19 @@ impl Tensor {
     /// down to `-255`, which wrap around). Meta tensors take any value. This holds for any number
     /// of elements; PyTorch skips the check for a single `F16` or `BF16` element, which it fills
     /// with the rounded value (`65505` becomes `65504`, `1e6` infinity).
+    #[track_caller]
     pub fn fill_(&self, value: impl Into<Scalar>) -> &Self {
         self.overwrite_(value.into(), "FillBackward2")
     }
 
     /// Sets every element to zero. Recorded like [`fill_`](Tensor::fill_), as `ZeroBackward0`.
+    #[track_caller]
     pub fn zero_(&self) -> &Self {
         self.overwrite_(0.into(), "ZeroBackward0")
     }
 
     /// `fill_` recorded as node `name`.
+    #[track_caller]
     fn overwrite_(&self, value: Scalar, name: &'static str) -> &Self {
         let recorded = crate::autograd::check_in_place(self, &[]);
         check_writable(&self.data());
@@ -505,6 +533,7 @@ impl Tensor {
     /// Every public in-place operation writes its data with this function or
     /// [`write_fill`](Tensor::write_fill), exactly once, and never through another public
     /// in-place operation.
+    #[track_caller]
     pub(crate) fn write_copy(&self, src: &Tensor) {
         let (dst, mut s) = self.check_copy(src);
         if dst.device() == Device::Meta {
@@ -525,6 +554,7 @@ impl Tensor {
     /// `self` is writable, `src` broadcasts to it, and the devices allow the copy. These are
     /// not the checks of the other in-place operations' results: any dtype may be copied.
     /// Returns the data of `self` and of `src`.
+    #[track_caller]
     fn check_copy(&self, src: &Tensor) -> (TensorData, TensorData) {
         let dst = self.data();
         let s = src.data();
@@ -538,6 +568,7 @@ impl Tensor {
     }
 
     /// The data half of [`fill_`](Tensor::fill_), see [`write_copy`](Tensor::write_copy).
+    #[track_caller]
     pub(crate) fn write_fill(&self, value: Scalar) {
         let dst = self.data();
         check_writable(&dst);
@@ -571,6 +602,7 @@ fn copy_device_error(dst: &TensorData, src: &TensorData) -> Option<String> {
 
 /// Panics unless the elements of `dst` are proven to be distinct memory locations (see
 /// `Layout::may_overlap_internally`), so that no location is written more than once.
+#[track_caller]
 pub(crate) fn check_writable(dst: &TensorData) {
     if let Some(e) = writable_error(dst) {
         panic!("{e}");
@@ -580,6 +612,7 @@ pub(crate) fn check_writable(dst: &TensorData) {
 /// Panics if `dst`, a tensor about to be written, may share memory with one of `others`, the
 /// tensors the write reads or that must keep their values (see
 /// [`TensorData::may_share_memory`]).
+#[track_caller]
 pub(crate) fn check_no_overlap(dst: &TensorData, others: impl IntoIterator<Item = TensorData>) {
     for t in others {
         if dst.may_share_memory(&t) {

@@ -7,6 +7,7 @@ use crate::autograd::saved::SavedId;
 use crate::ops::Operand;
 use crate::{Scalar, Shape, Tensor, where_};
 
+#[track_caller]
 pub(super) fn pow(base: &Operand, exponent: &Operand, out: &Tensor) {
     let Operand::Tensor(base) = base else {
         unreachable!("the public pow method has a tensor base")

@@ -25,6 +25,10 @@ jobs:
         run: cargo +stable fmt --all --check
       - name: Clippy
         run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - name: Panic locations (#[track_caller] on the public API)
+        run: |
+          python3 tools/check_track_caller.py --self-test
+          python3 tools/check_track_caller.py
       - name: Debug tests
         run: cargo +stable test --workspace --locked
       - name: Release tests

@@ -345,11 +345,13 @@ thread_local! {
 }
 
 /// Whether operations on this thread record the backward graph.
+#[track_caller]
 pub fn is_grad_enabled() -> bool {
     GRAD_ENABLED.with(Cell::get)
 }
 
 /// Enables or disables graph recording on this thread until the returned guard is dropped.
+#[track_caller]
 pub fn set_grad_enabled(enabled: bool) -> GradModeGuard {
     let previous = GRAD_ENABLED.with(|g| g.replace(enabled));
     GradModeGuard {
@@ -365,12 +367,14 @@ pub fn set_grad_enabled(enabled: bool) -> GradModeGuard {
 /// let _guard = homura::no_grad();
 /// assert!(!homura::is_grad_enabled());
 /// ```
+#[track_caller]
 pub fn no_grad() -> GradModeGuard {
     set_grad_enabled(false)
 }
 
 /// Enables graph recording on this thread until the returned guard is dropped, like
 /// `with torch.enable_grad():`.
+#[track_caller]
 pub fn enable_grad() -> GradModeGuard {
     set_grad_enabled(true)
 }
@@ -429,6 +433,7 @@ pub struct GradOptions {
 /// created, has the wrong shape or is on the wrong device, if `grad_tensors` has the wrong
 /// length, or if the backward
 /// pass fails (a saved tensor was freed or modified in place, a derivative isn't implemented).
+#[track_caller]
 pub fn backward(tensors: &[&Tensor], grad_tensors: &[Option<&Tensor>], options: BackwardOptions) {
     let roots = root_edges(tensors, make_grads(tensors, grad_tensors));
     let keep_graph = options.retain_graph.unwrap_or(options.create_graph);
@@ -460,6 +465,7 @@ pub fn backward(tensors: &[&Tensor], grad_tensors: &[Option<&Tensor>], options: 
 ///
 /// Like [`backward`]; also if `inputs` is empty, if an input doesn't require grad, or if an
 /// input is unused and `allow_unused` is not set.
+#[track_caller]
 pub fn grad(outputs: &[&Tensor], inputs: &[&Tensor], options: GradOptions) -> Vec<Option<Tensor>> {
     if inputs.is_empty() {
         panic!("`inputs` argument to `grad()` cannot be empty.");
@@ -467,15 +473,15 @@ pub fn grad(outputs: &[&Tensor], inputs: &[&Tensor], options: GradOptions) -> Ve
     let grad_outputs: Vec<Option<&Tensor>> =
         options.grad_outputs.iter().map(Option::as_ref).collect();
     let roots = root_edges(outputs, make_grads(outputs, &grad_outputs));
-    let input_edges: Vec<_> = inputs
-        .iter()
-        .map(|t| {
-            if !t.requires_grad() {
-                panic!("One of the differentiated Tensors does not require grad");
-            }
-            record::gradient_edge(t)
-        })
-        .collect();
+    // Loops rather than iterator closures on the paths that panic: `#[track_caller]` doesn't pass
+    // through closures.
+    let mut input_edges = Vec::with_capacity(inputs.len());
+    for t in inputs {
+        if !t.requires_grad() {
+            panic!("One of the differentiated Tensors does not require grad");
+        }
+        input_edges.push(record::gradient_edge(t));
+    }
     let keep_graph = options.retain_graph.unwrap_or(options.create_graph);
     let grads = engine::run(roots, Some(&input_edges), keep_graph, options.create_graph);
     if !options.allow_unused
@@ -492,14 +498,13 @@ pub fn grad(outputs: &[&Tensor], inputs: &[&Tensor], options: GradOptions) -> Ve
 /// The gradient of each output (PyTorch's `_make_grads`): the given one, checked against the
 /// output's shape, or ones for an output that requires grad and has a single element. As in
 /// PyTorch, the pairs are checked before the numbers of outputs and gradients are compared.
+#[track_caller]
 fn make_grads(outputs: &[&Tensor], grads: &[Option<&Tensor>]) -> Vec<Option<Tensor>> {
     let implicit = vec![None; outputs.len()];
     let given = if grads.is_empty() { &implicit } else { grads };
-    let made: Vec<_> = outputs
-        .iter()
-        .zip(given)
-        .enumerate()
-        .map(|(i, (out, grad))| match *grad {
+    let mut made = Vec::with_capacity(outputs.len());
+    for (i, (out, grad)) in outputs.iter().zip(given).enumerate() {
+        made.push(match *grad {
             Some(grad) => {
                 let (grad_shape, out_shape) = (grad.shape(), out.shape());
                 if grad_shape != out_shape {
@@ -517,8 +522,8 @@ fn make_grads(outputs: &[&Tensor], grads: &[Option<&Tensor>]) -> Vec<Option<Tens
                 Some(crate::ones_like(out))
             }
             None => None,
-        })
-        .collect();
+        });
+    }
     if given.len() != outputs.len() {
         panic!(
             "got {} tensors and {} gradients",
@@ -530,18 +535,16 @@ fn make_grads(outputs: &[&Tensor], grads: &[Option<&Tensor>]) -> Vec<Option<Tens
 }
 
 /// The edge of each output with its gradient.
+#[track_caller]
 fn root_edges(outputs: &[&Tensor], grads: Vec<Option<Tensor>>) -> Vec<(node::Edge, Tensor)> {
-    outputs
-        .iter()
-        .zip(grads)
-        .enumerate()
-        .map(|(i, (out, grad))| {
-            let Some(edge) = record::gradient_edge(out) else {
-                panic!("element {i} of tensors does not require grad and does not have a grad_fn");
-            };
-            (edge, grad.expect("outputs with an edge require grad"))
-        })
-        .collect()
+    let mut roots = Vec::with_capacity(outputs.len());
+    for (i, (out, grad)) in outputs.iter().zip(grads).enumerate() {
+        let Some(edge) = record::gradient_edge(out) else {
+            panic!("element {i} of tensors does not require grad and does not have a grad_fn");
+        };
+        roots.push((edge, grad.expect("outputs with an edge require grad")));
+    }
+    roots
 }
 
 #[cfg(test)]

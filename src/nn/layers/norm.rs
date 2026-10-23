@@ -36,6 +36,7 @@ impl LayerNorm {
     /// A layer that normalizes the last dimensions `normalized_shape`
     /// (`nn.LayerNorm(normalized_shape)`), with a weight and a bias. Like PyTorch, an empty
     /// shape is accepted here, and the forward computation rejects it.
+    #[track_caller]
     pub fn new(normalized_shape: impl IntoShape) -> LayerNorm {
         let normalized_shape = normalized_shape.into_shape().to_vec();
         LayerNorm {
@@ -48,6 +49,7 @@ impl LayerNorm {
 
     /// This layer with `eps`, which is added to the variance (`eps=...`).
     #[must_use]
+    #[track_caller]
     pub fn eps(mut self, eps: f64) -> LayerNorm {
         self.eps = eps;
         self
@@ -58,6 +60,7 @@ impl LayerNorm {
     /// [`reset_parameters`](LayerNorm::reset_parameters) does, with the dtype and device of the
     /// parameter the layer has (the default ones if it has none); a parameter it has stays.
     #[must_use]
+    #[track_caller]
     pub fn elementwise_affine(mut self, elementwise_affine: bool) -> LayerNorm {
         if !elementwise_affine {
             self.weight = None;
@@ -81,6 +84,7 @@ impl LayerNorm {
     /// layer with elementwise affine gets a bias of zeros if it has none, with the dtype and
     /// device of its weight; a layer without elementwise affine stays without one, as in PyTorch.
     #[must_use]
+    #[track_caller]
     pub fn bias(mut self, bias: bool) -> LayerNorm {
         if !bias {
             self.bias = None;
@@ -94,6 +98,7 @@ impl LayerNorm {
 
     /// Initializes the parameters again, like PyTorch: the weight with ones and the bias with
     /// zeros.
+    #[track_caller]
     pub fn reset_parameters(&self) {
         if let Some(w) = &self.weight {
             init::ones_(w);
@@ -104,6 +109,7 @@ impl LayerNorm {
     }
 
     /// The normalization of `input`, whose last dimensions are `normalized_shape`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::layer_norm(
             input,
@@ -169,6 +175,7 @@ pub struct RmsNorm {
 impl RmsNorm {
     /// A layer that normalizes the last dimensions `normalized_shape`
     /// (`nn.RMSNorm(normalized_shape)`), with a weight.
+    #[track_caller]
     pub fn new(normalized_shape: impl IntoShape) -> RmsNorm {
         let normalized_shape = normalized_shape.into_shape().to_vec();
         RmsNorm {
@@ -180,6 +187,7 @@ impl RmsNorm {
 
     /// This layer with `eps` (`eps=...`): a number, or `None` for the machine epsilon.
     #[must_use]
+    #[track_caller]
     pub fn eps(mut self, eps: impl Into<Option<f64>>) -> RmsNorm {
         self.eps = eps.into();
         self
@@ -189,6 +197,7 @@ impl RmsNorm {
     /// otherwise (`elementwise_affine=False`). A new weight is initialized with ones, with the
     /// default dtype and device: the layer has no other parameter to take them from.
     #[must_use]
+    #[track_caller]
     pub fn elementwise_affine(mut self, elementwise_affine: bool) -> RmsNorm {
         if !elementwise_affine {
             self.weight = None;
@@ -201,6 +210,7 @@ impl RmsNorm {
     }
 
     /// Initializes the weight again with ones, like PyTorch.
+    #[track_caller]
     pub fn reset_parameters(&self) {
         if let Some(w) = &self.weight {
             init::ones_(w);
@@ -208,6 +218,7 @@ impl RmsNorm {
     }
 
     /// The normalization of `input`, whose last dimensions are `normalized_shape`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::rms_norm(
             input,

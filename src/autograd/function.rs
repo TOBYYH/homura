@@ -91,6 +91,7 @@ pub trait Function: Send + Sync + Sized + 'static {
     ///
     /// Panics if `forward` panics, and in the cases listed there. The panic leaves grad mode as it
     /// was and records nothing.
+    #[track_caller]
     fn apply(self, inputs: &[&Tensor]) -> Vec<Tensor> {
         apply(self, inputs)
     }
@@ -111,6 +112,7 @@ impl ForwardContext {
     /// # Panics
     ///
     /// Panics if `i` is out of range.
+    #[track_caller]
     pub fn needs_input_grad(&self, i: usize) -> bool {
         self.needs_input_grad[i]
     }
@@ -125,6 +127,7 @@ impl ForwardContext {
     /// computed with grad mode off have no history: they are constants, so a `backward` that
     /// uses them is correct for the first derivative only. If `forward` explicitly enables grad
     /// mode, other saved tensors retain the history it records.
+    #[track_caller]
     pub fn save_for_backward(&mut self, tensors: &[&Tensor]) {
         self.saved = tensors.iter().map(|&t| t.clone()).collect();
     }
@@ -135,6 +138,7 @@ impl ForwardContext {
     ///
     /// [`Function::apply`] panics if a marked tensor (of the last call) is not one of the tensors
     /// `forward` returns; PyTorch ignores such tensors.
+    #[track_caller]
     pub fn mark_non_differentiable(&mut self, outputs: &[&Tensor]) {
         self.non_differentiable = outputs.iter().map(|&t| t.clone()).collect();
     }
@@ -164,6 +168,7 @@ impl BackwardContext<'_> {
     /// # Panics
     ///
     /// Panics if `i` is out of range.
+    #[track_caller]
     pub fn needs_input_grad(&self, i: usize) -> bool {
         self.needs_input_grad[i]
     }
@@ -175,6 +180,7 @@ impl BackwardContext<'_> {
     ///
     /// Panics with PyTorch's messages if the saved tensors were freed by an earlier backward
     /// pass without `retain_graph`, or if one of them was modified in place since it was saved.
+    #[track_caller]
     pub fn saved_tensors(&self) -> Vec<Tensor> {
         self.saved.iter().map(|&id| self.ctx.unpack(id)).collect()
     }
@@ -218,15 +224,18 @@ impl<F: Function> Node for FunctionNode<F> {
     }
 }
 
+#[track_caller]
 fn apply<F: Function>(mut function: F, inputs: &[&Tensor]) -> Vec<Tensor> {
     let needs_input_grad: Vec<bool> = inputs.iter().map(|t| t.requires_grad()).collect();
     let record = is_grad_enabled() && needs_input_grad.iter().any(|&b| b);
     // Before the user's code runs, so that a stale input view fails without side effects.
-    let edges: Vec<_> = if record {
-        inputs.iter().map(|t| gradient_edge(t)).collect()
-    } else {
-        vec![]
-    };
+    let mut edges = Vec::new();
+    if record {
+        // A loop rather than a closure, so that the panic keeps the caller's location.
+        for t in inputs {
+            edges.push(gradient_edge(t));
+        }
+    }
     let versions: Vec<u64> = inputs.iter().map(|t| t.version()).collect();
     let mut ctx = ForwardContext {
         needs_input_grad,
@@ -292,6 +301,7 @@ fn apply<F: Function>(mut function: F, inputs: &[&Tensor]) -> Vec<Tensor> {
 /// it behaves the same in every grad mode): it must not have modified an input in place, its
 /// outputs must not share memory with an input or each other, and it must not have marked a
 /// tensor it doesn't return as non-differentiable.
+#[track_caller]
 fn check_forward<F: Function>(
     inputs: &[&Tensor],
     versions: &[u64],

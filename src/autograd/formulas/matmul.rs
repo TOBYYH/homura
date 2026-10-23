@@ -22,6 +22,7 @@ fn cross_save(
 }
 
 /// Records the backward node of `out = a.matmul(b)`.
+#[track_caller]
 pub(crate) fn matmul(a: &Tensor, b: &Tensor, out: &Tensor) {
     record(&[Some(a), Some(b)], &[out], |builder| MatmulBackward {
         operands: cross_save(builder, 0, a, b),
@@ -127,6 +128,7 @@ pub(crate) enum ScaledProduct {
 
 /// Records the backward node of `out = beta * input + alpha * product(x, y)`, with the inputs as
 /// the operation used them (`addr` promotes them first).
+#[track_caller]
 pub(crate) fn scaled_product(
     product: ScaledProduct,
     input: &Tensor,

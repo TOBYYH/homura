@@ -7,6 +7,7 @@ use crate::autograd::saved::SavedId;
 use crate::dtype::ResultType;
 use crate::{Scalar, Shape, Tensor};
 
+#[track_caller]
 pub(crate) fn addcmul(x: &Tensor, a: &Tensor, b: &Tensor, value: Scalar, out: &Tensor) {
     record(&[Some(x), Some(a), Some(b)], &[out], |builder| {
         AddcmulBackward0 {
@@ -20,6 +21,7 @@ pub(crate) fn addcmul(x: &Tensor, a: &Tensor, b: &Tensor, value: Scalar, out: &T
     });
 }
 
+#[track_caller]
 pub(crate) fn addcdiv(x: &Tensor, a: &Tensor, b: &Tensor, value: Scalar, out: &Tensor) {
     record(&[Some(x), Some(a), Some(b)], &[out], |builder| {
         AddcdivBackward0 {

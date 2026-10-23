@@ -63,6 +63,7 @@ pub(crate) struct ViewInfo {
 /// # Panics
 ///
 /// Panics if the layout reaches outside the storage of `parent`.
+#[track_caller]
 pub(crate) fn view_of(parent: &Tensor, layout: Layout) -> Tensor {
     let data = parent.data();
     layout.check_bounds(data.dtype.size_in_bytes(), data.storage.nbytes());
@@ -242,6 +243,7 @@ impl Tensor {
     /// Whether gradients flow to this tensor (PyTorch's `requires_grad`): it is a leaf whose own
     /// flag is set, it was computed by a recorded operation, or it is a view of a tensor that
     /// requires grad.
+    #[track_caller]
     pub fn requires_grad(&self) -> bool {
         requires_grad(self)
     }
@@ -258,6 +260,7 @@ impl Tensor {
     ///
     /// Panics if `requires_grad` is true and the dtype is not floating point, or if it is false
     /// and the tensor is not a leaf, as PyTorch does.
+    #[track_caller]
     pub fn requires_grad_(&self, requires_grad: bool) -> &Self {
         if !is_leaf(self) {
             if !requires_grad {
@@ -282,12 +285,14 @@ impl Tensor {
     /// rather than computed by a recorded operation. Backward passes accumulate gradients into
     /// the `.grad` of leaves; a non-leaf stores its gradient only after
     /// [`retain_grad`](Tensor::retain_grad).
+    #[track_caller]
     pub fn is_leaf(&self) -> bool {
         is_leaf(self)
     }
 
     /// The gradient accumulated into this tensor by backward passes, PyTorch's `.grad`: for a
     /// leaf that requires grad, or for a non-leaf after [`retain_grad`](Tensor::retain_grad).
+    #[track_caller]
     pub fn grad(&self) -> Option<Tensor> {
         grad(self)
     }
@@ -323,6 +328,7 @@ impl Tensor {
     ///
     /// Panics if the tensor doesn't require grad, with PyTorch's message, or if it is a stale
     /// view (see [`grad_fn`](Tensor::grad_fn)).
+    #[track_caller]
     pub fn retain_grad(&self) -> &Self {
         if !requires_grad(self) {
             panic!("can't retain_grad on Tensor that has requires_grad=False");
@@ -344,6 +350,7 @@ impl Tensor {
 
     /// Whether this tensor is a non-leaf that called [`retain_grad`](Tensor::retain_grad)
     /// (PyTorch's `retains_grad`). Stays true after [`detach_`](Tensor::detach_), as in PyTorch.
+    #[track_caller]
     pub fn retains_grad(&self) -> bool {
         retains_grad(self)
     }
@@ -355,6 +362,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if the gradient's dtype, device or shape differ from the tensor's.
+    #[track_caller]
     pub fn set_grad(&self, grad: Option<Tensor>) {
         if let Some(g) = &grad {
             let (dtype, grad_dtype) = (self.dtype(), g.dtype());
@@ -392,6 +400,7 @@ impl Tensor {
     /// mode after the view was created: the view's node no longer describes how it depends on
     /// the base's new history (PyTorch replays the view on it, which homura doesn't support
     /// yet).
+    #[track_caller]
     pub fn grad_fn(&self) -> Option<GradFn> {
         record::check_not_stale(self);
         grad_fn(self).map(|(node, _)| GradFn(node))
@@ -400,6 +409,7 @@ impl Tensor {
     /// A tensor sharing this tensor's data (and version counter) without its history: it doesn't
     /// require grad, and isn't treated as a view, so it can be modified in place. Modifying it
     /// in place is visible in `self`, and is detected by backward passes that saved `self`.
+    #[track_caller]
     pub fn detach(&self) -> Tensor {
         Tensor::from_data(self.data())
     }
@@ -411,6 +421,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics on views, which can't be detached in place; use [`detach`](Tensor::detach).
+    #[track_caller]
     pub fn detach_(&self) -> &Self {
         if self.view_info().is_some() {
             panic!("Can't detach views in-place. Use detach() instead.");
@@ -428,6 +439,7 @@ impl Tensor {
     ///
     /// Panics if the tensor doesn't require grad or has more than one element, or if the
     /// backward pass fails; see [`autograd::backward`](crate::autograd::backward).
+    #[track_caller]
     pub fn backward(&self) {
         super::backward(&[self], &[], BackwardOptions::default());
     }
@@ -435,6 +447,7 @@ impl Tensor {
     /// Like [`backward`](Tensor::backward), with `gradient` as the gradient of this tensor
     /// (PyTorch's `y.backward(gradient)`): the vector of the vector-Jacobian product. It must
     /// have the shape of this tensor.
+    #[track_caller]
     pub fn backward_with(&self, gradient: &Tensor) {
         super::backward(&[self], &[Some(gradient)], BackwardOptions::default());
     }

@@ -132,6 +132,7 @@ impl Layout {
     }
 
     /// Broadcasts this layout to `shape` by giving new and size-1 dimensions a stride of 0.
+    #[track_caller]
     pub fn expand_to(&self, shape: &Shape) -> Layout {
         let n = shape.len();
         let m = self.shape.len();
@@ -192,6 +193,7 @@ impl Layout {
 
     /// Panics unless every element of this layout, with elements of `item_size` bytes, lies
     /// inside a storage of `nbytes` bytes and the number of elements is representable.
+    #[track_caller]
     pub fn check_bounds(&self, item_size: usize, nbytes: usize) {
         let needed = self
             .checked_end()
@@ -378,8 +380,12 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if the size in bytes exceeds `isize::MAX`, on every device.
+    #[track_caller]
     pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
-        let nbytes = checked_nbytes(&shape, dtype).unwrap_or_else(|e| panic!("{e}"));
+        let nbytes = match checked_nbytes(&shape, dtype) {
+            Ok(nbytes) => nbytes,
+            Err(e) => panic!("{e}"),
+        };
         let storage = Arc::new(Storage::new(nbytes, device));
         Tensor::from_data(TensorData {
             storage,
@@ -395,6 +401,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if the layout reaches outside the storage.
+    #[track_caller]
     pub(crate) fn make_view(&self, layout: Layout) -> Tensor {
         crate::autograd::view_of(self, layout)
     }
@@ -418,6 +425,7 @@ impl Tensor {
     }
 
     /// Creates a tensor from host data with an exact dtype.
+    #[track_caller]
     pub(crate) fn from_host<T: Element>(values: &[T], shape: Shape, device: Device) -> Tensor {
         assert_eq!(
             values.len(),
@@ -443,6 +451,7 @@ impl Tensor {
     }
 
     /// The size of each dimension.
+    #[track_caller]
     pub fn shape(&self) -> Shape {
         self.0
             .data
@@ -454,37 +463,44 @@ impl Tensor {
     }
 
     /// The size of dimension `dim` (negative values count from the end).
+    #[track_caller]
     pub fn size(&self, dim: i64) -> usize {
         let shape = self.shape();
         shape[crate::shape::normalize_dim(dim, shape.len())]
     }
 
     /// The strides of each dimension, in elements.
+    #[track_caller]
     pub fn stride(&self) -> Strides {
         self.layout().strides
     }
 
     /// Offset of the first element in the underlying storage, in elements.
+    #[track_caller]
     pub fn storage_offset(&self) -> usize {
         self.layout().offset
     }
 
     /// Number of dimensions (PyTorch's `dim()`).
+    #[track_caller]
     pub fn num_dims(&self) -> usize {
         self.shape().len()
     }
 
     /// Total number of elements (PyTorch's `numel()`).
+    #[track_caller]
     pub fn num_elements(&self) -> usize {
         self.shape().num_elements()
     }
 
     /// The element type.
+    #[track_caller]
     pub fn dtype(&self) -> DType {
         self.0.data.read().unwrap_or_else(|e| e.into_inner()).dtype
     }
 
     /// The device holding the data.
+    #[track_caller]
     pub fn device(&self) -> Device {
         self.0
             .data
@@ -494,21 +510,25 @@ impl Tensor {
     }
 
     /// Whether the elements are laid out in row-major order without gaps.
+    #[track_caller]
     pub fn is_contiguous(&self) -> bool {
         self.layout().is_contiguous()
     }
 
     /// Whether the dtype is a floating point type.
+    #[track_caller]
     pub fn is_floating_point(&self) -> bool {
         self.dtype().is_floating_point()
     }
 
     /// Size of one element in bytes.
+    #[track_caller]
     pub fn element_size(&self) -> usize {
         self.dtype().size_in_bytes()
     }
 
     /// Whether `self` and `other` are handles to the same tensor (Python's `x is y`).
+    #[track_caller]
     pub fn is_same(&self, other: &Tensor) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -535,6 +555,7 @@ impl Tensor {
 
     /// Copies the data into a new contiguous tensor (PyTorch's `x.clone()`). The copy is
     /// connected to the graph: gradients flow through it to `self`.
+    #[track_caller]
     pub fn deep_clone(&self) -> Tensor {
         let out = Tensor::from_data(crate::ops::clone_data(&self.data()));
         crate::autograd::formulas::deep_clone(self, &out);

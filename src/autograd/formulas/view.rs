@@ -8,6 +8,7 @@ use crate::{DType, Device, Shape, Tensor};
 
 /// Records the backward node of `out = x.view(..)`, also used by `reshape` when it can share
 /// the storage.
+#[track_caller]
 pub(crate) fn view(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| ViewBackward0 { self_shape });
@@ -15,23 +16,27 @@ pub(crate) fn view(x: &Tensor, out: &Tensor) {
 
 /// Records the backward node of `out = x.unsafe_view(..)`, the reshape of a result an operation
 /// has just allocated: a differentiable reshape whose output is not recorded as a view.
+#[track_caller]
 pub(crate) fn unsafe_view(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| UnsafeViewBackward0 { self_shape });
 }
 
 /// Records the backward node of `out = x.expand(..)`.
+#[track_caller]
 pub(crate) fn expand(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| ExpandBackward0 { self_shape });
 }
 
 /// Records the backward node of `out = x.permute(dims)`, with `dims` already wrapped.
+#[track_caller]
 pub(crate) fn permute(x: &Tensor, dims: Vec<usize>, out: &Tensor) {
     record(&[Some(x)], &[out], |_| PermuteBackward0 { dims });
 }
 
 /// Records the backward node of `out = x.transpose(dim0, dim1)`.
+#[track_caller]
 pub(crate) fn transpose(x: &Tensor, dim0: i64, dim1: i64, out: &Tensor) {
     record(&[Some(x)], &[out], |_| TransposeBackward0 { dim0, dim1 });
 }
@@ -47,22 +52,26 @@ pub(crate) enum Squeeze {
 
 /// Records the backward node of a squeeze of `x` that removed the dimensions `removed`, in
 /// increasing order.
+#[track_caller]
 pub(crate) fn squeeze(x: &Tensor, kind: Squeeze, removed: Vec<usize>, out: &Tensor) {
     record(&[Some(x)], &[out], |_| SqueezeBackward { kind, removed });
 }
 
 /// Records the backward node of `out = x.unsqueeze(dim)`, with `dim` already wrapped.
+#[track_caller]
 pub(crate) fn unsqueeze(x: &Tensor, dim: usize, out: &Tensor) {
     record(&[Some(x)], &[out], |_| UnsqueezeBackward0 { dim });
 }
 
 /// Records the backward node of `out`, a view of all of `x` (PyTorch's `alias`), which indexing
 /// returns when no index item changes anything.
+#[track_caller]
 pub(crate) fn alias(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |_| AliasBackward0);
 }
 
 /// Records the backward node of `out = x.select(dim, index)`, with `index` already wrapped.
+#[track_caller]
 pub(crate) fn select(x: &Tensor, dim: usize, index: usize, out: &Tensor) {
     record(&[Some(x)], &[out], |_| SelectBackward0 {
         self_shape: x.shape(),
@@ -74,6 +83,7 @@ pub(crate) fn select(x: &Tensor, dim: usize, index: usize, out: &Tensor) {
 /// Records the backward node of `out`, the positions `start..end` with `step` of `x` along
 /// `dim`, which slicing and `narrow` view. `start` and `end` are already clamped into the
 /// dimension.
+#[track_caller]
 pub(crate) fn slice(x: &Tensor, dim: usize, start: usize, end: usize, step: usize, out: &Tensor) {
     record(&[Some(x)], &[out], |_| SliceBackward0 {
         self_shape: x.shape(),
@@ -85,6 +95,7 @@ pub(crate) fn slice(x: &Tensor, dim: usize, start: usize, end: usize, step: usiz
 }
 
 /// Records the backward node of `out = x.unfold(dim, size, step)`, with `dim` already wrapped.
+#[track_caller]
 pub(crate) fn unfold(x: &Tensor, dim: usize, size: usize, step: usize, out: &Tensor) {
     record(&[Some(x)], &[out], |_| UnfoldBackward0 {
         self_shape: x.shape(),
@@ -95,6 +106,7 @@ pub(crate) fn unfold(x: &Tensor, dim: usize, size: usize, step: usize, out: &Ten
 }
 
 /// Records the backward node of `out = x.as_strided(..)`.
+#[track_caller]
 pub(crate) fn as_strided(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |_| {
         let input = x.layout();

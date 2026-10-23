@@ -19,9 +19,12 @@ pub(crate) fn needs_grad(inputs: &[Option<&Tensor>]) -> bool {
 /// have side effects before they record (`nn::functional::batch_norm` writes its running
 /// statistics): if the operation will be recorded, panics like [`gradient_edge`] for a stale
 /// input view, so that it fails before anything is written.
+#[track_caller]
 pub(crate) fn check_recordable(inputs: &[Option<&Tensor>]) {
     if needs_grad(inputs) {
-        inputs.iter().flatten().for_each(|t| check_not_stale(t));
+        for t in inputs.iter().flatten() {
+            check_not_stale(t);
+        }
     }
 }
 
@@ -40,6 +43,7 @@ pub(crate) fn check_recordable(inputs: &[Option<&Tensor>]) {
 /// recorded in place: the edges are looked up and the inputs saved while the target still holds
 /// its old value and history, then the result is written, the target's saved copies are moved to
 /// the version after the write, and the new node replaces the target's history.
+#[track_caller]
 pub(crate) fn record<N: Node>(
     inputs: &[Option<&Tensor>],
     outputs: &[&Tensor],
@@ -49,7 +53,15 @@ pub(crate) fn record<N: Node>(
         return;
     }
     let in_place = take_in_place_write(outputs);
-    let edges = inputs.iter().map(|t| t.and_then(gradient_edge)).collect();
+    // A loop rather than a closure, so that the stale-view panic of `gradient_edge` keeps the
+    // caller's location.
+    let mut edges = Vec::with_capacity(inputs.len());
+    for t in inputs {
+        edges.push(match t {
+            Some(t) => gradient_edge(t),
+            None => None,
+        });
+    }
     let mut builder = NodeBuilder::new(edges);
     let formula = formula(&mut builder);
     let target_nr = in_place.map(|(output_nr, write)| {
@@ -168,6 +180,7 @@ pub(crate) fn original_value(t: &Tensor) -> Tensor {
 /// # Panics
 ///
 /// Panics as described above.
+#[track_caller]
 pub(crate) fn check_in_place(target: &Tensor, inputs: &[Option<&Tensor>]) -> bool {
     if !is_grad_enabled() || !target.is_floating_point() {
         return false;
@@ -190,6 +203,11 @@ pub(crate) fn check_in_place(target: &Tensor, inputs: &[Option<&Tensor>]) -> boo
     if has_own_flag(target) && meta::is_leaf(target) {
         panic!("a leaf Variable that requires grad is being used in an in-place operation.");
     }
+    // `record` makes this check too, inside the closure that records the write, where the
+    // caller's location is lost.
+    for t in inputs.iter().flatten() {
+        check_not_stale(t);
+    }
     true
 }
 
@@ -211,6 +229,7 @@ fn has_own_flag(t: &Tensor) -> bool {
 /// Panics if `t` is a view whose base had its history rewritten by an in-place operation in
 /// grad mode after the view was created. Replaying the view on the new history is not
 /// supported yet.
+#[track_caller]
 pub(crate) fn gradient_edge(t: &Tensor) -> Option<Edge> {
     check_not_stale(t);
     if let Some((node, output_nr)) = meta::grad_fn(t) {
@@ -230,6 +249,7 @@ pub(crate) fn gradient_edge(t: &Tensor) -> Option<Edge> {
 /// in-place operation in grad mode after the view was created (replaying the view on the new
 /// history is not supported yet), or its base's data was replaced by `Module::to`, so that the
 /// view no longer shares it.
+#[track_caller]
 pub(crate) fn check_not_stale(t: &Tensor) {
     match staleness(t) {
         None => {}

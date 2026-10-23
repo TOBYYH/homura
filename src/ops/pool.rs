@@ -66,6 +66,7 @@ impl AdaptiveWindows {
 /// `max_pool2d_with_indices`; see `cpu::max_pool2d`. The values are recorded as
 /// `MaxPool2DWithIndicesBackward0`, which saves `input` and the indices; the indices have no
 /// history.
+#[track_caller]
 pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Tensor) {
     let x = input.data();
     let shape = g.output_shape(&x.layout.shape);
@@ -94,6 +95,7 @@ pub(crate) fn max_pool2d_backward(grad: &Tensor, input: &Tensor, indices: &Tenso
 /// The means of the adaptive windows of `input` for an output of `output` (PyTorch's
 /// `_adaptive_avg_pool2d`); see `cpu::adaptive_avg_pool2d`. Recorded as
 /// `AdaptiveAvgPool2DBackward0`, which saves `input`.
+#[track_caller]
 pub(crate) fn adaptive_avg_pool2d(input: &Tensor, output: [usize; 2]) -> Tensor {
     let x = input.data();
     let nd = x.layout.shape.len();

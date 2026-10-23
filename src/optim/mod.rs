@@ -95,17 +95,21 @@ pub trait Optimizer {
     /// addition (SGD's `-lr`, weight decay, dampening and Nesterov momentum, Adam's weight decay)
     /// in the parameter's dtype, and Adam's `-lr / (1 - beta1^step)` in its computation type
     /// (F32 for F16 and BF16).
+    #[track_caller]
     fn step(&mut self);
 
     /// Sets the gradient of every parameter to `None` (`zero_grad()`).
+    #[track_caller]
     fn zero_grad(&mut self);
 
     /// The options that [`ParamGroup`]s are based on: the arguments of `new` and the chained
     /// methods (`defaults`). Groups added later can start from them,
     /// `SgdOptions { lr: 0.01, ..*opt.defaults() }`.
+    #[track_caller]
     fn defaults(&self) -> &Self::Options;
 
     /// The parameter groups, in the order they were added (`param_groups`).
+    #[track_caller]
     fn param_groups(&self) -> &[ParamGroup<Self::Options>];
 
     /// The options of the parameter group `index`, to change them
@@ -115,6 +119,7 @@ pub trait Optimizer {
     /// # Panics
     ///
     /// Panics if there is no group `index`.
+    #[track_caller]
     fn options_mut(&mut self, index: usize) -> &mut Self::Options;
 
     /// Adds a group of parameters with its own options (`add_param_group`).
@@ -124,6 +129,7 @@ pub trait Optimizer {
     /// Panics if the options are invalid, a parameter is not a leaf, a parameter is already in
     /// the optimizer ("some parameters appear in more than one parameter group"), or a
     /// parameter appears twice in the group.
+    #[track_caller]
     fn add_param_group(&mut self, group: ParamGroup<Self::Options>);
 }
 
@@ -137,6 +143,7 @@ pub struct ParamGroup<O> {
 
 impl<O> ParamGroup<O> {
     /// A group of `params` with `options`.
+    #[track_caller]
     pub fn new(params: impl IntoIterator<Item = Parameter>, options: O) -> ParamGroup<O> {
         ParamGroup {
             params: params.into_iter().collect(),
@@ -145,9 +152,33 @@ impl<O> ParamGroup<O> {
     }
 
     /// The parameters of this group.
+    #[track_caller]
     pub fn params(&self) -> &[Parameter] {
         &self.params
     }
+}
+
+/// The checks of an optimizer's options, which [`Groups`] makes. They are trait methods called
+/// statically, not callbacks: `#[track_caller]` passes the location of the user's call through
+/// direct and generic calls, but not through function pointers or closures.
+trait GroupOptions: Copy {
+    /// The checks of single values, made by the chained option methods.
+    #[track_caller]
+    fn check_values(&self) {
+        self.check();
+    }
+
+    /// All checks of a group's options, made when it is added and in `step`.
+    #[track_caller]
+    fn check(&self);
+}
+
+/// The checks of a step for one parameter with a gradient, made before anything is updated.
+trait ParamCheck<O, S> {
+    /// Panics if the step can't update `param`, with the options `options` of its group and its
+    /// state `state`.
+    #[track_caller]
+    fn check_param(&self, options: &O, param: &Tensor, state: Option<&S>);
 }
 
 /// The parameter groups of an optimizer with the state `S` of each parameter, which the
@@ -167,9 +198,10 @@ struct WithGrad {
     grad: Tensor,
 }
 
-impl<O: Copy, S> Groups<O, S> {
+impl<O: GroupOptions, S> Groups<O, S> {
     /// The groups of an optimizer made with `params` and `defaults`.
-    fn new(params: impl IntoIterator<Item = Parameter>, defaults: O, check: fn(&O)) -> Self {
+    #[track_caller]
+    fn new(params: impl IntoIterator<Item = Parameter>, defaults: O) -> Self {
         let params: Vec<Parameter> = params.into_iter().collect();
         if params.is_empty() {
             panic!("optimizer got an empty parameter list");
@@ -179,12 +211,13 @@ impl<O: Copy, S> Groups<O, S> {
             groups: vec![],
             state: vec![],
         };
-        groups.add(ParamGroup::new(params, defaults), check);
+        groups.add(ParamGroup::new(params, defaults));
         groups
     }
 
-    fn add(&mut self, group: ParamGroup<O>, check: fn(&O)) {
-        check(&group.options);
+    #[track_caller]
+    fn add(&mut self, group: ParamGroup<O>) {
+        group.options.check();
         for (i, p) in group.params.iter().enumerate() {
             check_leaf(p);
             if group.params[..i].iter().any(|q| q.is_same(p)) {
@@ -199,15 +232,18 @@ impl<O: Copy, S> Groups<O, S> {
         self.groups.push(group);
     }
 
-    /// Applies a chained option method to the defaults and to every group.
-    fn set(&mut self, f: impl Fn(&mut O), check: fn(&O)) {
+    /// Applies a chained option method to the defaults and to every group. `f` only assigns;
+    /// the check runs here.
+    #[track_caller]
+    fn set(&mut self, f: impl Fn(&mut O)) {
         f(&mut self.defaults);
-        check(&self.defaults);
+        self.defaults.check_values();
         for g in &mut self.groups {
             f(&mut g.options);
         }
     }
 
+    #[track_caller]
     fn options_mut(&mut self, index: usize) -> &mut O {
         let len = self.groups.len();
         match self.groups.get_mut(index) {
@@ -229,21 +265,18 @@ impl<O: Copy, S> Groups<O, S> {
         }
     }
 
-    /// The checks of a step, before it updates anything: `check` on the options of each group,
-    /// and for each parameter with a gradient that it is a leaf and `check_param` on it and its
-    /// state, if it has one. Returns those parameters with their gradients, in order.
-    fn prepare(
-        &self,
-        check: fn(&O),
-        check_param: impl Fn(&O, &Tensor, Option<&S>),
-    ) -> Vec<WithGrad> {
+    /// The checks of a step, before it updates anything: the options of each group, and for each
+    /// parameter with a gradient that it is a leaf and `checker`'s checks of it and its state, if
+    /// it has one. Returns those parameters with their gradients, in order.
+    #[track_caller]
+    fn prepare(&self, checker: &impl ParamCheck<O, S>) -> Vec<WithGrad> {
         let mut out = vec![];
         for (g, (group, state)) in self.groups.iter().zip(&self.state).enumerate() {
-            check(&group.options);
+            group.options.check();
             for (i, p) in group.params.iter().enumerate() {
                 let Some(grad) = p.grad() else { continue };
                 check_leaf(p);
-                check_param(&group.options, p, state[i].as_ref());
+                checker.check_param(&group.options, p, state[i].as_ref());
                 out.push(WithGrad {
                     group: g,
                     index: i,
@@ -256,21 +289,25 @@ impl<O: Copy, S> Groups<O, S> {
 }
 
 /// `a + alpha * b`, rounded once (see [`Fused`]).
+#[track_caller]
 fn scaled_add(a: &Tensor, b: &Tensor, alpha: f64) -> Tensor {
     fused(Fused::ScaledAdd(alpha), a, b, None)
 }
 
 /// `lerp(a, b, weight)`, rounded once.
+#[track_caller]
 fn lerp(a: &Tensor, b: &Tensor, weight: f64) -> Tensor {
     fused(Fused::Lerp(weight), a, b, None)
 }
 
 /// `a + value * b * c`, rounded once.
+#[track_caller]
 fn addcmul(a: &Tensor, b: &Tensor, c: &Tensor, value: f64) -> Tensor {
     fused(Fused::Addcmul(value), a, b, Some(c))
 }
 
 /// `a + value * b / c`, rounded once.
+#[track_caller]
 fn addcdiv(a: &Tensor, b: &Tensor, c: &Tensor, value: f64) -> Tensor {
     fused(Fused::Addcdiv(value), a, b, Some(c))
 }
@@ -282,6 +319,7 @@ fn addcdiv(a: &Tensor, b: &Tensor, c: &Tensor, value: f64) -> Tensor {
 ///
 /// Panics on the CPU if the scalar of `op` doesn't fit the type PyTorch converts it to (see
 /// [`check_coefficient`]); `step` checks the scalars before it updates anything.
+#[track_caller]
 fn fused(op: Fused, a: &Tensor, b: &Tensor, c: Option<&Tensor>) -> Tensor {
     let out = Tensor::empty_on(a.shape(), a.dtype(), a.device());
     if a.device() == Device::Cpu {
@@ -309,6 +347,7 @@ fn computation(dtype: DType) -> DType {
 /// tensor, `value` of `addcmul` / `addcdiv` and the weight of `lerp` to its computation type.
 /// Infinities and NaN pass, as there. Scalar operands of other operations (`mul_(momentum)`,
 /// `add_(eps)`) aren't checked, like PyTorch's, and the meta device checks nothing.
+#[track_caller]
 fn check_coefficient(value: f64, dtype: DType) {
     if Scalar::Float(value).checked_to(dtype).is_none() {
         panic!("value cannot be converted to type {dtype} without overflow");
@@ -316,6 +355,7 @@ fn check_coefficient(value: f64, dtype: DType) {
 }
 
 /// [`check_coefficient`] for the scalars a step uses with the parameter `p`, on the CPU.
+#[track_caller]
 fn check_coefficients(p: &Tensor, coefficients: impl IntoIterator<Item = (f64, DType)>) {
     if p.device() == Device::Cpu {
         for (value, dtype) in coefficients {
@@ -324,6 +364,7 @@ fn check_coefficients(p: &Tensor, coefficients: impl IntoIterator<Item = (f64, D
     }
 }
 
+#[track_caller]
 fn check_leaf(p: &Tensor) {
     if p.grad_fn().is_some() {
         panic!("can't optimize a non-leaf Tensor");
@@ -332,6 +373,7 @@ fn check_leaf(p: &Tensor) {
 
 /// Panics unless the state tensor `name` matches the parameter `p`, which changes when the
 /// parameter is moved with `Module::to` after the state was created.
+#[track_caller]
 fn check_state_tensor(p: &Tensor, t: &Tensor, name: &str) {
     if t.shape() != p.shape() || t.dtype() != p.dtype() || t.device() != p.device() {
         panic!(

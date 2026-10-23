@@ -44,6 +44,7 @@ pub enum TensorIndex {
 /// [`NewAxis`], [`Ellipsis`], `bool` and index tensors.
 pub trait IndexItem {
     /// Converts into a [`TensorIndex`].
+    #[track_caller]
     fn into_index(self) -> TensorIndex;
 }
 
@@ -199,6 +200,7 @@ fn covers(size: usize, start: Option<i64>, end: Option<i64>, step: i64) -> bool 
 /// A full index expression: a single [`IndexItem`] or a tuple of them.
 pub trait IndexSpec {
     /// Converts into a list of [`TensorIndex`] items.
+    #[track_caller]
     fn into_indices(self) -> Vec<TensorIndex>;
 }
 
@@ -246,6 +248,7 @@ fn index_dims(t: &Tensor) -> usize {
 }
 
 /// The value of a zero-dimensional index tensor, which indexing consumes. Meta tensors have none.
+#[track_caller]
 fn index_value(t: &Tensor) -> i64 {
     let data = t.data();
     if data.device() != Device::Cpu {
@@ -329,6 +332,7 @@ impl Tensor {
     /// ellipsis, on index tensors of another dtype (PyTorch also accepts `u8` masks and
     /// zero-dimensional `i8` and `i16` tensors), on masks of the wrong shape, on indices that
     /// don't broadcast together, and on meta tensors as described.
+    #[track_caller]
     pub fn index(&self, spec: impl IndexSpec) -> Tensor {
         let items = spec.into_indices();
         for item in &items {
@@ -451,19 +455,17 @@ impl Tensor {
     /// elements of `self` can't be proven to be distinct memory locations (PyTorch warns) or if
     /// `values` or an index tensor may share memory with `self`. Every check runs before the
     /// write, so a call that panics changes nothing.
+    #[track_caller]
     pub fn index_put_(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> &Self {
         let entries = self.put_entries(indices.into_indices());
-        self.in_place(
-            &[Some(values)],
-            false,
-            || {
-                check_index_put_target(self, &entries, values);
-                (self.index_put_tensors(&entries, values, accumulate), ())
-            },
-            |original, ()| {
-                crate::autograd::formulas::index_put(original, &entries, values, accumulate, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(values)]);
+        let computed = {
+            check_index_put_target(self, &entries, values);
+            (self.index_put_tensors(&entries, values, accumulate), ())
+        };
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            crate::autograd::formulas::index_put(original, &entries, values, accumulate, self)
+        })
     }
 
     /// A copy of `self` with `values` written into the elements that advanced indexing with
@@ -503,6 +505,7 @@ impl Tensor {
     /// Panics on items other than tensors, `..` and one [`Ellipsis`], without a tensor, on
     /// zero-dimensional masks, if the indices are invalid as in `index`, or if `values` doesn't
     /// have the dtype, device or a shape as described.
+    #[track_caller]
     pub fn index_put(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> Tensor {
         let entries = self.put_entries(indices.into_indices());
         self.index_put_tensors(&entries, values, accumulate)
@@ -511,6 +514,7 @@ impl Tensor {
     /// The entries for the advanced indexing core from the items of `index_put` and
     /// `index_put_`: tensors as they are, `..` as `None`, an ellipsis as `None` for every
     /// dimension it stands for, without trailing `None`s.
+    #[track_caller]
     fn put_entries(&self, items: Vec<TensorIndex>) -> Vec<Option<Tensor>> {
         let mut entries: Vec<Option<Option<Tensor>>> = vec![];
         let mut ellipses = 0;
@@ -572,6 +576,7 @@ impl Tensor {
 
     /// The slices along `dim` at the positions in the flat `i64` tensor `index`, without
     /// recording anything for autograd: the callers record their own node.
+    #[track_caller]
     fn select_positions(&self, dim: usize, index: &Tensor, allow_negative: bool) -> Tensor {
         let (src, idx) = (self.data(), index.data());
         let device = crate::ops::common_device([&src, &idx]);
@@ -586,6 +591,7 @@ impl Tensor {
 
     /// The slices along `dim` at the positions in the 1-D integer tensor `index`
     /// (`torch.index_select`).
+    #[track_caller]
     pub fn index_select(&self, dim: i64, index: &Tensor) -> Tensor {
         if index.num_dims() > 1 {
             panic!("index_select(): Index is supposed to be a vector");

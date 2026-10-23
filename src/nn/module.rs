@@ -145,6 +145,7 @@ pub trait Module: Member {
 
     /// The parameters of the module tree with their keys, each tensor once
     /// (`named_parameters()`).
+    #[track_caller]
     fn named_parameters(&self) -> Vec<(String, Parameter)> {
         let mut out = vec![];
         walk(self, true, &mut |item| {
@@ -156,6 +157,7 @@ pub trait Module: Member {
     }
 
     /// The parameters of the module tree, each tensor once (`parameters()`).
+    #[track_caller]
     fn parameters(&self) -> Vec<Parameter> {
         self.named_parameters()
             .into_iter()
@@ -165,6 +167,7 @@ pub trait Module: Member {
 
     /// The buffers of the module tree with their keys, each tensor once, including
     /// non-persistent ones (`named_buffers()`).
+    #[track_caller]
     fn named_buffers(&self) -> Vec<(String, Tensor)> {
         let mut out = vec![];
         walk(self, true, &mut |item| {
@@ -176,12 +179,14 @@ pub trait Module: Member {
     }
 
     /// The buffers of the module tree, each tensor once (`buffers()`).
+    #[track_caller]
     fn buffers(&self) -> Vec<Tensor> {
         self.named_buffers().into_iter().map(|(_, t)| t).collect()
     }
 
     /// The modules of the tree with their keys, starting with this one under the key `""`, then
     /// each submodule before its own submodules; a shared submodule once (`named_modules()`).
+    #[track_caller]
     fn named_modules(&self) -> Vec<(String, &dyn Module)> {
         let mut out = vec![];
         walk(self, true, &mut |item| {
@@ -193,6 +198,7 @@ pub trait Module: Member {
     }
 
     /// The direct submodules with their names; a shared submodule once (`named_children()`).
+    #[track_caller]
     fn named_children(&self) -> Vec<(String, &dyn Module)> {
         let mut members = Members::default();
         self.visit(&mut members);
@@ -211,6 +217,7 @@ pub trait Module: Member {
     }
 
     /// The direct submodules; a shared submodule once (`children()`).
+    #[track_caller]
     fn children(&self) -> Vec<&dyn Module> {
         self.named_children().into_iter().map(|(_, m)| m).collect()
     }
@@ -221,6 +228,7 @@ pub trait Module: Member {
     /// The values share the storage of the parameters and buffers, so they show later updates;
     /// they are new tensors without history that don't require grad, like PyTorch's. Use
     /// [`Tensor::deep_clone`] on them for a snapshot.
+    #[track_caller]
     fn state_dict(&self) -> StateDict {
         entries(self)
             .into_iter()
@@ -254,6 +262,7 @@ pub trait Module: Member {
     /// # Errors
     ///
     /// Returns a [`LoadError`] listing every problem found; nothing has been written then.
+    #[track_caller]
     fn load_state_dict(
         &self,
         state_dict: &StateDict,
@@ -288,6 +297,7 @@ pub trait Module: Member {
     /// the device (out of the meta device, which has no data) or would be too large, if a tensor
     /// to convert is a view or has a history, or if its `.grad` has a history (clear it with
     /// [`set_grad(None)`](Tensor::set_grad) first; PyTorch converts such gradients).
+    #[track_caller]
     fn to(&self, options: impl Into<TensorOptions>)
     where
         Self: Sized,
@@ -296,16 +306,19 @@ pub trait Module: Member {
     }
 
     /// Sets every [`Training`] flag in the module tree to training mode (`train()`).
+    #[track_caller]
     fn train(&self) {
         set_training(self, true);
     }
 
     /// Sets every [`Training`] flag in the module tree to evaluation mode (`eval()`).
+    #[track_caller]
     fn eval(&self) {
         set_training(self, false);
     }
 
     /// Clears the gradient of every parameter (`zero_grad()`, which sets them to `None`).
+    #[track_caller]
     fn zero_grad(&self) {
         for p in self.parameters() {
             p.set_grad(None);
@@ -317,6 +330,7 @@ pub trait Module: Member {
     /// # Panics
     ///
     /// Like [`Tensor::requires_grad_`], for each parameter in turn.
+    #[track_caller]
     fn requires_grad_(&self, requires_grad: bool) {
         for p in self.parameters() {
             p.requires_grad_(requires_grad);
@@ -372,6 +386,7 @@ enum Item<'a> {
 /// # Panics
 ///
 /// Panics if names are invalid or the tree has a cycle through shared submodules.
+#[track_caller]
 fn walk<'a, M: Member + ?Sized>(root: &'a M, dedup: bool, emit: &mut dyn FnMut(Item<'a>)) {
     let mut members = Members::default();
     root.visit_as("", &mut members);
@@ -399,6 +414,7 @@ struct Walk<'a, 'e> {
 impl<'a> Walk<'a, '_> {
     /// Visits the members of the module with key `prefix`. The names of the root's members (the
     /// root itself, normally) are not checked: the root is named `""`.
+    #[track_caller]
     fn level(&mut self, prefix: &str, members: Vec<(String, Entry<'a>)>, root: bool) {
         if !root {
             check_names(&members);
@@ -456,6 +472,7 @@ impl<'a> Walk<'a, '_> {
 
 /// Panics with PyTorch's messages if a name is empty or contains `.`, or if two members share a
 /// name.
+#[track_caller]
 fn check_names(members: &[(String, Entry<'_>)]) {
     let mut seen = HashSet::new();
     for (name, member) in members {
@@ -481,6 +498,7 @@ fn check_names(members: &[(String, Entry<'_>)]) {
 }
 
 /// The parameters and persistent buffers of the tree by key, every path.
+#[track_caller]
 fn entries<M: Member + ?Sized>(module: &M) -> Vec<(String, &Tensor)> {
     let mut out = vec![];
     walk(module, false, &mut |item| match item {
@@ -491,6 +509,7 @@ fn entries<M: Member + ?Sized>(module: &M) -> Vec<(String, &Tensor)> {
     out
 }
 
+#[track_caller]
 fn set_training<M: Member + ?Sized>(module: &M, training: bool) {
     walk(module, true, &mut |item| {
         if let Item::Training(t) = item {
@@ -499,6 +518,7 @@ fn set_training<M: Member + ?Sized>(module: &M, training: bool) {
     });
 }
 
+#[track_caller]
 fn load<M: Member + ?Sized>(
     module: &M,
     state_dict: &StateDict,
@@ -560,6 +580,7 @@ fn load<M: Member + ?Sized>(
     })
 }
 
+#[track_caller]
 fn convert<M: Member + ?Sized>(module: &M, options: TensorOptions) {
     if let Some(dtype) = options.dtype
         && !dtype.is_floating_point()
@@ -589,31 +610,12 @@ fn convert<M: Member + ?Sized>(module: &M, options: TensorOptions) {
         if (dtype, device) == (data.dtype, data.device()) {
             continue;
         }
-        let fail = |why: &str| -> ! { panic!("Module::to can't convert {kind} {key:?}: {why}") };
-        let check = |data: &TensorData| {
-            if let Some(e) = conversion_error(data.device(), device) {
-                fail(&e);
-            }
-            if let Err(e) = checked_nbytes(&data.layout.shape, dtype) {
-                fail(&e);
-            }
+        // The check returns the reason, so that the panic happens here, in a function with
+        // `#[track_caller]`.
+        let grad = match check_change(t, &data, device, dtype) {
+            Ok(grad) => grad,
+            Err(why) => panic!("Module::to can't convert {kind} {key:?}: {why}"),
         };
-        check(&data);
-        if t.view_info().is_some() || !t.is_leaf() {
-            fail("only a tensor that isn't a view and has no history can be converted in place");
-        }
-        // Taken now: a tensor converted earlier in the loop may be this one's `.grad`.
-        let grad = t.grad().map(|g| {
-            if !g.is_leaf() {
-                fail(
-                    "its .grad has a history; clear it with set_grad(None) before converting the \
-                     module",
-                );
-            }
-            let grad = g.data();
-            check(&grad);
-            (grad, g.requires_grad())
-        });
         changes.push((t, data, dtype, device, grad));
     }
     for (t, data, dtype, device, grad) in changes {
@@ -624,6 +626,43 @@ fn convert<M: Member + ?Sized>(module: &M, options: TensorOptions) {
         });
         crate::autograd::replace_leaf_data(t, convert_data(&data, dtype, device), grad);
     }
+}
+
+/// Why the tensor `t` with the data `data` can't be converted in place to `dtype` on `device`, or
+/// the data and `requires_grad` of its `.grad`, which is converted with it. Takes the `.grad` now:
+/// a tensor converted earlier may be this one's `.grad`.
+fn check_change(
+    t: &Tensor,
+    data: &TensorData,
+    device: Device,
+    dtype: DType,
+) -> Result<Option<(TensorData, bool)>, String> {
+    check_conversion(data, device, dtype)?;
+    if t.view_info().is_some() || !t.is_leaf() {
+        return Err(
+            "only a tensor that isn't a view and has no history can be converted in place".into(),
+        );
+    }
+    let Some(g) = t.grad() else {
+        return Ok(None);
+    };
+    if !g.is_leaf() {
+        return Err(
+            "its .grad has a history; clear it with set_grad(None) before converting the module"
+                .into(),
+        );
+    }
+    let grad = g.data();
+    check_conversion(&grad, device, dtype)?;
+    Ok(Some((grad, g.requires_grad())))
+}
+
+/// Why `data` can't be converted to `dtype` on `device`, except running out of memory.
+fn check_conversion(data: &TensorData, device: Device, dtype: DType) -> Result<(), String> {
+    if let Some(e) = conversion_error(data.device(), device) {
+        return Err(e);
+    }
+    checked_nbytes(&data.layout.shape, dtype).map(drop)
 }
 
 /// Reports the submodules that `T` reports under the identity of the `Arc` holding it.

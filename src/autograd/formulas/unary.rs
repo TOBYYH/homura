@@ -11,6 +11,7 @@ use crate::{DType, Tensor, where_};
 
 /// Records the backward node of `out = op(x)`. As in PyTorch, each node saves what its formula
 /// needs: the input, or the result where the derivative is a function of it.
+#[track_caller]
 pub(crate) fn unary(op: UnaryOp, x: &Tensor, out: &Tensor) {
     use UnaryOp::*;
     let inputs = [Some(x)];
@@ -192,6 +193,7 @@ impl Node for LogSigmoidBackward0 {
 /// When `g` or `x` requires grad (a backward pass with `create_graph`), the result is recorded as
 /// a node of its own with the reference's derivatives instead of differentiating the operations
 /// above.
+#[track_caller]
 fn log_sigmoid_backward(g: &Tensor, x: &Tensor) -> Tensor {
     let grad = {
         let _no_grad = crate::autograd::no_grad();

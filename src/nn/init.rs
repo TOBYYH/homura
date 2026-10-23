@@ -58,6 +58,7 @@ pub enum Nonlinearity {
 /// assert_eq!(calculate_gain(Nonlinearity::Relu, None), 2f64.sqrt());
 /// assert_eq!(calculate_gain(Nonlinearity::LeakyRelu, Some(1.0)), 1.0);
 /// ```
+#[track_caller]
 pub fn calculate_gain(nonlinearity: Nonlinearity, param: Option<f64>) -> f64 {
     use Nonlinearity::*;
     match nonlinearity {
@@ -80,6 +81,7 @@ pub fn calculate_gain(nonlinearity: Nonlinearity, param: Option<f64>) -> f64 {
 /// # Panics
 ///
 /// Panics if `tensor` has fewer than two dimensions.
+#[track_caller]
 pub fn calculate_fan_in_and_fan_out(tensor: &Tensor) -> (usize, usize) {
     let shape = tensor.shape();
     if shape.len() < 2 {
@@ -95,6 +97,7 @@ pub fn calculate_fan_in_and_fan_out(tensor: &Tensor) -> (usize, usize) {
 /// # Panics
 ///
 /// Panics like [`Tensor::uniform_`]: for integer and bool tensors, and for invalid bounds.
+#[track_caller]
 pub fn uniform_(tensor: &Tensor, a: f64, b: f64) -> &Tensor {
     let _no_grad = crate::no_grad();
     tensor.uniform_(a, b)
@@ -106,6 +109,7 @@ pub fn uniform_(tensor: &Tensor, a: f64, b: f64) -> &Tensor {
 /// # Panics
 ///
 /// Panics like [`Tensor::normal_`]: for integer and bool tensors, and for a negative `std`.
+#[track_caller]
 pub fn normal_(tensor: &Tensor, mean: f64, std: f64) -> &Tensor {
     let _no_grad = crate::no_grad();
     tensor.normal_(mean, std)
@@ -116,23 +120,27 @@ pub fn normal_(tensor: &Tensor, mean: f64, std: f64) -> &Tensor {
 /// # Panics
 ///
 /// Panics if `value` overflows the dtype of `tensor`, as [`Tensor::fill_`] describes.
+#[track_caller]
 pub fn constant_(tensor: &Tensor, value: impl Into<Scalar>) -> &Tensor {
     let _no_grad = crate::no_grad();
     tensor.fill_(value)
 }
 
 /// Fills `tensor` with ones.
+#[track_caller]
 pub fn ones_(tensor: &Tensor) -> &Tensor {
     constant_(tensor, 1)
 }
 
 /// Fills `tensor` with zeros.
+#[track_caller]
 pub fn zeros_(tensor: &Tensor) -> &Tensor {
     let _no_grad = crate::no_grad();
     tensor.zero_()
 }
 
 /// The standard deviation `gain / √fan` of the Kaiming initializations.
+#[track_caller]
 fn kaiming_std(tensor: &Tensor, a: f64, mode: FanMode, nonlinearity: Nonlinearity) -> f64 {
     let (fan_in, fan_out) = calculate_fan_in_and_fan_out(tensor);
     let fan = match mode {
@@ -152,6 +160,7 @@ fn kaiming_std(tensor: &Tensor, a: f64, mode: FanMode, nonlinearity: Nonlinearit
 /// # Panics
 ///
 /// Panics if `tensor` has elements and fewer than two dimensions, or isn't floating point.
+#[track_caller]
 pub fn kaiming_uniform_(
     tensor: &Tensor,
     a: f64,
@@ -175,6 +184,7 @@ pub fn kaiming_uniform_(
 /// # Panics
 ///
 /// Panics if `tensor` has elements and fewer than two dimensions, or isn't floating point.
+#[track_caller]
 pub fn kaiming_normal_(
     tensor: &Tensor,
     a: f64,
@@ -189,6 +199,7 @@ pub fn kaiming_normal_(
 }
 
 /// The standard deviation `gain × √(2 / (fan_in + fan_out))` of the Xavier initializations.
+#[track_caller]
 fn xavier_std(tensor: &Tensor, gain: f64) -> f64 {
     let (fan_in, fan_out) = calculate_fan_in_and_fan_out(tensor);
     if fan_in + fan_out == 0 {
@@ -208,6 +219,7 @@ fn xavier_std(tensor: &Tensor, gain: f64) -> f64 {
 ///
 /// Panics if `tensor` has fewer than two dimensions or both fans are zero, also without elements,
 /// if it isn't floating point, or for a negative or infinite `gain`, like [`uniform_`].
+#[track_caller]
 pub fn xavier_uniform_(tensor: &Tensor, gain: f64) -> &Tensor {
     let a = 3f64.sqrt() * xavier_std(tensor, gain);
     uniform_(tensor, -a, a)
@@ -221,6 +233,7 @@ pub fn xavier_uniform_(tensor: &Tensor, gain: f64) -> &Tensor {
 /// Panics if `tensor` has fewer than two dimensions or both fans are zero, also without elements,
 /// if it isn't floating point, or for a negative or NaN `gain`, like [`normal_`] (an infinite
 /// `gain` gives an infinite standard deviation, which [`normal_`] takes).
+#[track_caller]
 pub fn xavier_normal_(tensor: &Tensor, gain: f64) -> &Tensor {
     let std = xavier_std(tensor, gain);
     normal_(tensor, 0.0, std)

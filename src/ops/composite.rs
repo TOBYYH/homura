@@ -6,6 +6,7 @@ use crate::backend::cpu;
 use crate::shape::normalize_dim;
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
+#[track_caller]
 fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     let src = x.data();
     if !src.dtype.is_floating_point() {
@@ -41,6 +42,7 @@ enum Coefficients {
 ///
 /// Panics if the value doesn't fit in `dtype`. For floating point dtypes only `addr` checks this,
 /// and lets infinities and NaN through.
+#[track_caller]
 fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scalar {
     if rule == Coefficients::Strict {
         if matches!(s, Scalar::Bool(_)) && dtype != DType::Bool {
@@ -55,14 +57,17 @@ fn coefficient(s: Scalar, dtype: DType, name: &str, rule: Coefficients) -> Scala
     if rule == Coefficients::Truncate && dtype.is_floating_point() {
         return s;
     }
-    s.checked_to(dtype)
-        .unwrap_or_else(|| panic!("{name}={s} cannot be converted to {dtype} without overflow"))
+    match s.checked_to(dtype) {
+        Some(s) => s,
+        None => panic!("{name}={s} cannot be converted to {dtype} without overflow"),
+    }
 }
 
 /// Checks the `input` of an `add*` operation against its result of `shape`, which has the dtype
 /// and device of `factor`, before anything is computed: `input` must have that dtype and device
 /// and broadcast to the shape, whatever `beta` is. Returns the coefficients converted to the
 /// dtype, see [`coefficient`].
+#[track_caller]
 fn check_input(
     input: &Tensor,
     factor: &Tensor,
@@ -107,6 +112,7 @@ fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> T
 /// # Panics
 ///
 /// Panics if the value doesn't fit in `ty`.
+#[track_caller]
 fn converted(s: Scalar, ty: DType, name: &str) -> Scalar {
     let v = s.to_f64();
     if v.is_finite() && v.abs() > ty.float_max() {
@@ -151,16 +157,17 @@ enum Kernel {
 ///   several batches drops `beta` when `alpha` is zero. homura's values don't depend on the
 ///   layout and don't follow either.
 /// - integers: the product in the dtype, scaled with wrapping arithmetic.
+#[track_caller]
 fn scaled_matrix_product(
     input: &Tensor,
     (x, y): (&Tensor, &Tensor),
     coefficients: (Scalar, Scalar),
     kernel: Kernel,
-    product: impl Fn(&Tensor, &Tensor) -> Tensor,
+    product: Product,
 ) -> Tensor {
     let device = common_device([&x.data(), &y.data()]);
     let meta = |t: &Tensor| Tensor::empty_on(t.shape(), t.dtype(), Device::Meta);
-    let shape = product(&meta(x), &meta(y)).shape();
+    let shape = product.apply(&meta(x), &meta(y)).shape();
     let dtype = x.dtype();
     let (beta, alpha) = check_input(input, x, &shape, coefficients, Coefficients::Truncate);
     let (beta, alpha) = if dtype.is_floating_point() {
@@ -183,10 +190,32 @@ fn scaled_matrix_product(
             }
         }
         DType::F16 | DType::BF16 => {
-            let p = product(&x.to(DType::F32), &y.to(DType::F32));
+            let p = product.apply(&x.to(DType::F32), &y.to(DType::F32));
             scaled_sum(&input.to(DType::F32), p, beta, alpha).to(dtype)
         }
-        _ => scaled_sum(input, product(x, y), beta, alpha),
+        _ => scaled_sum(input, product.apply(x, y), beta, alpha),
+    }
+}
+
+/// The product of a scaled matrix product. An enum rather than a closure, so that a shape
+/// mismatch found by `matmul` reports the caller's location (`#[track_caller]` doesn't pass
+/// through closures).
+#[derive(Clone, Copy)]
+enum Product {
+    /// `x @ y`.
+    Matmul,
+    /// `(x @ y).sum(0)` of batches: integer sums are computed in `I64`; casting back wraps exactly
+    /// like accumulating in the input dtype would.
+    SumOfMatmul,
+}
+
+impl Product {
+    #[track_caller]
+    fn apply(self, x: &Tensor, y: &Tensor) -> Tensor {
+        match self {
+            Product::Matmul => x.matmul(y),
+            Product::SumOfMatmul => x.matmul(y).sum_dim(0, false).to(x.dtype()),
+        }
     }
 }
 
@@ -197,27 +226,32 @@ fn scaled_matrix_product(
 /// scales `vec1` before the outer product, so a zero or tiny `alpha` doesn't turn a finite
 /// result into NaN or infinity. Integers and bools compute the outer product first, which gives
 /// the same values; a broadcast product rather than a matmul, which doesn't support bool.
+#[track_caller]
 fn addr_value(input: &Tensor, v1: &Tensor, v2: &Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
     let dtype = v1.dtype();
     let shape = Shape::new(&[v1.size(0), v2.size(0)]);
     let (beta, alpha) = check_input(input, v1, &shape, (beta, alpha), Coefficients::Strict);
-    let outer = |v1: Tensor| v1.unsqueeze(1).mul(v2.unsqueeze(0));
+    #[track_caller]
+    fn outer(v1: &Tensor, v2: &Tensor) -> Tensor {
+        v1.unsqueeze(1).mul(v2.unsqueeze(0))
+    }
     if !dtype.is_floating_point() {
-        return scaled_sum(input, outer(v1.clone()), beta, alpha);
+        return scaled_sum(input, outer(v1, v2), beta, alpha);
     }
     let (beta, alpha) = (
         converted(beta, dtype, "beta"),
         converted(alpha, dtype, "alpha"),
     );
-    let product = outer(scale(v1.clone(), alpha));
+    let product = outer(&scale(v1.clone(), alpha), v2);
     if beta.to_f64() == 0.0 {
         return product;
     }
     scale(input.clone(), beta).add(&product)
 }
 
-/// Computes `beta * input + alpha * product(x, y)` with `forward` in no-grad mode and records
-/// the node of the scaled product.
+/// Records the node of the scaled product `out = beta * input + alpha * product(x, y)`, which the
+/// caller computed in no-grad mode.
+#[track_caller]
 fn scaled_product(
     product: ScaledProduct,
     input: &Tensor,
@@ -225,16 +259,13 @@ fn scaled_product(
     y: &Tensor,
     beta: Scalar,
     alpha: Scalar,
-    forward: impl FnOnce() -> Tensor,
+    out: Tensor,
 ) -> Tensor {
-    let out = {
-        let _guard = crate::no_grad();
-        forward()
-    };
     crate::autograd::formulas::scaled_product(product, input, x, y, beta, alpha, &out);
     out
 }
 
+#[track_caller]
 fn check_dims(t: &Tensor, n: usize, what: &str) {
     if t.num_dims() != n {
         panic!(
@@ -246,11 +277,13 @@ fn check_dims(t: &Tensor, n: usize, what: &str) {
 
 impl Tensor {
     /// Softmax along `dim`, computed stably by subtracting the maximum first.
+    #[track_caller]
     pub fn softmax(&self, dim: i64) -> Tensor {
         softmax_op(self, dim, false)
     }
 
     /// Logarithm of the softmax along `dim`, computed stably.
+    #[track_caller]
     pub fn log_softmax(&self, dim: i64) -> Tensor {
         softmax_op(self, dim, true)
     }
@@ -273,6 +306,7 @@ impl Tensor {
     /// fit in the type the coefficients are taken in for floating point inputs, as PyTorch's
     /// kernels do: f32 for `F16`, `BF16` and `F32` (`F64` for `F64`) in `addmm`, `baddbmm` and
     /// `addbmm`, the input dtype itself in `addmv`.
+    #[track_caller]
     pub fn addmm(
         &self,
         mat1: &Tensor,
@@ -283,14 +317,22 @@ impl Tensor {
         check_dims(mat1, 2, "mat1");
         check_dims(mat2, 2, "mat2");
         let (beta, alpha) = (beta.into(), alpha.into());
-        scaled_product(ScaledProduct::Mm, self, mat1, mat2, beta, alpha, || {
-            scaled_matrix_product(self, (mat1, mat2), (beta, alpha), Kernel::Gemm, |a, b| {
-                a.matmul(b)
-            })
-        })
+        let out = {
+            let _guard = crate::no_grad();
+            let coefficients = (beta, alpha);
+            scaled_matrix_product(
+                self,
+                (mat1, mat2),
+                coefficients,
+                Kernel::Gemm,
+                Product::Matmul,
+            )
+        };
+        scaled_product(ScaledProduct::Mm, self, mat1, mat2, beta, alpha, out)
     }
 
     /// `beta * self + alpha * (mat @ vec)` for a 2-D `mat` and a 1-D `vec`.
+    #[track_caller]
     pub fn addmv(
         &self,
         mat: &Tensor,
@@ -301,11 +343,18 @@ impl Tensor {
         check_dims(mat, 2, "mat");
         check_dims(vec, 1, "vec");
         let (beta, alpha) = (beta.into(), alpha.into());
-        scaled_product(ScaledProduct::Mv, self, mat, vec, beta, alpha, || {
-            scaled_matrix_product(self, (mat, vec), (beta, alpha), Kernel::Gemv, |a, b| {
-                a.matmul(b)
-            })
-        })
+        let out = {
+            let _guard = crate::no_grad();
+            let coefficients = (beta, alpha);
+            scaled_matrix_product(
+                self,
+                (mat, vec),
+                coefficients,
+                Kernel::Gemv,
+                Product::Matmul,
+            )
+        };
+        scaled_product(ScaledProduct::Mv, self, mat, vec, beta, alpha, out)
     }
 
     /// `beta * self + alpha * outer(vec1, vec2)` for 1-D `vec1` and `vec2`.
@@ -317,6 +366,7 @@ impl Tensor {
     ///
     /// Panics if a coefficient doesn't fit in the result dtype, is a floating point number for
     /// integer or bool inputs, or is a bool for non-bool inputs, as PyTorch does.
+    #[track_caller]
     pub fn addr(
         &self,
         vec1: &Tensor,
@@ -339,12 +389,15 @@ impl Tensor {
         let (input, v1, v2) = (self.to(dtype), vec1.to(dtype), vec2.to(dtype));
         let (beta, alpha) = (beta.into(), alpha.into());
         // Cast before multiplication so a wider self also widens the product computation.
-        scaled_product(ScaledProduct::Outer, &input, &v1, &v2, beta, alpha, || {
+        let out = {
+            let _guard = crate::no_grad();
             addr_value(&input, &v1, &v2, beta, alpha)
-        })
+        };
+        scaled_product(ScaledProduct::Outer, &input, &v1, &v2, beta, alpha, out)
     }
 
     /// `beta * self + alpha * (batch1 @ batch2)` for 3-D `batch1` and `batch2`.
+    #[track_caller]
     pub fn baddbmm(
         &self,
         batch1: &Tensor,
@@ -362,26 +415,16 @@ impl Tensor {
             );
         }
         let (beta, alpha) = (beta.into(), alpha.into());
-        scaled_product(
-            ScaledProduct::Bmm,
-            self,
-            batch1,
-            batch2,
-            beta,
-            alpha,
-            || {
-                scaled_matrix_product(
-                    self,
-                    (batch1, batch2),
-                    (beta, alpha),
-                    Kernel::Gemm,
-                    |a, b| a.matmul(b),
-                )
-            },
-        )
+        let out = {
+            let _guard = crate::no_grad();
+            let (batches, coefficients) = ((batch1, batch2), (beta, alpha));
+            scaled_matrix_product(self, batches, coefficients, Kernel::Gemm, Product::Matmul)
+        };
+        scaled_product(ScaledProduct::Bmm, self, batch1, batch2, beta, alpha, out)
     }
 
     /// `beta * self + alpha * sum_i (batch1[i] @ batch2[i])` for 3-D `batch1` and `batch2`.
+    #[track_caller]
     pub fn addbmm(
         &self,
         batch1: &Tensor,
@@ -399,6 +442,17 @@ impl Tensor {
             );
         }
         let (beta, alpha) = (beta.into(), alpha.into());
+        let out = {
+            let _guard = crate::no_grad();
+            let (batches, coefficients) = ((batch1, batch2), (beta, alpha));
+            scaled_matrix_product(
+                self,
+                batches,
+                coefficients,
+                Kernel::Gemm,
+                Product::SumOfMatmul,
+            )
+        };
         scaled_product(
             ScaledProduct::SumBmm,
             self,
@@ -406,23 +460,12 @@ impl Tensor {
             batch2,
             beta,
             alpha,
-            || {
-                scaled_matrix_product(
-                    self,
-                    (batch1, batch2),
-                    (beta, alpha),
-                    Kernel::Gemm,
-                    |a, b| {
-                        // Integer sums are computed in `I64`; casting back wraps exactly like
-                        // accumulating in the input dtype would.
-                        a.matmul(b).sum_dim(0, false).to(a.dtype())
-                    },
-                )
-            },
+            out,
         )
     }
 
     /// `self + value * tensor1 * tensor2`.
+    #[track_caller]
     pub fn addcmul(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> Tensor {
         let value = value.into();
         let out = {
@@ -438,6 +481,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if both `tensor1` and `tensor2` are integer tensors, as PyTorch does.
+    #[track_caller]
     pub fn addcdiv(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> Tensor {
         if !tensor1.is_floating_point() && !tensor2.is_floating_point() {
             panic!(
@@ -456,6 +500,7 @@ impl Tensor {
 
     /// Linear interpolation `self + weight * (end - self)`, with `weight` a tensor or a scalar.
     /// Uses PyTorch's formula, which is exact at both ends.
+    #[track_caller]
     pub fn lerp(&self, end: &Tensor, weight: impl Into<Operand>) -> Tensor {
         let weight = weight.into();
         let out = {
@@ -482,32 +527,29 @@ impl Tensor {
     }
 
     /// In-place [`addcmul`](Tensor::addcmul).
+    #[track_caller]
     pub fn addcmul_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
         let value = value.into();
-        self.in_place(
-            &[Some(tensor1), Some(tensor2)],
-            false,
-            || (self.addcmul(tensor1, tensor2, value), ()),
-            |original, ()| {
-                crate::autograd::formulas::addcmul(original, tensor1, tensor2, value, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(tensor1), Some(tensor2)]);
+        let computed = (self.addcmul(tensor1, tensor2, value), ());
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            crate::autograd::formulas::addcmul(original, tensor1, tensor2, value, self)
+        })
     }
 
     /// In-place [`addcdiv`](Tensor::addcdiv).
+    #[track_caller]
     pub fn addcdiv_(&self, tensor1: &Tensor, tensor2: &Tensor, value: impl Into<Scalar>) -> &Self {
         let value = value.into();
-        self.in_place(
-            &[Some(tensor1), Some(tensor2)],
-            false,
-            || (self.addcdiv(tensor1, tensor2, value), ()),
-            |original, ()| {
-                crate::autograd::formulas::addcdiv(original, tensor1, tensor2, value, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(tensor1), Some(tensor2)]);
+        let computed = (self.addcdiv(tensor1, tensor2, value), ());
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            crate::autograd::formulas::addcdiv(original, tensor1, tensor2, value, self)
+        })
     }
 
     /// In-place [`lerp`](Tensor::lerp).
+    #[track_caller]
     pub fn lerp_(&self, end: &Tensor, weight: impl Into<Operand>) -> &Self {
         let weight = weight.into();
         let weight_tensor = match &weight {
@@ -516,11 +558,10 @@ impl Tensor {
         };
         // A tensor weight saves both endpoints for its own gradient.
         let saves_self = weight_tensor.is_some_and(Tensor::requires_grad);
-        self.in_place(
-            &[Some(end), weight_tensor],
-            saves_self,
-            || (self.lerp(end, weight.clone()), ()),
-            |original, ()| crate::autograd::formulas::lerp(original, end, &weight, self),
-        )
+        let begun = self.begin_in_place(&[Some(end), weight_tensor]);
+        let computed = (self.lerp(end, weight.clone()), ());
+        self.finish_in_place(begun, computed, saves_self, |original, ()| {
+            crate::autograd::formulas::lerp(original, end, &weight, self)
+        })
     }
 }

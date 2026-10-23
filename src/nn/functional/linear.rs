@@ -30,6 +30,7 @@ use crate::{Shape, Tensor};
 /// operations above: if `input` and `weight` have different dtypes, if the shapes don't fit, or
 /// if the bias can't be added (in the `addmm` paths, its dtype must be that of `input`; added in
 /// place, it must broadcast to the result and convert to its dtype).
+#[track_caller]
 pub fn linear(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Tensor {
     let (input_dims, weight_dims) = (input.num_dims(), weight.num_dims());
     if input_dims == 0 || weight_dims == 0 {

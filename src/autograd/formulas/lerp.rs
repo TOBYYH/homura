@@ -7,6 +7,7 @@ use crate::autograd::saved::SavedId;
 use crate::ops::Operand;
 use crate::{Scalar, Shape, Tensor};
 
+#[track_caller]
 pub(crate) fn lerp(x: &Tensor, end: &Tensor, weight: &Operand, out: &Tensor) {
     let shapes = [x.shape(), end.shape()];
     match weight {

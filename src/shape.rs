@@ -56,16 +56,19 @@ macro_rules! dim_vec_newtype {
 
         impl $name {
             /// Creates a value from a slice of dimension sizes.
+            #[track_caller]
             pub fn new(dims: &[usize]) -> Self {
                 $name(DimVec::from_slice(dims))
             }
 
             /// The values as a slice.
+            #[track_caller]
             pub fn as_slice(&self) -> &[usize] {
                 self.0.as_slice()
             }
 
             /// The values as a `Vec`.
+            #[track_caller]
             pub fn to_vec(&self) -> Vec<usize> {
                 self.as_slice().to_vec()
             }
@@ -183,11 +186,13 @@ dim_vec_newtype!(
 
 impl Shape {
     /// The shape of a zero-dimensional tensor.
+    #[track_caller]
     pub fn scalar() -> Self {
         Shape::new(&[])
     }
 
     /// Number of dimensions.
+    #[track_caller]
     pub fn num_dims(&self) -> usize {
         self.len()
     }
@@ -198,8 +203,12 @@ impl Shape {
     ///
     /// Panics if the shape is not representable: the product of its sizes, with zeros counted as
     /// ones, must be at most `isize::MAX`.
+    #[track_caller]
     pub fn num_elements(&self) -> usize {
-        checked_num_elements(self).unwrap_or_else(|| panic!("shape {self:?} has too many elements"))
+        match checked_num_elements(self) {
+            Some(n) => n,
+            None => panic!("shape {self:?} has too many elements"),
+        }
     }
 }
 
@@ -220,6 +229,7 @@ pub(crate) fn checked_num_elements(shape: &[usize]) -> Option<usize> {
 /// and `()` (zero-dimensional).
 pub trait IntoShape {
     /// Converts into a [`Shape`].
+    #[track_caller]
     fn into_shape(self) -> Shape;
 }
 
@@ -275,6 +285,7 @@ impl IntoShape for () {
 /// `expand`: `[i64; N]`, `&[i64]`, `Vec<i64>` or a [`Shape`].
 pub trait IntoShapeSpec {
     /// Converts into a list of sizes, where `-1` has an operation-specific meaning.
+    #[track_caller]
     fn into_shape_spec(self) -> Vec<i64>;
 }
 
@@ -318,11 +329,13 @@ impl IntoShapeSpec for &Shape {
 /// `&[i64]` or `Vec<i64>`.
 pub trait Dims {
     /// Converts into a list of dimension indices.
+    #[track_caller]
     fn into_dims(self) -> Vec<i64>;
 
     /// Whether this is a single dimension rather than a list. PyTorch records `squeeze(dim)` and
     /// `squeeze(dims)` with different backward nodes, and so does homura.
     #[doc(hidden)]
+    #[track_caller]
     fn is_single(&self) -> bool {
         false
     }
@@ -364,6 +377,7 @@ impl Dims for Vec<i64> {
 
 /// Wraps a possibly negative dimension index into `0..num_dims`. Zero-dimensional tensors accept
 /// `0` and `-1`, like PyTorch.
+#[track_caller]
 pub(crate) fn normalize_dim(dim: i64, num_dims: usize) -> usize {
     let n = num_dims.max(1) as i64;
     if dim < -n || dim >= n {
@@ -385,6 +399,7 @@ pub(crate) fn normalize_dim(dim: i64, num_dims: usize) -> usize {
 /// Panics if a dimension is out of range or appears twice. A zero-dimensional tensor accepts
 /// `0` and `-1` like a tensor with one dimension, so naming it twice (`[0, -1]`) is rejected
 /// too, as in PyTorch; its mask is still empty.
+#[track_caller]
 pub(crate) fn dims_mask(dims: &[i64], num_dims: usize) -> Vec<bool> {
     if dims.is_empty() {
         return vec![true; num_dims];
@@ -407,9 +422,10 @@ pub(crate) fn contiguous_strides(shape: &[usize]) -> Strides {
     let mut acc: usize = 1;
     for i in (0..shape.len()).rev() {
         strides[i] = acc;
-        acc = acc
-            .checked_mul(shape[i].max(1))
-            .unwrap_or_else(|| panic!("shape {shape:?} has too many elements"));
+        let Some(next) = acc.checked_mul(shape[i].max(1)) else {
+            panic!("shape {shape:?} has too many elements");
+        };
+        acc = next;
     }
     Strides::new(&strides)
 }
@@ -445,6 +461,7 @@ pub(crate) fn is_expandable_to(shape: &[usize], desired: &[usize]) -> bool {
 }
 
 /// The broadcast shape of `a` and `b` (NumPy rules).
+#[track_caller]
 pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Shape {
     let n = a.len().max(b.len());
     let mut out = vec![0; n];
@@ -474,10 +491,14 @@ pub(crate) fn broadcast_shapes(a: &[usize], b: &[usize]) -> Shape {
 }
 
 /// Resolves a shape spec with at most one `-1` against a number of elements.
+#[track_caller]
 pub(crate) fn infer_size(spec: &[i64], num_elements: usize) -> Shape {
-    let invalid = || -> ! {
-        panic!("shape '{spec:?}' is invalid for input of size {num_elements}");
-    };
+    // A macro, not a closure: `#[track_caller]` doesn't pass through closures.
+    macro_rules! invalid {
+        () => {
+            panic!("shape '{spec:?}' is invalid for input of size {num_elements}")
+        };
+    }
     let mut infer = None;
     let mut known: usize = 1;
     for (i, &d) in spec.iter().enumerate() {
@@ -489,20 +510,23 @@ pub(crate) fn infer_size(spec: &[i64], num_elements: usize) -> Shape {
         } else if d < 0 {
             panic!("invalid shape dimension {d}");
         } else {
-            known = known.checked_mul(d as usize).unwrap_or_else(|| invalid());
+            let Some(product) = known.checked_mul(d as usize) else {
+                invalid!();
+            };
+            known = product;
         }
     }
     let mut out: Vec<usize> = spec.iter().map(|&d| d.max(0) as usize).collect();
     match infer {
         Some(i) => {
             if known == 0 || !num_elements.is_multiple_of(known) {
-                invalid();
+                invalid!();
             }
             out[i] = num_elements / known;
         }
         None => {
             if known != num_elements {
-                invalid();
+                invalid!();
             }
         }
     }

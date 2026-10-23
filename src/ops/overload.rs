@@ -44,24 +44,28 @@ macro_rules! tensor_tensor {
     ($Trait:ident, $method:ident, $op:ident) => {
         impl $Trait<&Tensor> for &Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: &Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into())
             }
         }
         impl $Trait<Tensor> for &Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into())
             }
         }
         impl $Trait<&Tensor> for Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: &Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into())
             }
         }
         impl $Trait<Tensor> for Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into())
             }
@@ -73,12 +77,14 @@ macro_rules! tensor_scalar {
     ($Trait:ident, $method:ident, $op:ident) => {
         impl<S: Number> $Trait<S> for &Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: S) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into().into())
             }
         }
         impl<S: Number> $Trait<S> for Tensor {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: S) -> Tensor {
                 binary_op(BinaryOp::$op, self.into(), rhs.into().into())
             }
@@ -90,12 +96,14 @@ macro_rules! scalar_tensor {
     ($Trait:ident, $method:ident, $op:ident, $($s:ty),*) => {$(
         impl $Trait<&Tensor> for $s {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: &Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, Scalar::from(self).into(), rhs.into())
             }
         }
         impl $Trait<Tensor> for $s {
             type Output = Tensor;
+            #[track_caller]
             fn $method(self, rhs: Tensor) -> Tensor {
                 binary_op(BinaryOp::$op, Scalar::from(self).into(), rhs.into())
             }
@@ -106,6 +114,7 @@ macro_rules! scalar_tensor {
 macro_rules! assign {
     ($Trait:ident, $method:ident, $inplace:ident) => {
         impl<T: Into<Operand>> $Trait<T> for Tensor {
+            #[track_caller]
             fn $method(&mut self, rhs: T) {
                 self.$inplace(rhs);
             }
@@ -129,6 +138,7 @@ arith!(Div, div, Div, DivAssign, div_assign, div_);
 
 impl Neg for &Tensor {
     type Output = Tensor;
+    #[track_caller]
     fn neg(self) -> Tensor {
         Tensor::neg(self)
     }
@@ -136,6 +146,7 @@ impl Neg for &Tensor {
 
 impl Neg for Tensor {
     type Output = Tensor;
+    #[track_caller]
     fn neg(self) -> Tensor {
         Tensor::neg(&self)
     }

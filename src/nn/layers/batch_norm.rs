@@ -61,6 +61,7 @@ pub struct BatchNorm2d {
 impl BatchNorm2d {
     /// A layer for inputs with `num_features` channels (`nn.BatchNorm2d(num_features)`), with a
     /// weight and a bias, tracking running statistics.
+    #[track_caller]
     pub fn new(num_features: usize) -> BatchNorm2d {
         let c = [num_features];
         BatchNorm2d {
@@ -79,6 +80,7 @@ impl BatchNorm2d {
 
     /// This layer with `eps`, which is added to the variance (`eps=...`).
     #[must_use]
+    #[track_caller]
     pub fn eps(mut self, eps: f64) -> BatchNorm2d {
         self.eps = eps;
         self
@@ -87,6 +89,7 @@ impl BatchNorm2d {
     /// This layer with `momentum` (`momentum=...`): a number, or `None` for the cumulative
     /// average.
     #[must_use]
+    #[track_caller]
     pub fn momentum(mut self, momentum: impl Into<Option<f64>>) -> BatchNorm2d {
         self.momentum = momentum.into();
         self
@@ -98,6 +101,7 @@ impl BatchNorm2d {
     /// floating point members the layer has (see [`track_running_stats`](Self::track_running_stats));
     /// a parameter it has stays.
     #[must_use]
+    #[track_caller]
     pub fn affine(mut self, affine: bool) -> BatchNorm2d {
         if !affine {
             self.weight = None;
@@ -116,6 +120,7 @@ impl BatchNorm2d {
     /// layer with affine gets a bias of zeros if it has none, with the dtype and device of its
     /// weight; a layer without affine stays without one, as in PyTorch.
     #[must_use]
+    #[track_caller]
     pub fn bias(mut self, bias: bool) -> BatchNorm2d {
         if !bias {
             self.bias = None;
@@ -134,6 +139,7 @@ impl BatchNorm2d {
     /// the bias, the running mean, the running variance), or the default ones; the count is
     /// `I64` on that device. A buffer the layer has stays.
     #[must_use]
+    #[track_caller]
     pub fn track_running_stats(mut self, track_running_stats: bool) -> BatchNorm2d {
         self.track_running_stats = track_running_stats;
         if !track_running_stats {
@@ -169,6 +175,7 @@ impl BatchNorm2d {
 
     /// Sets the running statistics of a layer that tracks them to their initial values, like
     /// PyTorch: the mean to zeros, the variance to ones and the count to 0, in place.
+    #[track_caller]
     pub fn reset_running_stats(&self) {
         if self.track_running_stats {
             if let Some(mean) = &self.running_mean {
@@ -186,6 +193,7 @@ impl BatchNorm2d {
     /// Initializes the running statistics again with
     /// [`reset_running_stats`](BatchNorm2d::reset_running_stats), and the parameters, like
     /// PyTorch: the weight with ones and the bias with zeros.
+    #[track_caller]
     pub fn reset_parameters(&self) {
         self.reset_running_stats();
         if let Some(w) = &self.weight {
@@ -210,6 +218,7 @@ impl BatchNorm2d {
     /// momentum is `None` and the count is on the meta device, which has no value to read, or is
     /// 0 after counting (a count of -1 was loaded), which leaves the running statistics as they
     /// are, and as [`functional::batch_norm`].
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         let rank = input.num_dims();
         if rank != 4 {

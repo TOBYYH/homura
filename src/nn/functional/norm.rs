@@ -11,6 +11,7 @@ fn opmath(dtype: DType) -> DType {
 }
 
 /// Panics if `normalized_shape` is empty.
+#[track_caller]
 fn check_not_empty(normalized_shape: &[usize]) {
     if normalized_shape.is_empty() {
         panic!(
@@ -22,6 +23,7 @@ fn check_not_empty(normalized_shape: &[usize]) {
 
 /// Panics unless `input` ends with the dimensions `normalized_shape`; `star` is what PyTorch's
 /// message puts after the `*` of the expected shape.
+#[track_caller]
 fn check_input_shape(input: &Tensor, normalized_shape: &[usize], star: &str) {
     let shape = input.shape();
     if !shape.ends_with(normalized_shape) {
@@ -36,6 +38,7 @@ fn check_input_shape(input: &Tensor, normalized_shape: &[usize], star: &str) {
 }
 
 /// Panics unless the parameter `t` has the shape `normalized_shape`.
+#[track_caller]
 fn check_parameter(name: &str, t: Option<&Tensor>, normalized_shape: &[usize]) {
     if let Some(t) = t
         && t.shape()[..] != *normalized_shape
@@ -70,6 +73,7 @@ fn check_parameter(name: &str, t: Option<&Tensor>, normalized_shape: &[usize]) {
 /// With PyTorch's messages: if the dtypes differ, other than for a half precision input with
 /// `F32` parameters, if `normalized_shape` is empty, if a parameter doesn't have the shape
 /// `normalized_shape` or `input` doesn't end with it, and if `input` isn't floating point.
+#[track_caller]
 pub fn layer_norm(
     input: &Tensor,
     normalized_shape: impl IntoShape,
@@ -157,6 +161,7 @@ pub fn layer_norm(
 /// With PyTorch's messages: if `normalized_shape` is empty, if `weight` doesn't have the shape
 /// `normalized_shape`, if `input` doesn't end with it, if `input` isn't floating point, and like
 /// the multiplication by `weight` (which must not be complex).
+#[track_caller]
 pub fn rms_norm(
     input: &Tensor,
     normalized_shape: impl IntoShape,
@@ -216,6 +221,7 @@ impl Default for BatchNormOptions {
 }
 
 /// Panics unless the per-channel tensor `t` has `channels` elements.
+#[track_caller]
 fn check_channels(name: &str, t: Option<&Tensor>, channels: usize) {
     if let Some(t) = t
         && t.num_elements() != channels
@@ -281,6 +287,7 @@ fn check_channels(name: &str, t: Option<&Tensor>, channels: usize) {
 /// PyTorch writes element by element) or may share memory with `input`, `weight`, `bias` or each
 /// other (which PyTorch reads after writing them). Interleaved views of one buffer, such as
 /// its columns, count as sharing.
+#[track_caller]
 pub fn batch_norm(
     input: &Tensor,
     running_mean: Option<&Tensor>,

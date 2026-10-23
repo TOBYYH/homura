@@ -9,6 +9,7 @@ macro_rules! activation {
     ($layer:ty, |$s:ident, $x:ident| $body:expr) => {
         impl $layer {
             /// The activation of `input`; the result is a new tensor.
+            #[track_caller]
             pub fn forward(&self, input: &Tensor) -> Tensor {
                 let ($s, $x) = (self, input);
                 $body
@@ -53,12 +54,14 @@ pub struct Gelu {
 
 impl Gelu {
     /// The exact GELU (`nn.GELU()`).
+    #[track_caller]
     pub fn new() -> Gelu {
         Gelu::default()
     }
 
     /// This layer with `approximate` (`approximate='none'` or `'tanh'`).
     #[must_use]
+    #[track_caller]
     pub fn approximate(mut self, approximate: GeluApproximate) -> Gelu {
         self.approximate = approximate;
         self
@@ -101,6 +104,7 @@ pub struct Softmax {
 
 impl Softmax {
     /// Softmax along `dim`, which may be negative to count from the end.
+    #[track_caller]
     pub fn new(dim: i64) -> Softmax {
         Softmax { dim }
     }

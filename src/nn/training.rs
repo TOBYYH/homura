@@ -23,11 +23,13 @@ pub struct Training(AtomicBool);
 
 impl Training {
     /// Whether the module is in training mode.
+    #[track_caller]
     pub fn get(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 
     /// Sets the mode: training if `training` is true, evaluation otherwise.
+    #[track_caller]
     pub fn set(&self, training: bool) {
         self.0.store(training, Ordering::Relaxed);
     }

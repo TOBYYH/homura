@@ -49,6 +49,7 @@ fn philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
 }
 
 /// Seeds the global random number generator.
+#[track_caller]
 pub fn manual_seed(seed: u64) {
     let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
     g.seed = seed;
@@ -103,6 +104,7 @@ enum Dist {
 impl Dist {
     /// Panics if the parameters or the dtype are invalid. Runs before anything else, so rejected
     /// calls neither advance the generator nor behave differently on the meta device.
+    #[track_caller]
     fn validate(&self, dtype: DType) {
         match *self {
             Dist::Uniform(..) | Dist::Normal(..) if !dtype.is_floating_point() => {
@@ -237,6 +239,7 @@ fn sample_int(n: usize, low: i64, high: i64) -> Vec<i64> {
 }
 
 /// Fills a new tensor with samples from `dist`.
+#[track_caller]
 fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tensor {
     dist.validate(dtype);
     if device == Device::Meta {
@@ -269,11 +272,13 @@ fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tens
 }
 
 /// Uniform samples from `[0, 1)` with the default dtype and device.
+#[track_caller]
 pub fn rand(shape: impl IntoShape) -> Tensor {
     rand_with(shape, TensorOptions::default())
 }
 
 /// [`rand`] with the given dtype and/or device.
+#[track_caller]
 pub fn rand_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     random_tensor(
@@ -285,11 +290,13 @@ pub fn rand_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Te
 }
 
 /// Samples from the standard normal distribution with the default dtype and device.
+#[track_caller]
 pub fn randn(shape: impl IntoShape) -> Tensor {
     randn_with(shape, TensorOptions::default())
 }
 
 /// [`randn`] with the given dtype and/or device.
+#[track_caller]
 pub fn randn_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     random_tensor(
@@ -307,11 +314,13 @@ pub fn randn_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> T
 /// Panics if the interval is empty or doesn't lie inside the range of the dtype. For floating
 /// point dtypes that range is the integers they represent exactly: `±2^11` for `F16`, `±2^8` for
 /// `BF16`, `±2^24` for `F32` and `±2^53` for `F64`.
+#[track_caller]
 pub fn randint(low: i64, high: i64, shape: impl IntoShape) -> Tensor {
     randint_with(low, high, shape, TensorOptions::default())
 }
 
 /// [`randint`] with the given dtype and/or device (the dtype defaults to `I64`).
+#[track_caller]
 pub fn randint_with(
     low: i64,
     high: i64,
@@ -324,11 +333,13 @@ pub fn randint_with(
 }
 
 /// [`rand`] with the shape, dtype and device of `t`.
+#[track_caller]
 pub fn rand_like(t: &Tensor) -> Tensor {
     rand_with(t.shape(), (t.dtype(), t.device()))
 }
 
 /// [`randn`] with the shape, dtype and device of `t`.
+#[track_caller]
 pub fn randn_like(t: &Tensor) -> Tensor {
     randn_with(t.shape(), (t.dtype(), t.device()))
 }
@@ -343,12 +354,14 @@ impl Tensor {
     ///
     /// Panics if `from > to`, or if `from`, `to` or `to - from` is not a finite value of the dtype
     /// of `self`, as PyTorch does.
+    #[track_caller]
     pub fn uniform_(&self, from: f64, to: f64) -> &Self {
         self.sample_(Dist::Uniform(from, to), "UniformBackward0")
     }
 
     /// Fills `self` with samples from a normal distribution. Recorded like
     /// [`uniform_`](Tensor::uniform_), as `NormalBackward0`.
+    #[track_caller]
     pub fn normal_(&self, mean: f64, std: f64) -> &Self {
         self.sample_(Dist::Normal(mean, std), "NormalBackward0")
     }
@@ -356,6 +369,7 @@ impl Tensor {
     /// Fills `self` with samples from `dist`, recorded as node `name`. Every check runs before
     /// the generator advances, so a rejected call leaves the random sequence unchanged too:
     /// autograd's, then the arguments, then whether `self` can be written.
+    #[track_caller]
     fn sample_(&self, dist: Dist, name: &'static str) -> &Self {
         let recorded = crate::autograd::check_in_place(self, &[]);
         dist.validate(self.dtype());

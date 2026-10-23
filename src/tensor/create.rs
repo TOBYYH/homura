@@ -71,9 +71,11 @@ pub trait NestedData {
     /// The element type.
     type Elem: Element;
     #[doc(hidden)]
+    #[track_caller]
     fn collect_shape(&self, shape: &mut Vec<usize>);
     /// Appends the values in row-major order, checking that the data has the given shape.
     #[doc(hidden)]
+    #[track_caller]
     fn collect_values(&self, shape: &[usize], out: &mut Vec<Self::Elem>);
 }
 
@@ -150,6 +152,7 @@ impl<U: NestedData + ?Sized> NestedData for &U {
     }
 }
 
+#[track_caller]
 fn nested_to_tensor<D: NestedData + ?Sized>(data: &D, device: Device) -> Tensor {
     let mut shape = vec![];
     data.collect_shape(&mut shape);
@@ -172,6 +175,7 @@ fn nested_to_tensor<D: NestedData + ?Sized>(data: &D, device: Device) -> Tensor 
 /// assert_eq!(homura::tensor([1, 2, 3]).dtype(), DType::I64);
 /// assert_eq!(homura::tensor([true, false]).dtype(), DType::Bool);
 /// ```
+#[track_caller]
 pub fn tensor<D: NestedData>(data: D) -> Tensor {
     let t = nested_to_tensor(&data, default_device());
     match D::Elem::DTYPE {
@@ -183,6 +187,7 @@ pub fn tensor<D: NestedData>(data: D) -> Tensor {
 
 /// [`tensor`] with an explicit dtype and/or device. Without a dtype, the element type's own
 /// dtype is used.
+#[track_caller]
 pub fn tensor_with<D: NestedData>(data: D, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     let t = nested_to_tensor(&data, o.device());
@@ -195,32 +200,38 @@ pub fn tensor_with<D: NestedData>(data: D, options: impl Into<TensorOptions>) ->
 impl Tensor {
     /// Creates a tensor of the given shape from a slice of values with the exact dtype of `T`,
     /// on the default device.
+    #[track_caller]
     pub fn from_slice<T: Element>(values: &[T], shape: impl IntoShape) -> Tensor {
         Tensor::from_host(values, shape.into_shape(), default_device())
     }
 
     /// Creates a tensor of the given shape from a vector, like [`Tensor::from_slice`].
+    #[track_caller]
     pub fn from_vec<T: Element>(values: Vec<T>, shape: impl IntoShape) -> Tensor {
         Tensor::from_slice(&values, shape)
     }
 
     /// A tensor of zeros with the dtype and device of `self`.
+    #[track_caller]
     pub fn new_zeros(&self, shape: impl IntoShape) -> Tensor {
         zeros_with(shape, (self.dtype(), self.device()))
     }
 
     /// A tensor of ones with the dtype and device of `self`.
+    #[track_caller]
     pub fn new_ones(&self, shape: impl IntoShape) -> Tensor {
         ones_with(shape, (self.dtype(), self.device()))
     }
 
     /// A tensor filled with `value` with the dtype and device of `self`.
+    #[track_caller]
     pub fn new_full(&self, shape: impl IntoShape, value: impl Into<Scalar>) -> Tensor {
         full_with(shape, value, (self.dtype(), self.device()))
     }
 }
 
 /// A tensor filled with `value`.
+#[track_caller]
 fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
     let value = crate::ops::fill_value(value, dtype, device);
     let t = Tensor::empty_on(shape, dtype, device);
@@ -237,11 +248,13 @@ fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
 }
 
 /// Zeros with the default dtype and device.
+#[track_caller]
 pub fn zeros(shape: impl IntoShape) -> Tensor {
     zeros_with(shape, TensorOptions::default())
 }
 
 /// Zeros with the given dtype and/or device.
+#[track_caller]
 pub fn zeros_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     filled(
@@ -253,11 +266,13 @@ pub fn zeros_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> T
 }
 
 /// Ones with the default dtype and device.
+#[track_caller]
 pub fn ones(shape: impl IntoShape) -> Tensor {
     ones_with(shape, TensorOptions::default())
 }
 
 /// Ones with the given dtype and/or device.
+#[track_caller]
 pub fn ones_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     filled(
@@ -270,6 +285,7 @@ pub fn ones_with(shape: impl IntoShape, options: impl Into<TensorOptions>) -> Te
 
 /// A tensor filled with `value`. The dtype follows the value: the default dtype for floats,
 /// `I64` for integers and `Bool` for booleans.
+#[track_caller]
 pub fn full(shape: impl IntoShape, value: impl Into<Scalar>) -> Tensor {
     full_with(shape, value, TensorOptions::default())
 }
@@ -279,6 +295,7 @@ pub fn full(shape: impl IntoShape, value: impl Into<Scalar>) -> Tensor {
 /// # Panics
 ///
 /// Panics if `value` overflows the dtype, as [`Tensor::fill_`] describes.
+#[track_caller]
 pub fn full_with(
     shape: impl IntoShape,
     value: impl Into<Scalar>,
@@ -294,21 +311,25 @@ pub fn full_with(
 }
 
 /// Zeros with the shape, dtype and device of `t`.
+#[track_caller]
 pub fn zeros_like(t: &Tensor) -> Tensor {
     t.new_zeros(t.shape())
 }
 
 /// Ones with the shape, dtype and device of `t`.
+#[track_caller]
 pub fn ones_like(t: &Tensor) -> Tensor {
     t.new_ones(t.shape())
 }
 
 /// `value` with the shape, dtype and device of `t`.
+#[track_caller]
 pub fn full_like(t: &Tensor, value: impl Into<Scalar>) -> Tensor {
     t.new_full(t.shape(), value)
 }
 
 /// A tensor from values computed in `f64` (floats) or `i64` (integers).
+#[track_caller]
 fn from_values(n: usize, dtype: DType, device: Device, f: impl Fn(usize) -> Scalar) -> Tensor {
     // Allocating first rejects sizes that are too large before computing any values.
     let t = Tensor::empty_on(Shape::new(&[n]), dtype, device);
@@ -323,17 +344,20 @@ fn from_values(n: usize, dtype: DType, device: Device, f: impl Fn(usize) -> Scal
 
 /// `[0, 1, ..., end)` on the default device; `I64` for an integer `end`, otherwise the default
 /// dtype.
+#[track_caller]
 pub fn arange(end: impl Into<Scalar>) -> Tensor {
     arange_step_with(0, end, 1, TensorOptions::default())
 }
 
 /// [`arange`] with the given dtype and/or device.
+#[track_caller]
 pub fn arange_with(end: impl Into<Scalar>, options: impl Into<TensorOptions>) -> Tensor {
     arange_step_with(0, end, 1, options)
 }
 
 /// `[start, start + step, ...)` up to (excluding) `end`. The dtype is `I64` when all arguments
 /// are integers, otherwise the default dtype.
+#[track_caller]
 pub fn arange_step(
     start: impl Into<Scalar>,
     end: impl Into<Scalar>,
@@ -343,6 +367,7 @@ pub fn arange_step(
 }
 
 /// [`arange_step`] with the given dtype and/or device.
+#[track_caller]
 pub fn arange_step_with(
     start: impl Into<Scalar>,
     end: impl Into<Scalar>,
@@ -395,11 +420,13 @@ pub fn arange_step_with(
 }
 
 /// `steps` evenly spaced values from `start` to `end` inclusive, with the default dtype.
+#[track_caller]
 pub fn linspace(start: f64, end: f64, steps: usize) -> Tensor {
     linspace_with(start, end, steps, TensorOptions::default())
 }
 
 /// [`linspace`] with the given dtype and/or device.
+#[track_caller]
 pub fn linspace_with(
     start: f64,
     end: f64,
@@ -423,11 +450,13 @@ pub fn linspace_with(
 }
 
 /// The `n × n` identity matrix with the default dtype.
+#[track_caller]
 pub fn eye(n: usize) -> Tensor {
     eye_with(n, TensorOptions::default())
 }
 
 /// [`eye`] with the given dtype and/or device.
+#[track_caller]
 pub fn eye_with(n: usize, options: impl Into<TensorOptions>) -> Tensor {
     let o = options.into();
     from_values(n * n, o.float_dtype(), o.device(), |i| {

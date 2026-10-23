@@ -26,6 +26,7 @@ fn reduce(loss: Tensor, reduction: Reduction) -> Tensor {
 
 /// Rejects a tensor argument that the reference doesn't differentiate when it requires grad in
 /// grad mode, as PyTorch's autograd layer does.
+#[track_caller]
 fn check_not_differentiable(function: &str, argument: &str, t: Option<&Tensor>) {
     if is_grad_enabled() && t.is_some_and(Tensor::requires_grad) {
         panic!(
@@ -51,17 +52,19 @@ fn check_not_differentiable(function: &str, argument: &str, t: Option<&Tensor>) 
 /// # Panics
 ///
 /// Panics if the shapes don't broadcast or the common dtype is not floating point.
+#[track_caller]
 pub fn mse_loss(input: &Tensor, target: &Tensor, reduction: Reduction) -> Tensor {
     let shape = broadcast_shapes(&input.shape(), &target.shape());
     // PyTorch's `broadcast_tensors`, which records an expansion only where the shape changes.
-    let expand = |t: &Tensor| {
-        if t.shape() == shape {
+    #[track_caller]
+    fn expand(t: &Tensor, shape: &Shape) -> Tensor {
+        if t.shape() == *shape {
             t.clone()
         } else {
-            t.expand(&shape)
+            t.expand(shape)
         }
-    };
-    let (input, target) = (expand(input), expand(target));
+    }
+    let (input, target) = (expand(input, &shape), expand(target, &shape));
     let dtype = promote_types(input.dtype(), target.dtype());
     if !dtype.is_floating_point() {
         panic!("mse_loss is not implemented for {dtype} tensors");
@@ -106,6 +109,7 @@ pub fn mse_loss(input: &Tensor, target: &Tensor, reduction: Reduction) -> Tensor
 /// as described, if `target` is not `I64` or `U8`, if `weight` doesn't have one element per class
 /// (`[C]`) or the dtype of `input`, if `weight` requires grad in grad mode, or if a target that
 /// isn't `ignore_index` is not a class (checked for CPU targets).
+#[track_caller]
 pub fn nll_loss(
     input: &Tensor,
     target: &Tensor,
@@ -148,17 +152,11 @@ pub fn nll_loss(
     let class_dim = if dims == 1 { 0 } else { 1 };
     let n_classes = shape[class_dim];
     let target_dims = target.num_dims();
-    let check_target_dtype = || {
-        let t = target.dtype();
-        if t != DType::I64 && t != DType::U8 {
-            panic!("expected target dtype to be i64 or u8, but got {t}");
-        }
-    };
     if !spatial {
         if target_dims > 1 {
             panic!("0D or 1D target tensor expected, multi-target not supported");
         }
-        check_target_dtype();
+        check_target_dtype(target);
         if dims == 1 && target_dims == 1 && target_shape[0] != 1 {
             panic!(
                 "For 1D input, 1D target must have size 1, but got target size: {}",
@@ -181,7 +179,7 @@ pub fn nll_loss(
                  dimension: {target_dims}"
             );
         }
-        check_target_dtype();
+        check_target_dtype(target);
         if weight.is_some_and(|w| w.num_elements() != n_classes) {
             panic!("weight tensor should be defined either for all or no classes");
         }
@@ -226,11 +224,16 @@ pub fn nll_loss(
             }
             .reshape(index.shape());
             // `nll_loss2d` takes a weight of any shape with one element per class.
-            let weights = weight.map(|w| {
-                w.reshape([-1])
-                    .index_select(0, &index.reshape([-1]))
-                    .reshape(index.shape())
-            });
+            // Not `Option::map`: a closure would lose the caller's location (`#[track_caller]`).
+            #[allow(clippy::manual_map)]
+            let weights = match weight {
+                Some(w) => Some(
+                    w.reshape([-1])
+                        .index_select(0, &index.reshape([-1]))
+                        .reshape(index.shape()),
+                ),
+                None => None,
+            };
             let losses = match &weights {
                 Some(w) => picked.neg().mul(w),
                 None => picked.neg(),
@@ -288,6 +291,7 @@ impl Default for CrossEntropyOptions {
     }
 }
 
+#[track_caller]
 fn check_label_smoothing(label_smoothing: f64) {
     if label_smoothing > 1.0 {
         panic!("label_smoothing must be between 0.0 and 1.0. Got: {label_smoothing}");
@@ -320,6 +324,7 @@ fn check_label_smoothing(label_smoothing: f64) {
 /// With PyTorch's messages: as [`nll_loss`] for class targets; if probability targets are not
 /// floating point, `ignore_index` is not negative for them, or their weight isn't `[C]`; if
 /// `label_smoothing` is greater than 1.
+#[track_caller]
 pub fn cross_entropy(input: &Tensor, target: &Tensor, options: CrossEntropyOptions) -> Tensor {
     let CrossEntropyOptions {
         weight,
@@ -387,6 +392,7 @@ fn class_shape(dims: usize, class_dim: usize, w: &Tensor) -> Shape {
     Shape::new(&shape)
 }
 
+#[track_caller]
 fn cross_entropy_probabilities(
     input: &Tensor,
     target: &Tensor,
@@ -464,6 +470,7 @@ fn cross_entropy_probabilities(
 /// `pos_weight` requires grad in grad mode, `input` isn't floating point, the weights don't
 /// broadcast to the shape of `input`, or a result can't be written in place in the dtype of
 /// `target` (an integer `target`).
+#[track_caller]
 pub fn binary_cross_entropy_with_logits(
     input: &Tensor,
     target: &Tensor,
@@ -498,4 +505,14 @@ pub fn binary_cross_entropy_with_logits(
     };
     formulas::binary_cross_entropy_with_logits(input, target, weight, pos_weight, reduction, &out);
     out
+}
+
+/// Panics unless the class indices of an NLL loss are `I64` or `U8` (a function, not a closure,
+/// so that the panic reports the caller's location).
+#[track_caller]
+fn check_target_dtype(target: &Tensor) {
+    let t = target.dtype();
+    if t != DType::I64 && t != DType::U8 {
+        panic!("expected target dtype to be i64 or u8, but got {t}");
+    }
 }

@@ -18,6 +18,7 @@ use crate::{Device, Shape, Tensor};
 /// let b = homura::tensor([[3, 4]]);
 /// assert_eq!(homura::concat(&[&a, &b], 0).shape(), [2, 2]);
 /// ```
+#[track_caller]
 pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     if tensors.is_empty() {
         panic!("concat(): expected a non-empty list of Tensors");
@@ -87,6 +88,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
 }
 
 /// Stacks tensors of the same shape along a new dimension `dim` (`torch.stack`).
+#[track_caller]
 pub fn stack<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     if tensors.is_empty() {
         panic!("stack expects a non-empty TensorList");
@@ -101,12 +103,16 @@ pub fn stack<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
         }
     }
     let dim = normalize_dim(dim, first.len() + 1) as i64;
-    let parts: Vec<Tensor> = tensors.iter().map(|t| t.borrow().unsqueeze(dim)).collect();
+    let mut parts = Vec::with_capacity(tensors.len());
+    for t in tensors {
+        parts.push(t.borrow().unsqueeze(dim));
+    }
     concat(&parts, dim)
 }
 
 impl Tensor {
     /// Splits into views of `split_size` elements along `dim`; the last one may be smaller.
+    #[track_caller]
     pub fn split(&self, split_size: usize, dim: i64) -> Vec<Tensor> {
         let d = normalize_dim(dim, self.num_dims());
         let size = self.shape()[d];
@@ -120,16 +126,17 @@ impl Tensor {
             );
         }
         let count = size.div_ceil(split_size).max(1);
-        (0..count)
-            .map(|i| {
-                let start = i * split_size;
-                self.narrow(dim, start as i64, split_size.min(size - start))
-            })
-            .collect()
+        let mut parts = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * split_size;
+            parts.push(self.narrow(dim, start as i64, split_size.min(size - start)));
+        }
+        parts
     }
 
     /// Splits into views with the given sizes along `dim`; the sizes must add up to the size of
     /// `dim`.
+    #[track_caller]
     pub fn split_with_sizes(&self, split_sizes: &[usize], dim: i64) -> Vec<Tensor> {
         let d = normalize_dim(dim, self.num_dims());
         let size = self.shape()[d];
@@ -143,19 +150,18 @@ impl Tensor {
             );
         }
         let mut start = 0;
-        split_sizes
-            .iter()
-            .map(|&n| {
-                let t = self.narrow(dim, start as i64, n);
-                start += n;
-                t
-            })
-            .collect()
+        let mut parts = Vec::with_capacity(split_sizes.len());
+        for &n in split_sizes {
+            parts.push(self.narrow(dim, start as i64, n));
+            start += n;
+        }
+        parts
     }
 
     /// Splits into `chunks` views of (almost) equal size along `dim`. Like PyTorch, fewer chunks
     /// may be returned when the size is not divisible, and an empty dimension gives `chunks`
     /// empty views.
+    #[track_caller]
     pub fn chunk(&self, chunks: usize, dim: i64) -> Vec<Tensor> {
         if chunks == 0 {
             panic!("chunk expects `chunks` to be greater than 0, got: 0");
@@ -163,11 +169,16 @@ impl Tensor {
         let size = self.size(dim);
         if size == 0 {
             // Like PyTorch: `chunks` distinct empty views rather than a single one.
-            return (0..chunks).map(|_| self.narrow(dim, 0, 0)).collect();
+            let mut parts = Vec::with_capacity(chunks);
+            for _ in 0..chunks {
+                parts.push(self.narrow(dim, 0, 0));
+            }
+            return parts;
         }
         self.split(size.div_ceil(chunks), dim)
     }
 
+    #[track_caller]
     fn triangle(&self, diagonal: i64, upper: bool) -> Tensor {
         let src = self.data();
         if src.layout.shape.len() < 2 {
@@ -186,18 +197,21 @@ impl Tensor {
 
     /// Keeps elements on and above the `diagonal`-th diagonal of the last two dimensions and
     /// zeroes the rest (`diagonal = 0` is the main diagonal, positive values are above it).
+    #[track_caller]
     pub fn triu(&self, diagonal: i64) -> Tensor {
         self.triangle(diagonal, true)
     }
 
     /// Keeps elements on and below the `diagonal`-th diagonal of the last two dimensions and
     /// zeroes the rest.
+    #[track_caller]
     pub fn tril(&self, diagonal: i64) -> Tensor {
         self.triangle(diagonal, false)
     }
 
     /// Tiles the tensor `repeats[i]` times along each dimension, returning a copy. `repeats` may
     /// have more entries than `self` has dimensions; leading dimensions are added.
+    #[track_caller]
     pub fn repeat(&self, repeats: impl IntoShape) -> Tensor {
         let repeats = repeats.into_shape();
         let shape = self.shape();
@@ -230,6 +244,7 @@ impl Tensor {
     }
 
     /// Reverses the order of elements along `dims`, returning a copy.
+    #[track_caller]
     pub fn flip(&self, dims: impl Dims) -> Tensor {
         let src = self.data();
         let dims = dims.into_dims();

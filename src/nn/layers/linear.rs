@@ -39,6 +39,7 @@ pub struct Linear {
 impl Linear {
     /// A layer from `in_features` inputs to `out_features` outputs, with a bias
     /// (`nn.Linear(in_features, out_features)`).
+    #[track_caller]
     pub fn new(in_features: usize, out_features: usize) -> Linear {
         let layer = Linear {
             weight: Parameter::new(crate::zeros([out_features, in_features])),
@@ -54,6 +55,7 @@ impl Linear {
     /// otherwise. A new bias is initialized like [`reset_parameters`](Linear::reset_parameters)
     /// does, with the dtype and device of the weights.
     #[must_use]
+    #[track_caller]
     pub fn bias(mut self, bias: bool) -> Linear {
         if !bias {
             self.bias = None;
@@ -68,6 +70,7 @@ impl Linear {
     /// [`kaiming_uniform_`](init::kaiming_uniform_)`(a = √5)`, which samples from
     /// `U(-1/√in_features, 1/√in_features)`, and the bias from the same distribution (zeros
     /// for zero `in_features`).
+    #[track_caller]
     pub fn reset_parameters(&self) {
         init::kaiming_uniform_(
             &self.weight,
@@ -91,6 +94,7 @@ impl Linear {
     }
 
     /// The output for `input`, whose last dimension has the input features.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::linear(input, &self.weight, self.bias.as_deref())
     }

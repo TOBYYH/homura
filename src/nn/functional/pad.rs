@@ -29,6 +29,7 @@ use crate::{Scalar, Tensor};
 ///
 /// With PyTorch's messages: if `pad` has odd length or more than two entries per dimension of
 /// `input`, if cropping would leave a negative size, or if `value` overflows the dtype.
+#[track_caller]
 pub fn pad(input: &Tensor, pad: &[i64], value: impl Into<Scalar>) -> Tensor {
     crate::ops::constant_pad_nd(input, pad, value.into())
 }

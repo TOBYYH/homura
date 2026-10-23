@@ -14,6 +14,7 @@ pub enum GeluApproximate {
     Tanh,
 }
 
+#[track_caller]
 fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
     use UnaryOp::*;
     let src = x.data();
@@ -57,67 +58,80 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
 
 impl Tensor {
     /// `-self`.
+    #[track_caller]
     pub fn neg(&self) -> Tensor {
         unary_op(UnaryOp::Neg, self)
     }
 
     /// Absolute value.
+    #[track_caller]
     pub fn abs(&self) -> Tensor {
         unary_op(UnaryOp::Abs, self)
     }
 
     /// The sign of each element: `-1`, `0` or `1` in the dtype of `self`. As in PyTorch, NaN and
     /// `-0.0` give `0.0`, and bool tensors are copied unchanged.
+    #[track_caller]
     pub fn sign(&self) -> Tensor {
         unary_op(UnaryOp::Sign, self)
     }
 
     /// `e^x`.
+    #[track_caller]
     pub fn exp(&self) -> Tensor {
         unary_op(UnaryOp::Exp, self)
     }
 
     /// Natural logarithm.
+    #[track_caller]
     pub fn log(&self) -> Tensor {
         unary_op(UnaryOp::Log, self)
     }
 
     /// Square root.
+    #[track_caller]
     pub fn sqrt(&self) -> Tensor {
         unary_op(UnaryOp::Sqrt, self)
     }
 
     /// `1 / sqrt(x)`.
+    #[track_caller]
     pub fn rsqrt(&self) -> Tensor {
         unary_op(UnaryOp::Rsqrt, self)
     }
 
     /// `1 / x`.
+    #[track_caller]
     pub fn reciprocal(&self) -> Tensor {
         unary_op(UnaryOp::Reciprocal, self)
     }
 
     /// Sine.
+    #[track_caller]
     pub fn sin(&self) -> Tensor {
         unary_op(UnaryOp::Sin, self)
     }
 
     /// Cosine.
+    #[track_caller]
     pub fn cos(&self) -> Tensor {
         unary_op(UnaryOp::Cos, self)
     }
 
     /// The error function `erf(x) = 2/√π ∫₀ˣ e^(−t²) dt`.
+    #[track_caller]
     pub fn erf(&self) -> Tensor {
         unary_op(UnaryOp::Erf, self)
     }
 
     /// Hyperbolic tangent.
+    #[track_caller]
     pub fn tanh(&self) -> Tensor {
         unary_op(UnaryOp::Tanh, self)
     }
 
     /// `1 / (1 + e^-x)`.
+    #[track_caller]
     pub fn sigmoid(&self) -> Tensor {
         unary_op(UnaryOp::Sigmoid, self)
     }
@@ -129,21 +143,25 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if `self` is not floating point, as in PyTorch.
+    #[track_caller]
     pub fn log_sigmoid(&self) -> Tensor {
         unary_op(UnaryOp::LogSigmoid, self)
     }
 
     /// `max(x, 0)`.
+    #[track_caller]
     pub fn relu(&self) -> Tensor {
         unary_op(UnaryOp::Relu, self)
     }
 
     /// `x * sigmoid(x)` (also known as swish).
+    #[track_caller]
     pub fn silu(&self) -> Tensor {
         unary_op(UnaryOp::Silu, self)
     }
 
     /// The Gaussian error linear unit, exact or with the tanh approximation.
+    #[track_caller]
     pub fn gelu(&self, approximate: GeluApproximate) -> Tensor {
         match approximate {
             GeluApproximate::None => unary_op(UnaryOp::Gelu, self),
@@ -152,6 +170,7 @@ impl Tensor {
     }
 
     /// Elementwise logical not as a `Bool` tensor; nonzero values count as true.
+    #[track_caller]
     pub fn logical_not(&self) -> Tensor {
         unary_op(UnaryOp::LogicalNot, self)
     }

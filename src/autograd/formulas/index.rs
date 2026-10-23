@@ -11,6 +11,7 @@ use crate::autograd::saved::SavedId;
 use crate::{Shape, Tensor};
 
 /// Records the backward node of `out = x.index_select(dim, index)`.
+#[track_caller]
 pub(crate) fn index_select(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |b| IndexSelectBackward0 {
         self_shape: x.shape(),
@@ -37,6 +38,7 @@ fn unpack_indices(ctx: &ApplyContext<'_>, indices: &[Option<SavedId>]) -> Vec<Op
 }
 
 /// Records the backward node of `out = x.index_tensors(indices)`, advanced indexing.
+#[track_caller]
 pub(crate) fn index(x: &Tensor, indices: &[Option<Tensor>], out: &Tensor) {
     record(&[Some(x)], &[out], |b| IndexBackward0 {
         self_shape: x.shape(),
@@ -45,6 +47,7 @@ pub(crate) fn index(x: &Tensor, indices: &[Option<Tensor>], out: &Tensor) {
 }
 
 /// Records the backward node of `out = x.index_put_tensors(indices, values, accumulate)`.
+#[track_caller]
 pub(crate) fn index_put(
     x: &Tensor,
     indices: &[Option<Tensor>],
@@ -61,6 +64,7 @@ pub(crate) fn index_put(
 
 /// Records the backward node of `out = x.index_add(dim, index, source)`. As in PyTorch, the index
 /// is saved only when `source` needs a gradient.
+#[track_caller]
 pub(crate) fn index_add(x: &Tensor, dim: usize, index: &Tensor, source: &Tensor, out: &Tensor) {
     record(&[Some(x), Some(source)], &[out], |b| IndexAddBackward0 {
         dim,
@@ -69,6 +73,7 @@ pub(crate) fn index_add(x: &Tensor, dim: usize, index: &Tensor, source: &Tensor,
 }
 
 /// Records the backward node of `out = x.gather(dim, index)`.
+#[track_caller]
 pub(crate) fn gather(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |b| GatherBackward0 {
         self_shape: x.shape(),
@@ -79,6 +84,7 @@ pub(crate) fn gather(x: &Tensor, dim: usize, index: &Tensor, out: &Tensor) {
 
 /// Records the backward node of `out = x.scatter_add(dim, index, src)`. As in PyTorch, the index
 /// is saved only when `src` needs a gradient.
+#[track_caller]
 pub(crate) fn scatter_add(x: &Tensor, dim: usize, index: &Tensor, src: &Tensor, out: &Tensor) {
     record(&[Some(x), Some(src)], &[out], |b| ScatterAddBackward0 {
         dim,
@@ -89,6 +95,7 @@ pub(crate) fn scatter_add(x: &Tensor, dim: usize, index: &Tensor, src: &Tensor, 
 
 /// Records the backward node of `out = x.select_scatter(src, dim, index)`, with `index` already
 /// wrapped.
+#[track_caller]
 pub(crate) fn select_scatter(x: &Tensor, src: &Tensor, dim: usize, index: usize, out: &Tensor) {
     record(&[Some(x), Some(src)], &[out], |_| SelectScatterBackward0 {
         src_shape: src.shape(),
@@ -99,6 +106,7 @@ pub(crate) fn select_scatter(x: &Tensor, src: &Tensor, dim: usize, index: usize,
 
 /// Records the backward node of `out = x.slice_scatter(src, dim, ..)`, with `start` and `end`
 /// already clamped into the dimension.
+#[track_caller]
 pub(crate) fn slice_scatter(
     x: &Tensor,
     src: &Tensor,

@@ -40,12 +40,14 @@ fn single_dim(dim: usize, num_dims: usize) -> Vec<bool> {
 }
 
 /// Records the backward node of `out = x.sum()`.
+#[track_caller]
 pub(crate) fn sum(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| SumBackward0 { self_shape });
 }
 
 /// Records the backward node of `out = x.sum_dim(dims, keepdim)`.
+#[track_caller]
 pub(crate) fn sum_dim(x: &Tensor, dims: &[i64], keepdim: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |_| {
         let self_shape = x.shape();
@@ -58,6 +60,7 @@ pub(crate) fn sum_dim(x: &Tensor, dims: &[i64], keepdim: bool, out: &Tensor) {
 }
 
 /// Records the backward node of `out = x.sum_to_size(..)`, when it computed a new tensor.
+#[track_caller]
 pub(crate) fn sum_to_size(x: &Tensor, out: &Tensor) {
     let self_shape = x.shape();
     record(&[Some(x)], &[out], |_| SumToSizeBackward0 { self_shape });
@@ -65,6 +68,7 @@ pub(crate) fn sum_to_size(x: &Tensor, out: &Tensor) {
 
 /// Records the backward node of `out = x.mean()`, or of `out = x.mean_dim(dims, keepdim)` when
 /// `dims` is `Some`.
+#[track_caller]
 pub(crate) fn mean(x: &Tensor, dims: Option<&[i64]>, keepdim: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |_| {
         let self_shape = x.shape();
@@ -88,6 +92,7 @@ pub(crate) fn mean(x: &Tensor, dims: Option<&[i64]>, keepdim: bool, out: &Tensor
 
 /// Records the backward node of `out = x.prod()`, or of `out = x.prod_dim(dim, keepdim)` with
 /// `dim` already wrapped when `dim` is `Some`.
+#[track_caller]
 pub(crate) fn prod(x: &Tensor, dim: Option<usize>, keepdim: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |b| ProdBackward {
         x: b.save(x),
@@ -100,6 +105,7 @@ pub(crate) fn prod(x: &Tensor, dim: Option<usize>, keepdim: bool, out: &Tensor) 
 }
 
 /// Records the backward node of `out = x.max()` or `out = x.min()`.
+#[track_caller]
 pub(crate) fn extremum(x: &Tensor, is_max: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |b| ExtremumBackward {
         name: if is_max {
@@ -115,6 +121,7 @@ pub(crate) fn extremum(x: &Tensor, is_max: bool, out: &Tensor) {
 /// Records the backward node of the `values` of `x.max_dim(dim, keepdim)` or
 /// `x.min_dim(dim, keepdim)`, with `dim` already wrapped. The `indices` are saved, but are not an
 /// output of the node: they never require grad.
+#[track_caller]
 pub(crate) fn extremum_dim(
     x: &Tensor,
     dim: usize,
@@ -142,6 +149,7 @@ pub(crate) fn extremum_dim(
 /// Records the backward node of `out = x.var(..)` or `out = x.std(..)` (`std`), over `dims`
 /// (`None` for the whole tensor). An empty list of dimensions, like a zero-dimensional input,
 /// reduces the whole tensor, and gets the whole tensor's gradient.
+#[track_caller]
 pub(crate) fn var_std(
     x: &Tensor,
     dims: Option<&[i64]>,

@@ -10,6 +10,7 @@ use crate::{Shape, Tensor};
 
 /// Records the backward node of `out`, the values of `max_pool2d_with_indices(x)` with the
 /// positions `indices`.
+#[track_caller]
 pub(crate) fn max_pool2d(x: &Tensor, indices: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |b| MaxPool2DWithIndicesBackward0 {
         input: b.save(x),
@@ -18,6 +19,7 @@ pub(crate) fn max_pool2d(x: &Tensor, indices: &Tensor, out: &Tensor) {
 }
 
 /// Records the backward node of `out = max_pool2d_backward(grad, input, indices)`.
+#[track_caller]
 pub(crate) fn max_pool2d_backward(grad: &Tensor, input: &Tensor, indices: &Tensor, out: &Tensor) {
     record(&[Some(grad), Some(input)], &[out], |b| {
         MaxPool2DWithIndicesBackwardBackward0 {
@@ -28,6 +30,7 @@ pub(crate) fn max_pool2d_backward(grad: &Tensor, input: &Tensor, indices: &Tenso
 }
 
 /// Records the backward node of `out = adaptive_avg_pool2d(x, ..)`, the windowed means.
+#[track_caller]
 pub(crate) fn adaptive_avg_pool2d(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |b| AdaptiveAvgPool2DBackward0 {
         input: b.save(x),
@@ -35,6 +38,7 @@ pub(crate) fn adaptive_avg_pool2d(x: &Tensor, out: &Tensor) {
 }
 
 /// Records the backward node of `out = adaptive_avg_pool2d_backward(grad, input)`.
+#[track_caller]
 pub(crate) fn adaptive_avg_pool2d_backward(grad: &Tensor, input: &Tensor, out: &Tensor) {
     let shape = grad.shape();
     let nd = shape.len();

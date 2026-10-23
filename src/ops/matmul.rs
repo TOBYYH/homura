@@ -19,6 +19,7 @@ impl Tensor {
     ///
     /// Panics if either operand is zero-dimensional, if the dtypes differ or if the inner
     /// dimensions don't match.
+    #[track_caller]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         let (a, b) = (self.data(), other.data());
         let device = common_device([&a, &b]);

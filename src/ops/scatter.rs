@@ -12,6 +12,7 @@ use crate::{DType, Device, Shape, Strides, Tensor};
 
 /// Panics unless `index` is an `i32` or `i64` tensor, the index dtypes of PyTorch's indexing
 /// operations.
+#[track_caller]
 fn check_index_dtype(op: &str, index: &TensorData) {
     if !matches!(index.dtype, DType::I32 | DType::I64) {
         panic!(
@@ -24,19 +25,19 @@ fn check_index_dtype(op: &str, index: &TensorData) {
 /// The values of `index` in row-major order, checked to be positions along a dimension `dim` of
 /// `size`. Negative values are out of range, as in PyTorch's `index_add`, `gather` and
 /// `scatter_add`. The meta device has no values to check: the result is empty there.
+#[track_caller]
 fn positions(index: &TensorData, dim: usize, size: usize) -> Vec<usize> {
     if index.device() != Device::Cpu {
         return vec![];
     }
-    cpu::read_host::<i64>(index)
-        .into_iter()
-        .map(|i| {
-            if !(0..size as i64).contains(&i) {
-                panic!("index {i} is out of bounds for dimension {dim} with size {size}");
-            }
-            i as usize
-        })
-        .collect()
+    let mut out = vec![];
+    for i in cpu::read_host::<i64>(index) {
+        if !(0..size as i64).contains(&i) {
+            panic!("index {i} is out of bounds for dimension {dim} with size {size}");
+        }
+        out.push(i as usize);
+    }
+    out
 }
 
 /// `data` with a zero-dimensional layout seen as a one-dimensional one of one element, as
@@ -78,6 +79,7 @@ impl Tensor {
     ///
     /// Panics if `self` is zero-dimensional, like [`index_select`](Tensor::index_select), if the
     /// shapes or dtypes don't match as described, or if a position is out of range.
+    #[track_caller]
     pub fn index_add(&self, dim: i64, index: &Tensor, source: &Tensor) -> Tensor {
         let (data, idx, src) = (self.data(), index.data(), source.data());
         let device = common_device([&data, &idx, &src]);
@@ -127,16 +129,14 @@ impl Tensor {
     }
 
     /// In-place [`index_add`](Tensor::index_add).
+    #[track_caller]
     pub fn index_add_(&self, dim: i64, index: &Tensor, source: &Tensor) -> &Self {
-        self.in_place(
-            &[Some(source)],
-            false,
-            || (self.index_add(dim, index, source), ()),
-            |original, ()| {
-                let d = normalize_dim(dim, self.num_dims());
-                formulas::index_add(original, d, index, source, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(source)]);
+        let computed = (self.index_add(dim, index, source), ());
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            let d = normalize_dim(dim, self.num_dims());
+            formulas::index_add(original, d, index, source, self)
+        })
     }
 
     /// Picks the elements along `dim` at the positions in `index` (`torch.gather`): for
@@ -157,6 +157,7 @@ impl Tensor {
     ///
     /// Panics if the shapes or dtypes don't match as described, or if a position is out of
     /// range.
+    #[track_caller]
     pub fn gather(&self, dim: i64, index: &Tensor) -> Tensor {
         let (data, idx) = (self.data(), index.data());
         let device = common_device([&data, &idx]);
@@ -203,6 +204,7 @@ impl Tensor {
     ///
     /// Panics if the shapes or dtypes don't match as described, or if a position is out of
     /// range.
+    #[track_caller]
     pub fn scatter_add(&self, dim: i64, index: &Tensor, src: &Tensor) -> Tensor {
         let (data, idx, source) = (self.data(), index.data(), src.data());
         let device = common_device([&data, &idx, &source]);
@@ -240,16 +242,14 @@ impl Tensor {
     }
 
     /// In-place [`scatter_add`](Tensor::scatter_add).
+    #[track_caller]
     pub fn scatter_add_(&self, dim: i64, index: &Tensor, src: &Tensor) -> &Self {
-        self.in_place(
-            &[Some(src)],
-            false,
-            || (self.scatter_add(dim, index, src), ()),
-            |original, ()| {
-                let d = normalize_dim(dim, self.num_dims());
-                formulas::scatter_add(original, d, index, src, self)
-            },
-        )
+        let begun = self.begin_in_place(&[Some(src)]);
+        let computed = (self.scatter_add(dim, index, src), ());
+        self.finish_in_place(begun, computed, false, |original, ()| {
+            let d = normalize_dim(dim, self.num_dims());
+            formulas::scatter_add(original, d, index, src, self)
+        })
     }
 
     /// A copy of `self` with the slice that `self.select(dim, index)` views replaced by `src`
@@ -265,6 +265,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics like `select` does, or if `src` doesn't have the shape of the slice.
+    #[track_caller]
     pub fn select_scatter(&self, src: &Tensor, dim: i64, index: i64) -> Tensor {
         let (data, source) = (self.data(), src.data());
         let device = common_device([&data, &source]);
@@ -290,6 +291,7 @@ impl Tensor {
     ///
     /// Panics if `self` is zero-dimensional, if `dim` is out of range, if `step` is not
     /// positive, or if `src` doesn't have the shape of the slice.
+    #[track_caller]
     pub fn slice_scatter(
         &self,
         src: &Tensor,
@@ -315,6 +317,7 @@ impl Tensor {
     /// A contiguous copy of `self` with the part that `part` selects from a layout overwritten
     /// by `src`, which must have its shape: the forward pass of `select_scatter` and
     /// `slice_scatter`.
+    #[track_caller]
     fn scatter_into(
         &self,
         src: &TensorData,

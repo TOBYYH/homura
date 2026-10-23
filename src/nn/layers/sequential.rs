@@ -38,6 +38,7 @@ pub struct Sequential {
 
 impl Sequential {
     /// A `Sequential` without layers, whose forward computation returns its input.
+    #[track_caller]
     pub fn new() -> Sequential {
         Sequential::default()
     }
@@ -45,37 +46,44 @@ impl Sequential {
     /// This `Sequential` with `layer` appended (`append(layer)`, which also returns the
     /// `Sequential`).
     #[must_use]
+    #[track_caller]
     pub fn append(mut self, layer: impl Forward + Send + Sync + 'static) -> Sequential {
         self.push(layer);
         self
     }
 
     /// Appends `layer`.
+    #[track_caller]
     pub fn push(&mut self, layer: impl Forward + Send + Sync + 'static) {
         self.layers.push(Box::new(layer));
     }
 
     /// The number of layers.
+    #[track_caller]
     pub fn len(&self) -> usize {
         self.layers.len()
     }
 
     /// Whether there are no layers.
+    #[track_caller]
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
 
     /// The layer at `index`, if there is one.
+    #[track_caller]
     pub fn get(&self, index: usize) -> Option<&(dyn Forward + Send + Sync)> {
         self.layers.get(index).map(|layer| &**layer)
     }
 
     /// The layers, in order.
+    #[track_caller]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &(dyn Forward + Send + Sync)> {
         self.layers.iter().map(|layer| &**layer)
     }
 
     /// Applies the layers to `input` in order; without layers, returns `input` (the same tensor).
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         let mut x = input.clone();
         for layer in &self.layers {

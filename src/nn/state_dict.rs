@@ -35,32 +35,38 @@ pub struct StateDict {
 
 impl StateDict {
     /// An empty state dict.
+    #[track_caller]
     pub fn new() -> StateDict {
         StateDict::default()
     }
 
     /// The number of entries.
+    #[track_caller]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether there are no entries.
+    #[track_caller]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The tensor stored under `key`.
+    #[track_caller]
     pub fn get(&self, key: &str) -> Option<&Tensor> {
         self.index.get(key).map(|&i| &self.entries[i].1)
     }
 
     /// Whether there is an entry for `key`.
+    #[track_caller]
     pub fn contains_key(&self, key: &str) -> bool {
         self.index.contains_key(key)
     }
 
     /// Stores `value` under `key` and returns the tensor stored there before, if any. A new key
     /// goes last; an existing one keeps its position.
+    #[track_caller]
     pub fn insert(&mut self, key: impl Into<String>, value: Tensor) -> Option<Tensor> {
         let key = key.into();
         match self.index.get(&key) {
@@ -74,6 +80,7 @@ impl StateDict {
     }
 
     /// Removes the entry for `key` and returns its tensor, keeping the order of the others.
+    #[track_caller]
     pub fn remove(&mut self, key: &str) -> Option<Tensor> {
         let i = self.index.remove(key)?;
         let (_, value) = self.entries.remove(i);
@@ -86,16 +93,19 @@ impl StateDict {
     }
 
     /// The keys, in order.
+    #[track_caller]
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
 
     /// The tensors, in order.
+    #[track_caller]
     pub fn values(&self) -> impl Iterator<Item = &Tensor> {
         self.entries.iter().map(|(_, v)| v)
     }
 
     /// The entries, in order.
+    #[track_caller]
     pub fn iter(&self) -> StateDictIter<'_> {
         StateDictIter(self.entries.iter())
     }
@@ -109,9 +119,12 @@ impl StateDict {
 impl std::ops::Index<&str> for StateDict {
     type Output = Tensor;
 
+    #[track_caller]
     fn index(&self, key: &str) -> &Tensor {
-        self.get(key)
-            .unwrap_or_else(|| panic!("no entry {key:?} in the state dict"))
+        match self.get(key) {
+            Some(t) => t,
+            None => panic!("no entry {key:?} in the state dict"),
+        }
     }
 }
 

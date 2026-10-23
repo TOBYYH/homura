@@ -29,6 +29,7 @@ impl Flatten {
     /// A layer that merges the dimensions `start_dim..=end_dim`
     /// (`nn.Flatten(start_dim, end_dim)`). They are checked by the forward computation, as in
     /// PyTorch.
+    #[track_caller]
     pub fn new(start_dim: i64, end_dim: i64) -> Flatten {
         Flatten { start_dim, end_dim }
     }
@@ -39,6 +40,7 @@ impl Flatten {
     ///
     /// Panics with PyTorch's messages if a dimension is out of range for `input` (also for a
     /// zero-dimensional one, which has no dimension 1) or if `start_dim` comes after `end_dim`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         input.flatten(self.start_dim, self.end_dim)
     }

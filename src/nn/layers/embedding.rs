@@ -35,6 +35,7 @@ pub struct Embedding {
 impl Embedding {
     /// A table of `num_embeddings` rows of size `embedding_dim`
     /// (`nn.Embedding(num_embeddings, embedding_dim)`).
+    #[track_caller]
     pub fn new(num_embeddings: usize, embedding_dim: usize) -> Embedding {
         let table = Embedding {
             weight: Parameter::new(crate::zeros([num_embeddings, embedding_dim])),
@@ -53,6 +54,7 @@ impl Embedding {
     ///
     /// Panics if `padding_idx` is not in `-num_embeddings..num_embeddings`, like PyTorch.
     #[must_use]
+    #[track_caller]
     pub fn padding_idx(mut self, padding_idx: i64) -> Embedding {
         let n = self.num_embeddings as i64;
         if padding_idx >= n || padding_idx < -n {
@@ -70,6 +72,7 @@ impl Embedding {
 
     /// Initializes the weights again, like PyTorch: from `N(0, 1)`, with zeros in the padding
     /// row.
+    #[track_caller]
     pub fn reset_parameters(&self) {
         init::normal_(&self.weight, 0.0, 1.0);
         self.zero_padding_row();
@@ -84,6 +87,7 @@ impl Embedding {
 
     /// The rows at `input`, an `I64` or `I32` tensor of any shape; the result has the shape of
     /// `input` followed by `embedding_dim`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::embedding(input, &self.weight, self.padding_idx.map(|i| i as i64))
     }

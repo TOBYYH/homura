@@ -18,6 +18,7 @@ fn tensor(o: Option<&Operand>) -> Option<&Tensor> {
 /// bounds use the tensor rule, rounding the scalar at its corresponding forward stage: `dtypes`
 /// are the dtypes that the `min` and `max` steps computed in. They are passed in rather than
 /// taken from `out`, which `clamp_` makes the target of the write, whose dtype can be narrower.
+#[track_caller]
 pub(crate) fn clamp(
     x: &Tensor,
     min: Option<&Operand>,

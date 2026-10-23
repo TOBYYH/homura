@@ -7,6 +7,7 @@ use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
 
 /// Records `out = embedding(weight, indices)`: the rows of the 2-D `weight` at `indices`.
+#[track_caller]
 pub(crate) fn embedding(weight: &Tensor, indices: &Tensor, padding_idx: Option<i64>, out: &Tensor) {
     record(&[Some(weight)], &[out], |b| EmbeddingBackward0 {
         indices: b.save(indices),

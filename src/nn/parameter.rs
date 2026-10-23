@@ -33,6 +33,7 @@ impl Parameter {
     /// # Panics
     ///
     /// Panics if the dtype of `data` is not floating point, with PyTorch's message.
+    #[track_caller]
     pub fn new(data: Tensor) -> Parameter {
         Parameter::with_requires_grad(data, true)
     }
@@ -44,6 +45,7 @@ impl Parameter {
     /// # Panics
     ///
     /// Panics if `requires_grad` is true and the dtype of `data` is not floating point.
+    #[track_caller]
     pub fn with_requires_grad(data: Tensor, requires_grad: bool) -> Parameter {
         if requires_grad && !data.is_floating_point() {
             panic!("Only Tensors of floating point and complex dtype can require gradients");
@@ -54,6 +56,7 @@ impl Parameter {
     }
 
     /// The parameter's tensor.
+    #[track_caller]
     pub fn as_tensor(&self) -> &Tensor {
         &self.0
     }

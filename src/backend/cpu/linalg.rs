@@ -8,6 +8,7 @@ use crate::tensor::TensorData;
 /// Batched `out[b] = a[b] @ b[b]` on 3-D views: `a` is `[B, M, K]`, `b` is `[B, K, N]` and `out` is
 /// `[B, M, N]`. Any strides are accepted (a stride of 0 broadcasts). Floats accumulate in `f64`,
 /// integers in wrapping `i64`.
+#[track_caller]
 pub(crate) fn matmul(out: &TensorData, a: &TensorData, b: &TensorData) {
     let dtype = a.dtype;
     if dtype.is_floating_point() {

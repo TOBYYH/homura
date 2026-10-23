@@ -22,6 +22,7 @@ pub struct MaxPool2dOptions {
 
 impl MaxPool2dOptions {
     /// The options for windows of `kernel_size` with PyTorch's defaults.
+    #[track_caller]
     pub fn new(kernel_size: [usize; 2]) -> MaxPool2dOptions {
         MaxPool2dOptions {
             kernel_size,
@@ -35,6 +36,7 @@ impl MaxPool2dOptions {
 
 /// The output size of a pooling dimension of `n` elements, PyTorch's `pooling_output_shape`,
 /// with its checks.
+#[track_caller]
 fn pooling_output_size(n: usize, k: usize, p: usize, s: usize, d: usize, ceil_mode: bool) -> i64 {
     if s == 0 {
         panic!("stride should not be zero");
@@ -58,6 +60,7 @@ fn pooling_output_size(n: usize, k: usize, p: usize, s: usize, d: usize, ceil_mo
 
 /// Checks the arguments of a max pooling of `input` like PyTorch, in its order, and those homura
 /// adds (bool inputs, windows that cover only padding), and returns the geometry.
+#[track_caller]
 fn max_pool2d_geometry(input: &Tensor, options: &MaxPool2dOptions) -> Pool2d {
     let MaxPool2dOptions {
         kernel_size: kernel,
@@ -183,6 +186,7 @@ fn max_pool2d_geometry(input: &Tensor, options: &MaxPool2dOptions) -> Pool2d {
 /// # Panics
 ///
 /// As [`max_pool2d_with_indices`].
+#[track_caller]
 pub fn max_pool2d(input: &Tensor, options: MaxPool2dOptions) -> Tensor {
     max_pool2d_with_indices(input, options).0
 }
@@ -216,6 +220,7 @@ pub fn max_pool2d(input: &Tensor, options: MaxPool2dOptions) -> Tensor {
 /// the output would be empty. Unlike PyTorch, also for bool inputs (also on the meta device),
 /// and if a window covers only padding, which can happen with a dilation above 1: PyTorch
 /// returns `-inf` with an index outside the plane there.
+#[track_caller]
 pub fn max_pool2d_with_indices(input: &Tensor, options: MaxPool2dOptions) -> (Tensor, Tensor) {
     let g = max_pool2d_geometry(input, &options);
     ops::max_pool2d_with_indices(input, g)
@@ -247,6 +252,7 @@ pub fn max_pool2d_with_indices(input: &Tensor, options: MaxPool2dOptions) -> (Te
 /// With PyTorch's messages: if `input` has fewer than 3 dimensions; for output sizes other than
 /// `[1, 1]`, if it has more than 4, an empty height or width, or isn't floating point (unlike
 /// PyTorch, also where no element is computed).
+#[track_caller]
 pub fn adaptive_avg_pool2d(input: &Tensor, output_size: [usize; 2]) -> Tensor {
     let shape = input.shape();
     let nd = shape.len();

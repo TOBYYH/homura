@@ -1,8 +1,8 @@
 //! [`Adam`] and [`AdamW`].
 
 use super::{
-    Groups, Optimizer, ParamGroup, addcdiv, addcmul, check_coefficients, check_state_tensor,
-    computation, lerp, scaled_add,
+    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, addcdiv, addcmul, check_coefficients,
+    check_state_tensor, computation, lerp, scaled_add,
 };
 use crate::nn::Parameter;
 use crate::{DType, Device, Tensor};
@@ -54,22 +54,26 @@ impl AdamState {
     /// The number of steps taken (`step`): a 0-D CPU tensor, F64 if the default dtype was F64
     /// when the state was created and F32 otherwise, as in PyTorch. The bias corrections read
     /// it.
+    #[track_caller]
     pub fn step(&self) -> &Tensor {
         &self.step
     }
 
     /// The moving average of the gradient (`exp_avg`).
+    #[track_caller]
     pub fn exp_avg(&self) -> &Tensor {
         &self.exp_avg
     }
 
     /// The moving average of the squared gradient (`exp_avg_sq`).
+    #[track_caller]
     pub fn exp_avg_sq(&self) -> &Tensor {
         &self.exp_avg_sq
     }
 
     /// The maximum of `exp_avg_sq` so far (`max_exp_avg_sq`), if the state was created with
     /// `amsgrad`.
+    #[track_caller]
     pub fn max_exp_avg_sq(&self) -> Option<&Tensor> {
         self.max_exp_avg_sq.as_ref()
     }
@@ -98,36 +102,18 @@ impl Inner {
             maximize: false,
         };
         Inner {
-            groups: Groups::new(params, defaults, check),
+            groups: Groups::new(params, defaults),
             decoupled_weight_decay,
         }
     }
 
     /// PyTorch's `_single_tensor_adam`.
+    #[track_caller]
     fn step(&mut self) {
-        let decoupled = self.decoupled_weight_decay;
-        let params = self.groups.prepare(check, |o, p, s| {
-            // `alpha` of the coupled weight decay in the parameter's dtype, `value` of the
-            // update's addcdiv in its computation type, at the step that comes next.
-            let step = s.map_or(1.0, |s| s.step.add(1.0).to(DType::F64).item::<f64>());
-            let mut coefficients = vec![(-step_size(o, step), computation(p.dtype()))];
-            if o.weight_decay != 0.0 && !decoupled {
-                coefficients.push((o.weight_decay, p.dtype()));
-            }
-            check_coefficients(p, coefficients);
-            let Some(s) = s else { return };
-            check_state_tensor(p, &s.exp_avg, "exp_avg");
-            check_state_tensor(p, &s.exp_avg_sq, "exp_avg_sq");
-            if o.amsgrad {
-                match &s.max_exp_avg_sq {
-                    Some(m) => check_state_tensor(p, m, "max_exp_avg_sq"),
-                    None => panic!(
-                        "the optimizer state of a parameter has no max_exp_avg_sq: amsgrad was \
-                         turned on after the state was created"
-                    ),
-                }
-            }
-        });
+        let checker = AdamCheck {
+            decoupled: self.decoupled_weight_decay,
+        };
+        let params = self.groups.prepare(&checker);
         let _no_grad = crate::no_grad();
         for item in params {
             let group = &self.groups.groups[item.group];
@@ -177,7 +163,48 @@ fn step_size(o: &AdamOptions, step: f64) -> f64 {
     o.lr / (1.0 - o.betas.0.powf(step))
 }
 
+/// The per-parameter checks of an Adam or AdamW step.
+struct AdamCheck {
+    decoupled: bool,
+}
+
+impl ParamCheck<AdamOptions, AdamState> for AdamCheck {
+    fn check_param(&self, o: &AdamOptions, p: &Tensor, s: Option<&AdamState>) {
+        // `alpha` of the coupled weight decay in the parameter's dtype, `value` of the update's
+        // addcdiv in its computation type, at the step that comes next.
+        let step = match s {
+            Some(s) => s.step.add(1.0).to(DType::F64).item::<f64>(),
+            None => 1.0,
+        };
+        let mut coefficients = vec![(-step_size(o, step), computation(p.dtype()))];
+        if o.weight_decay != 0.0 && !self.decoupled {
+            coefficients.push((o.weight_decay, p.dtype()));
+        }
+        check_coefficients(p, coefficients);
+        let Some(s) = s else { return };
+        check_state_tensor(p, &s.exp_avg, "exp_avg");
+        check_state_tensor(p, &s.exp_avg_sq, "exp_avg_sq");
+        if o.amsgrad {
+            match &s.max_exp_avg_sq {
+                Some(m) => check_state_tensor(p, m, "max_exp_avg_sq"),
+                None => panic!(
+                    "the optimizer state of a parameter has no max_exp_avg_sq: amsgrad was \
+                     turned on after the state was created"
+                ),
+            }
+        }
+    }
+}
+
+impl GroupOptions for AdamOptions {
+    /// The checks of PyTorch's `Adam()`; NaN fails them, as there.
+    fn check(&self) {
+        check(self);
+    }
+}
+
 /// The checks of PyTorch's `Adam()`; NaN fails them, as there.
+#[track_caller]
 fn check(o: &AdamOptions) {
     if !(0.0..).contains(&o.lr) {
         panic!("Invalid learning rate: {}", o.lr);
@@ -207,8 +234,9 @@ macro_rules! adam_methods {
             ///
             /// Panics unless both are in `[0, 1)`.
             #[must_use]
+            #[track_caller]
             pub fn betas(mut self, betas: (f64, f64)) -> $name {
-                self.0.groups.set(|o| o.betas = betas, check);
+                self.0.groups.set(|o| o.betas = betas);
                 self
             }
 
@@ -218,8 +246,9 @@ macro_rules! adam_methods {
             ///
             /// Panics if `eps` is negative or NaN.
             #[must_use]
+            #[track_caller]
             pub fn eps(mut self, eps: f64) -> $name {
-                self.0.groups.set(|o| o.eps = eps, check);
+                self.0.groups.set(|o| o.eps = eps);
                 self
             }
 
@@ -229,27 +258,31 @@ macro_rules! adam_methods {
             ///
             /// Panics if `weight_decay` is negative or NaN.
             #[must_use]
+            #[track_caller]
             pub fn weight_decay(mut self, weight_decay: f64) -> $name {
-                self.0.groups.set(|o| o.weight_decay = weight_decay, check);
+                self.0.groups.set(|o| o.weight_decay = weight_decay);
                 self
             }
 
             /// Sets `amsgrad` of the defaults and of every group.
             #[must_use]
+            #[track_caller]
             pub fn amsgrad(mut self, amsgrad: bool) -> $name {
-                self.0.groups.set(|o| o.amsgrad = amsgrad, check);
+                self.0.groups.set(|o| o.amsgrad = amsgrad);
                 self
             }
 
             /// Sets `maximize` of the defaults and of every group.
             #[must_use]
+            #[track_caller]
             pub fn maximize(mut self, maximize: bool) -> $name {
-                self.0.groups.set(|o| o.maximize = maximize, check);
+                self.0.groups.set(|o| o.maximize = maximize);
                 self
             }
 
             /// The state of `param` (`state[param]`), if it is a parameter of this optimizer
             /// that has state.
+            #[track_caller]
             pub fn state(&self, param: &Parameter) -> Option<&AdamState> {
                 self.0.groups.state(param)
             }
@@ -279,7 +312,7 @@ macro_rules! adam_methods {
             }
 
             fn add_param_group(&mut self, group: ParamGroup<AdamOptions>) {
-                self.0.groups.add(group, check);
+                self.0.groups.add(group);
             }
         }
     };
@@ -324,6 +357,7 @@ impl Adam {
     ///
     /// Panics if `params` is empty or `lr` is negative or NaN, with PyTorch's messages, or if a
     /// parameter is not a leaf or appears twice.
+    #[track_caller]
     pub fn new(params: impl IntoIterator<Item = Parameter>, lr: f64) -> Adam {
         Adam(Inner::new(params, lr, 0.0, false))
     }
@@ -359,6 +393,7 @@ impl AdamW {
     ///
     /// Panics if `params` is empty or `lr` is negative or NaN, with PyTorch's messages, or if a
     /// parameter is not a leaf or appears twice.
+    #[track_caller]
     pub fn new(params: impl IntoIterator<Item = Parameter>, lr: f64) -> AdamW {
         AdamW(Inner::new(params, lr, 0.01, true))
     }

@@ -84,6 +84,7 @@ impl Default for Conv2dOptions {
 /// dtype; for bool tensors. Unlike PyTorch: for an input without channels (PyTorch returns an
 /// output without channels), when the tensors are on different devices, and for `Valid` or
 /// `Same` padding with a bias of another dtype.
+#[track_caller]
 pub fn conv2d(
     input: &Tensor,
     weight: &Tensor,
@@ -242,8 +243,17 @@ pub fn conv2d(
     }
     // Half precision is computed in F32 and rounded once.
     let half = matches!(dtype, DType::F16 | DType::BF16);
-    let up = |t: &Tensor| if half { t.to(DType::F32) } else { t.clone() };
-    let (x, w, b) = (up(&x), up(weight), bias.map(up));
+    #[track_caller]
+    fn up(t: &Tensor, half: bool) -> Tensor {
+        if half { t.to(DType::F32) } else { t.clone() }
+    }
+    let (x, w) = (up(&x, half), up(weight, half));
+    // Not `Option::map`: a closure would lose the caller's location (`#[track_caller]`).
+    #[allow(clippy::manual_map)]
+    let b = match bias {
+        Some(b) => Some(up(b, half)),
+        None => None,
+    };
     let out = convolve(&x, &w, b.as_ref(), stride, pads, dilation, groups);
     let out = if half { out.to(dtype) } else { out };
     if unbatched { out.squeeze_dim(0) } else { out }
@@ -252,6 +262,7 @@ pub fn conv2d(
 /// The convolution of the checked 4-D `x` with `w` and `b`, all of one dtype: pad, unfold the
 /// windows, take every `dilation`-th element of them, rearrange them into rows of
 /// `C / groups * kh * kw` elements per group and multiply them with the weight's rows.
+#[track_caller]
 fn convolve(
     x: &Tensor,
     w: &Tensor,

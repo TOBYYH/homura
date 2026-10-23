@@ -747,7 +747,7 @@ fn failed_writes_change_nothing() {
         assert_unchanged(&y, &message, || {
             y.index_add_(0, &ints(&[2]), &s);
         });
-        // An operand that is a stale view fails where its edge is looked up, before the write.
+        // An operand that is a stale view fails with the other checks, before the write.
         let base = &x * 1.0;
         let stale = base.view([2]);
         base.add_(1.0);

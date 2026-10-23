@@ -69,6 +69,7 @@ impl Storage {
     /// # Panics
     ///
     /// Panics for ROCm devices, which are not implemented yet.
+    #[track_caller]
     pub fn new(nbytes: usize, device: Device) -> Storage {
         let buffer = match device {
             Device::Cpu => Buffer::Cpu(CpuBuffer::zeroed(nbytes)),

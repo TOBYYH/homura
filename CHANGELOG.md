@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Changed
+
+- A panic for an invalid argument (shape, dtype, device, dimension, index or option) now reports
+  the location of the caller's code instead of a line inside homura: the public API carries
+  `#[track_caller]`, including tensor methods and operators, the crate's free functions,
+  `nn::functional`, layers and their `Forward` implementations, `Module` methods, optimizers
+  (also through `dyn Optimizer`), `autograd::backward` / `grad`, `Tensor::backward`,
+  `Function::apply` and `gradcheck`, and the internal checks they share, such as index and dtype
+  checks in the CPU kernels and the rejection of a view whose base was modified in place after
+  the view was created. Errors found while the backward pass runs (a saved tensor modified in
+  place, a graph run twice) are still reported inside homura. Methods that homura calls on user
+  implementations (`Function::forward` / `backward`, `Visitor`, `Member::visit_as`,
+  `Module::visit`) don't carry the attribute, so panics in user code keep their own location.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added

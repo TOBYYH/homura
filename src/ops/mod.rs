@@ -153,6 +153,7 @@ operand_from_scalar!(
 /// # Panics
 ///
 /// Panics if the tensors are on different devices.
+#[track_caller]
 pub(crate) fn common_device<'a>(tensors: impl IntoIterator<Item = &'a TensorData>) -> Device {
     let mut device = None;
     for t in tensors {
@@ -221,13 +222,15 @@ pub(crate) fn reshape_data(data: &TensorData, shape: Shape) -> TensorData {
 ///
 /// Panics if `value` overflows `dtype`, with PyTorch's message, also for tensors without
 /// elements.
+#[track_caller]
 pub(crate) fn fill_value(value: Scalar, dtype: DType, device: Device) -> Scalar {
     if device == Device::Meta {
         return value;
     }
-    value
-        .checked_to(dtype)
-        .unwrap_or_else(|| panic!("value cannot be converted to type {dtype} without overflow"))
+    match value.checked_to(dtype) {
+        Some(value) => value,
+        None => panic!("value cannot be converted to type {dtype} without overflow"),
+    }
 }
 
 /// The value of the single element of `t`, a CPU tensor, as a scalar of its kind: a bool, an
@@ -250,35 +253,52 @@ pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> Tensor
     out
 }
 
+/// An in-place operation between [`Tensor::begin_in_place`] and [`Tensor::finish_in_place`]:
+/// whether autograd records it, and the no-grad mode its computation runs in.
+pub(crate) struct InPlace {
+    recorded: bool,
+    _no_grad: crate::GradModeGuard,
+}
+
 impl Tensor {
-    /// The flow that the in-place operations recorded for autograd share; `inputs` are their
-    /// tensor inputs other than `self`.
+    /// The flow that the in-place operations recorded for autograd share, in two calls around
+    /// the computation; `inputs` are their tensor inputs other than `self`.
     ///
-    /// 1. [`check_in_place`](crate::autograd::check_in_place) rejects writes that autograd
-    ///    doesn't allow and tells whether this one is recorded.
-    /// 2. `compute` runs the out-of-place operation in no-grad mode, which checks the arguments.
-    ///    It returns the result and whatever else `record` needs from the computation.
-    /// 3. The result has to fit `self`, see [`check_result`](Tensor::check_result).
-    /// 4. The result is written into `self` by [`write_in_place`](Tensor::write_in_place),
-    ///    where `record` records the operation's node with `self` as its output and `original`
-    ///    in the place of `self` as an input. With `saves_self`, which must hold whenever the
-    ///    operation's formula saves that input, `original` is the value of `self` before the
-    ///    write, with its history; otherwise it is `self`.
+    /// 1. `begin_in_place` runs [`check_in_place`](crate::autograd::check_in_place), which
+    ///    rejects writes that autograd doesn't allow and tells whether this one is recorded, and
+    ///    enters no-grad mode.
+    /// 2. The caller runs the out-of-place operation, which checks the arguments, directly rather
+    ///    than in a closure: `#[track_caller]` reports its panics at the user's call only through
+    ///    direct calls.
+    /// 3. `finish_in_place` leaves no-grad mode and checks that the result fits `self` (see
+    ///    [`check_result`](Tensor::check_result)). The result is written into `self` by
+    ///    [`write_in_place`](Tensor::write_in_place), where `record` records the operation's node
+    ///    with `self` as its output and `original` in the place of `self` as an input, given what
+    ///    else it needs from the computation (`computed`). With `saves_self`, which must hold
+    ///    whenever the operation's formula saves that input, `original` is the value of `self`
+    ///    before the write, with its history; otherwise it is `self`.
     ///
     /// Every check runs before the write, so a call that panics changes neither the data, the
     /// version nor the history of `self`. The version is bumped exactly once.
-    pub(crate) fn in_place<C>(
+    #[track_caller]
+    pub(crate) fn begin_in_place(&self, inputs: &[Option<&Tensor>]) -> InPlace {
+        InPlace {
+            recorded: crate::autograd::check_in_place(self, inputs),
+            _no_grad: crate::no_grad(),
+        }
+    }
+
+    /// The end of an in-place operation that [`begin_in_place`](Tensor::begin_in_place) began.
+    #[track_caller]
+    pub(crate) fn finish_in_place<C>(
         &self,
-        inputs: &[Option<&Tensor>],
+        begun: InPlace,
+        (result, computed): (Tensor, C),
         saves_self: bool,
-        compute: impl FnOnce() -> (Tensor, C),
         record: impl FnOnce(&Tensor, C),
     ) -> &Self {
-        let recorded = crate::autograd::check_in_place(self, inputs);
-        let (result, computed) = {
-            let _no_grad = crate::no_grad();
-            compute()
-        };
+        let InPlace { recorded, _no_grad } = begun;
+        drop(_no_grad);
         self.check_result(&result);
         let target = self.clone();
         self.write_in_place(
@@ -318,6 +338,7 @@ impl Tensor {
     /// [`write_copy`](Tensor::write_copy), which then can't fail: it has the shape of `self`, its
     /// dtype may be cast to the dtype of `self`, and the elements of `self` are distinct memory
     /// locations. The result is on the device of `self`, which computed it.
+    #[track_caller]
     fn check_result(&self, result: &Tensor) {
         let (dst, src) = (self.data(), result.data());
         if dst.layout.shape != src.layout.shape {

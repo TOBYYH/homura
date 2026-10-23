@@ -24,9 +24,11 @@ pub enum Device {
 impl Device {
     /// Waits until all queued work on this device has finished. A no-op on the CPU and meta
     /// devices, where work runs synchronously.
+    #[track_caller]
     pub fn synchronize(self) {}
 
     /// A human readable name, such as `"cpu"`.
+    #[track_caller]
     pub fn name(self) -> String {
         self.to_string()
     }

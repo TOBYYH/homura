@@ -1,6 +1,9 @@
 //! [`Sgd`]: stochastic gradient descent.
 
-use super::{Groups, Optimizer, ParamGroup, check_coefficients, check_state_tensor, scaled_add};
+use super::{
+    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, check_coefficients,
+    check_state_tensor, scaled_add,
+};
 use crate::Tensor;
 use crate::nn::Parameter;
 
@@ -30,6 +33,7 @@ pub struct SgdState {
 
 impl SgdState {
     /// The momentum buffer (`momentum_buffer`), with the parameter's shape, dtype and device.
+    #[track_caller]
     pub fn momentum_buffer(&self) -> &Tensor {
         &self.momentum_buffer
     }
@@ -70,6 +74,7 @@ impl Sgd {
     ///
     /// Panics if `params` is empty or `lr` is negative, with PyTorch's messages, or if a
     /// parameter is not a leaf or appears twice.
+    #[track_caller]
     pub fn new(params: impl IntoIterator<Item = Parameter>, lr: f64) -> Sgd {
         let defaults = SgdOptions {
             lr,
@@ -80,7 +85,7 @@ impl Sgd {
             maximize: false,
         };
         Sgd {
-            groups: Groups::new(params, defaults, check_values),
+            groups: Groups::new(params, defaults),
         }
     }
 
@@ -90,15 +95,17 @@ impl Sgd {
     ///
     /// Panics if `momentum` is negative.
     #[must_use]
+    #[track_caller]
     pub fn momentum(mut self, momentum: f64) -> Sgd {
-        self.groups.set(|o| o.momentum = momentum, check_values);
+        self.groups.set(|o| o.momentum = momentum);
         self
     }
 
     /// Sets `dampening` of the defaults and of every group.
     #[must_use]
+    #[track_caller]
     pub fn dampening(mut self, dampening: f64) -> Sgd {
-        self.groups.set(|o| o.dampening = dampening, check_values);
+        self.groups.set(|o| o.dampening = dampening);
         self
     }
 
@@ -108,29 +115,32 @@ impl Sgd {
     ///
     /// Panics if `weight_decay` is negative.
     #[must_use]
+    #[track_caller]
     pub fn weight_decay(mut self, weight_decay: f64) -> Sgd {
-        self.groups
-            .set(|o| o.weight_decay = weight_decay, check_values);
+        self.groups.set(|o| o.weight_decay = weight_decay);
         self
     }
 
     /// Sets `nesterov` of the defaults and of every group. Whether the momentum and dampening
     /// allow it is checked by [`step`](Optimizer::step).
     #[must_use]
+    #[track_caller]
     pub fn nesterov(mut self, nesterov: bool) -> Sgd {
-        self.groups.set(|o| o.nesterov = nesterov, check_values);
+        self.groups.set(|o| o.nesterov = nesterov);
         self
     }
 
     /// Sets `maximize` of the defaults and of every group.
     #[must_use]
+    #[track_caller]
     pub fn maximize(mut self, maximize: bool) -> Sgd {
-        self.groups.set(|o| o.maximize = maximize, check_values);
+        self.groups.set(|o| o.maximize = maximize);
         self
     }
 
     /// The state of `param` (`state[param]`), if it is a parameter of this optimizer that has
     /// state.
+    #[track_caller]
     pub fn state(&self, param: &Parameter) -> Option<&SgdState> {
         self.groups.state(param)
     }
@@ -140,26 +150,7 @@ impl Optimizer for Sgd {
     type Options = SgdOptions;
 
     fn step(&mut self) {
-        let params = self.groups.prepare(check, |o, p, s| {
-            if let Some(s) = s {
-                check_state_tensor(p, &s.momentum_buffer, "momentum_buffer");
-            }
-            // The `alpha`s of the step's `add`s, in the parameter's dtype.
-            let mut alphas = vec![];
-            if o.weight_decay != 0.0 {
-                alphas.push(o.weight_decay);
-            }
-            if o.momentum != 0.0 {
-                if s.is_some() {
-                    alphas.push(1.0 - o.dampening);
-                }
-                if o.nesterov {
-                    alphas.push(o.momentum);
-                }
-            }
-            alphas.push(-o.lr);
-            check_coefficients(p, alphas.into_iter().map(|a| (a, p.dtype())));
-        });
+        let params = self.groups.prepare(&SgdCheck);
         let _no_grad = crate::no_grad();
         for item in params {
             let group = &self.groups.groups[item.group];
@@ -216,26 +207,55 @@ impl Optimizer for Sgd {
     }
 
     fn add_param_group(&mut self, group: ParamGroup<SgdOptions>) {
-        self.groups.add(group, check);
+        self.groups.add(group);
     }
 }
 
-/// The checks of single values, which PyTorch makes in `SGD()`; NaN passes them, as there.
-fn check_values(o: &SgdOptions) {
-    if o.lr < 0.0 {
-        panic!("Invalid learning rate: {}", o.lr);
+impl GroupOptions for SgdOptions {
+    /// The checks of single values, which PyTorch makes in `SGD()`; NaN passes them, as there.
+    fn check_values(&self) {
+        if self.lr < 0.0 {
+            panic!("Invalid learning rate: {}", self.lr);
+        }
+        if self.momentum < 0.0 {
+            panic!("Invalid momentum value: {}", self.momentum);
+        }
+        if self.weight_decay < 0.0 {
+            panic!("Invalid weight_decay value: {}", self.weight_decay);
+        }
     }
-    if o.momentum < 0.0 {
-        panic!("Invalid momentum value: {}", o.momentum);
-    }
-    if o.weight_decay < 0.0 {
-        panic!("Invalid weight_decay value: {}", o.weight_decay);
+
+    fn check(&self) {
+        self.check_values();
+        if self.nesterov && (self.momentum <= 0.0 || self.dampening != 0.0) {
+            panic!("Nesterov momentum requires a momentum and zero dampening");
+        }
     }
 }
 
-fn check(o: &SgdOptions) {
-    check_values(o);
-    if o.nesterov && (o.momentum <= 0.0 || o.dampening != 0.0) {
-        panic!("Nesterov momentum requires a momentum and zero dampening");
+/// The per-parameter checks of an SGD step.
+struct SgdCheck;
+
+impl ParamCheck<SgdOptions, SgdState> for SgdCheck {
+    fn check_param(&self, o: &SgdOptions, p: &Tensor, s: Option<&SgdState>) {
+        if let Some(s) = s {
+            check_state_tensor(p, &s.momentum_buffer, "momentum_buffer");
+        }
+        // The `alpha`s of the step's `add`s, in the parameter's dtype.
+        let mut alphas = vec![];
+        if o.weight_decay != 0.0 {
+            alphas.push(o.weight_decay);
+        }
+        if o.momentum != 0.0 {
+            if s.is_some() {
+                alphas.push(1.0 - o.dampening);
+            }
+            if o.nesterov {
+                alphas.push(o.momentum);
+            }
+        }
+        alphas.push(-o.lr);
+        let dtype = p.dtype();
+        check_coefficients(p, alphas.into_iter().map(|a| (a, dtype)));
     }
 }

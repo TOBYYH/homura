@@ -10,6 +10,7 @@ use crate::{DType, Tensor};
 /// Records the backward node of `out = x.softmax(dim)`, or `x.log_softmax(dim)` (`log`), with
 /// `dim` already wrapped. The derivative is a function of the result, so only the result is
 /// saved.
+#[track_caller]
 pub(crate) fn softmax(x: &Tensor, dim: usize, log: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |b| SoftmaxBackward {
         result: b.save_output(out, 0),
@@ -56,6 +57,7 @@ impl Node for SoftmaxBackward {
 /// When `g` or `y` requires grad (a backward pass with `create_graph`), the result is recorded as
 /// a node of its own whose derivatives follow the reference's formulas and their order of
 /// operations, rather than differentiating the operations above.
+#[track_caller]
 fn backward_data(g: &Tensor, y: &Tensor, dim: i64, log: bool) -> Tensor {
     let grad = {
         let _no_grad = crate::autograd::no_grad();

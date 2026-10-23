@@ -6,12 +6,14 @@ use crate::autograd::record::record;
 use crate::{DType, Device, Tensor};
 
 /// Records the backward node of `out = x.deep_clone()`.
+#[track_caller]
 pub(crate) fn deep_clone(x: &Tensor, out: &Tensor) {
     record(&[Some(x)], &[out], |_| CloneBackward0);
 }
 
 /// Records the backward node of `out = x.to(..)`, when it computed a new tensor. Conversions to
 /// integer dtypes are not differentiable, and `record` skips them.
+#[track_caller]
 pub(crate) fn to_copy(x: &Tensor, out: &Tensor) {
     let (self_dtype, self_device) = (x.dtype(), x.device());
     record(&[Some(x)], &[out], |_| ToCopyBackward0 {

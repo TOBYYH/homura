@@ -89,6 +89,7 @@ fn error(message: String) -> Result<(), GradcheckError> {
 ///
 /// Panics if no input requires grad, if a variable breaks the rules above, or if `f` panics. An
 /// output on the meta device can't be read and panics too.
+#[track_caller]
 pub fn gradcheck(
     f: impl Fn(&[Tensor]) -> Vec<Tensor>,
     inputs: &[&Tensor],
@@ -196,6 +197,7 @@ pub fn gradcheck(
 /// # Panics
 ///
 /// Like [`gradcheck`]; also if the outputs that require grad differ between calls of `f`.
+#[track_caller]
 pub fn gradgradcheck(
     f: impl Fn(&[Tensor]) -> Vec<Tensor>,
     inputs: &[&Tensor],
@@ -242,6 +244,7 @@ pub fn gradgradcheck(
 }
 
 /// The indices of the inputs that require grad, after checking them.
+#[track_caller]
 fn check_inputs(inputs: &[Tensor]) -> Vec<usize> {
     let variables: Vec<usize> = (0..inputs.len())
         .filter(|&i| inputs[i].requires_grad())

@@ -32,6 +32,7 @@ pub struct MaxPool2d {
 impl MaxPool2d {
     /// Max pooling with windows of `kernel_size`, a stride of the kernel size and PyTorch's other
     /// defaults (`nn.MaxPool2d(kernel_size)`).
+    #[track_caller]
     pub fn new(kernel_size: impl IntoPair) -> MaxPool2d {
         MaxPool2d {
             options: MaxPool2dOptions::new(kernel_size.into_pair()),
@@ -40,6 +41,7 @@ impl MaxPool2d {
 
     /// This layer with `stride` (`stride=...`).
     #[must_use]
+    #[track_caller]
     pub fn stride(mut self, stride: impl IntoPair) -> MaxPool2d {
         self.options.stride = Some(stride.into_pair());
         self
@@ -47,6 +49,7 @@ impl MaxPool2d {
 
     /// This layer with `padding` (`padding=...`), an implicit `-inf` padding.
     #[must_use]
+    #[track_caller]
     pub fn padding(mut self, padding: impl IntoPair) -> MaxPool2d {
         self.options.padding = padding.into_pair();
         self
@@ -54,6 +57,7 @@ impl MaxPool2d {
 
     /// This layer with `dilation` (`dilation=...`).
     #[must_use]
+    #[track_caller]
     pub fn dilation(mut self, dilation: impl IntoPair) -> MaxPool2d {
         self.options.dilation = dilation.into_pair();
         self
@@ -61,18 +65,21 @@ impl MaxPool2d {
 
     /// This layer with `ceil_mode` (`ceil_mode=...`): whether a last partial window counts.
     #[must_use]
+    #[track_caller]
     pub fn ceil_mode(mut self, ceil_mode: bool) -> MaxPool2d {
         self.options.ceil_mode = ceil_mode;
         self
     }
 
     /// The maximum of each window of `input`, `[C, H, W]` or `[N, C, H, W]`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::max_pool2d(input, self.options)
     }
 
     /// The maximum of each window of `input` and its position in the plane, like PyTorch's
     /// layer with `return_indices=True`: see [`functional::max_pool2d_with_indices`].
+    #[track_caller]
     pub fn forward_with_indices(&self, input: &Tensor) -> (Tensor, Tensor) {
         functional::max_pool2d_with_indices(input, self.options)
     }
@@ -119,6 +126,7 @@ pub struct AdaptiveAvgPool2d {
 impl AdaptiveAvgPool2d {
     /// Pooling into `output_size` windows: a number for both dimensions or a pair
     /// (`nn.AdaptiveAvgPool2d(output_size)`, without `None` entries).
+    #[track_caller]
     pub fn new(output_size: impl IntoPair) -> AdaptiveAvgPool2d {
         AdaptiveAvgPool2d {
             output_size: output_size.into_pair(),
@@ -126,6 +134,7 @@ impl AdaptiveAvgPool2d {
     }
 
     /// The mean of each window of `input`, `[C, H, W]` or `[N, C, H, W]`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::adaptive_avg_pool2d(input, self.output_size)
     }

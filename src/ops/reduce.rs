@@ -19,6 +19,7 @@ fn reduced_shape(shape: &Shape, mask: &[bool], keepdim: bool) -> Shape {
     Shape::new(&out)
 }
 
+#[track_caller]
 fn reduce_op(op: ReduceOp, x: &Tensor, dims: &[i64], keepdim: bool, name: &str) -> Tensor {
     let src = x.data();
     let dtype = src.dtype;
@@ -56,6 +57,7 @@ fn reduce_op(op: ReduceOp, x: &Tensor, dims: &[i64], keepdim: bool, name: &str) 
 }
 
 /// Index of the maximum (or minimum) along `dim`, or over all elements when `dim` is `None`.
+#[track_caller]
 fn arg_op(
     x: &Tensor,
     dim: Option<i64>,
@@ -93,6 +95,7 @@ fn arg_op(
     (vals, indices)
 }
 
+#[track_caller]
 fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: bool) -> Tensor {
     let src = x.data();
     if !src.dtype.is_floating_point() {
@@ -128,6 +131,7 @@ pub(crate) fn exclusive_cumprod(x: &Tensor, dim: usize, reverse: bool) -> Tensor
 
 impl Tensor {
     /// Sum of all elements. Integer and bool inputs give `I64`.
+    #[track_caller]
     pub fn sum(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Sum, self, &[], false, "sum");
         formulas::sum(self, &out);
@@ -135,6 +139,7 @@ impl Tensor {
     }
 
     /// Sum over `dims` (all dimensions if empty).
+    #[track_caller]
     pub fn sum_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
         let dims = dims.into_dims();
         let out = reduce_op(ReduceOp::Sum, self, &dims, keepdim, "sum");
@@ -157,6 +162,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if `size` doesn't broadcast to the shape of `self`.
+    #[track_caller]
     pub fn sum_to_size(&self, size: impl IntoShape) -> Tensor {
         let size = size.into_shape();
         let shape = self.shape();
@@ -179,6 +185,7 @@ impl Tensor {
     }
 
     /// Mean of all elements. Requires a floating point input.
+    #[track_caller]
     pub fn mean(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Mean, self, &[], false, "mean");
         formulas::mean(self, None, false, &out);
@@ -186,6 +193,7 @@ impl Tensor {
     }
 
     /// Mean over `dims` (all dimensions if empty).
+    #[track_caller]
     pub fn mean_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
         let dims = dims.into_dims();
         let out = reduce_op(ReduceOp::Mean, self, &dims, keepdim, "mean");
@@ -197,6 +205,7 @@ impl Tensor {
     ///
     /// Its gradient for an input that contains zeros can't be differentiated again yet: a
     /// backward pass with `create_graph` that computes it panics.
+    #[track_caller]
     pub fn prod(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Prod, self, &[], false, "prod");
         formulas::prod(self, None, false, &out);
@@ -204,6 +213,7 @@ impl Tensor {
     }
 
     /// Product along `dim`. Its gradient has the limit of [`prod`](Tensor::prod)'s.
+    #[track_caller]
     pub fn prod_dim(&self, dim: i64, keepdim: bool) -> Tensor {
         let out = reduce_op(ReduceOp::Prod, self, &[dim], keepdim, "prod");
         let dim = normalize_dim(dim, self.num_dims());
@@ -212,6 +222,7 @@ impl Tensor {
     }
 
     /// Largest element (NaN if there is any).
+    #[track_caller]
     pub fn max(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Max, self, &[], false, "max");
         formulas::extremum(self, true, &out);
@@ -219,6 +230,7 @@ impl Tensor {
     }
 
     /// Largest values along `dim` and their indices (the first one on ties).
+    #[track_caller]
     pub fn max_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, true, true, "max");
         let v = v.unwrap();
@@ -228,6 +240,7 @@ impl Tensor {
     }
 
     /// Smallest element (NaN if there is any).
+    #[track_caller]
     pub fn min(&self) -> Tensor {
         let out = reduce_op(ReduceOp::Min, self, &[], false, "min");
         formulas::extremum(self, false, &out);
@@ -235,6 +248,7 @@ impl Tensor {
     }
 
     /// Smallest values along `dim` and their indices (the first one on ties).
+    #[track_caller]
     pub fn min_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
         let (v, i) = arg_op(self, Some(dim), keepdim, false, true, "min");
         let v = v.unwrap();
@@ -244,27 +258,32 @@ impl Tensor {
     }
 
     /// Index of the largest element in the flattened tensor.
+    #[track_caller]
     pub fn argmax(&self) -> Tensor {
         arg_op(self, None, false, true, false, "argmax").1
     }
 
     /// Indices of the largest values along `dim` (the first one on ties).
+    #[track_caller]
     pub fn argmax_dim(&self, dim: i64, keepdim: bool) -> Tensor {
         arg_op(self, Some(dim), keepdim, true, false, "argmax").1
     }
 
     /// Index of the smallest element in the flattened tensor.
+    #[track_caller]
     pub fn argmin(&self) -> Tensor {
         arg_op(self, None, false, false, false, "argmin").1
     }
 
     /// Indices of the smallest values along `dim` (the first one on ties).
+    #[track_caller]
     pub fn argmin_dim(&self, dim: i64, keepdim: bool) -> Tensor {
         arg_op(self, Some(dim), keepdim, false, false, "argmin").1
     }
 
     /// Variance of all elements, dividing by `N - correction` (`correction = 1` is Bessel's
     /// correction, PyTorch's default).
+    #[track_caller]
     pub fn var(&self, correction: i64) -> Tensor {
         let out = var_op(self, &[], correction, false, false);
         formulas::var_std(self, None, correction, false, false, &out);
@@ -274,6 +293,7 @@ impl Tensor {
     /// Variance over `dims` (all dimensions if empty). With an empty list, the gradient is that
     /// of [`var`](Tensor::var) (PyTorch's `var(dim=[])` divides its gradient by
     /// `1 - correction` instead).
+    #[track_caller]
     pub fn var_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
         let dims = dims.into_dims();
         let out = var_op(self, &dims, correction, keepdim, false);
@@ -282,6 +302,7 @@ impl Tensor {
     }
 
     /// Standard deviation of all elements; see [`var`](Tensor::var).
+    #[track_caller]
     pub fn std(&self, correction: i64) -> Tensor {
         let out = var_op(self, &[], correction, false, true);
         formulas::var_std(self, None, correction, false, true, &out);
@@ -290,6 +311,7 @@ impl Tensor {
 
     /// Standard deviation over `dims` (all dimensions if empty); see
     /// [`var_dim`](Tensor::var_dim).
+    #[track_caller]
     pub fn std_dim(&self, dims: impl Dims, correction: i64, keepdim: bool) -> Tensor {
         let dims = dims.into_dims();
         let out = var_op(self, &dims, correction, keepdim, true);
@@ -299,21 +321,25 @@ impl Tensor {
 
     /// Whether all elements are nonzero, as a zero-dimensional `Bool` tensor (`U8` for `U8`
     /// inputs, like PyTorch).
+    #[track_caller]
     pub fn all(&self) -> Tensor {
         reduce_op(ReduceOp::All, self, &[], false, "all")
     }
 
     /// Whether all elements along `dims` are nonzero.
+    #[track_caller]
     pub fn all_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
         reduce_op(ReduceOp::All, self, &dims.into_dims(), keepdim, "all")
     }
 
     /// Whether any element is nonzero.
+    #[track_caller]
     pub fn any(&self) -> Tensor {
         reduce_op(ReduceOp::Any, self, &[], false, "any")
     }
 
     /// Whether any element along `dims` is nonzero.
+    #[track_caller]
     pub fn any_dim(&self, dims: impl Dims, keepdim: bool) -> Tensor {
         reduce_op(ReduceOp::Any, self, &dims.into_dims(), keepdim, "any")
     }

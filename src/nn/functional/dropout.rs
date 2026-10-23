@@ -29,6 +29,7 @@ use crate::{DType, Tensor};
 ///
 /// Panics if `p` isn't between 0 and 1 (also NaN), in training or not, and for `0 < p < 1` in
 /// training if `input` isn't floating point (with PyTorch's messages).
+#[track_caller]
 pub fn dropout(input: &Tensor, p: f64, training: bool) -> Tensor {
     if !(0.0..=1.0).contains(&p) {
         panic!("dropout probability has to be between 0 and 1, but got {p}");

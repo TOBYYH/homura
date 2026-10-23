@@ -27,15 +27,15 @@ use crate::{DType, Device, Tensor, no_grad};
 /// than the number of rows (checked for CPU indices). That message is "index out of range in
 /// self" also for tables without rows or columns, for which PyTorch's `index_select` reports
 /// others.
+#[track_caller]
 pub fn embedding(input: &Tensor, weight: &Tensor, padding_idx: Option<i64>) -> Tensor {
     let rows = weight.shape().first().map_or(0, |&n| n as i64);
     // PyTorch's Python wrapper normalizes `padding_idx` first.
-    let padding_idx = padding_idx.map(|p| {
-        if p >= rows || p < -rows {
-            panic!("Padding_idx must be within num_embeddings");
-        }
-        if p < 0 { p + rows } else { p }
-    });
+    let padding_idx = match padding_idx {
+        Some(p) if p >= rows || p < -rows => panic!("Padding_idx must be within num_embeddings"),
+        Some(p) if p < 0 => Some(p + rows),
+        p => p,
+    };
     if weight.num_dims() != 2 {
         panic!("'weight' must be 2-D");
     }

@@ -51,6 +51,7 @@ impl Conv2d {
     /// PyTorch's default options (`nn.Conv2d(in_channels, out_channels, kernel_size)`). Like
     /// PyTorch, sizes of 0 are accepted here; the forward computation rejects a layer without
     /// input channels or with an empty kernel.
+    #[track_caller]
     pub fn new(in_channels: usize, out_channels: usize, kernel_size: impl IntoPair) -> Conv2d {
         let kernel_size = kernel_size.into_pair();
         let options = Conv2dOptions::default();
@@ -77,6 +78,7 @@ impl Conv2d {
     ///
     /// Panics with PyTorch's message if the padding is `Same` and the stride isn't 1.
     #[must_use]
+    #[track_caller]
     pub fn stride(mut self, stride: impl IntoPair) -> Conv2d {
         self.options.stride = stride.into_pair();
         self.check_same_padding();
@@ -90,6 +92,7 @@ impl Conv2d {
     ///
     /// Panics with PyTorch's message if the padding is `Same` and the stride isn't 1.
     #[must_use]
+    #[track_caller]
     pub fn padding(mut self, padding: impl Into<Conv2dPadding>) -> Conv2d {
         self.options.padding = padding.into();
         self.check_same_padding();
@@ -98,6 +101,7 @@ impl Conv2d {
 
     /// This layer with `dilation` (`dilation=...`).
     #[must_use]
+    #[track_caller]
     pub fn dilation(mut self, dilation: impl IntoPair) -> Conv2d {
         self.options.dilation = dilation.into_pair();
         self
@@ -115,6 +119,7 @@ impl Conv2d {
     /// Panics with PyTorch's messages, in its order, if `groups` is 0 or doesn't divide the
     /// input channels or the output channels.
     #[must_use]
+    #[track_caller]
     pub fn groups(mut self, groups: usize) -> Conv2d {
         if groups == 0 {
             panic!("groups must be a positive integer");
@@ -146,6 +151,7 @@ impl Conv2d {
     /// otherwise. A new bias is initialized like [`reset_parameters`](Conv2d::reset_parameters)
     /// does, with the dtype and device of the weights.
     #[must_use]
+    #[track_caller]
     pub fn bias(mut self, bias: bool) -> Conv2d {
         if !bias {
             self.bias = None;
@@ -160,6 +166,7 @@ impl Conv2d {
     /// [`kaiming_uniform_`](init::kaiming_uniform_)`(a = √5)`, which samples from
     /// `U(-1/√fan_in, 1/√fan_in)` with `fan_in = in_channels / groups * kh * kw`, and then the
     /// bias from the same distribution (zeros for a `fan_in` of 0).
+    #[track_caller]
     pub fn reset_parameters(&self) {
         init::kaiming_uniform_(
             &self.weight,
@@ -182,6 +189,7 @@ impl Conv2d {
         }
     }
 
+    #[track_caller]
     fn check_same_padding(&self) {
         if self.options.padding == Conv2dPadding::Same && self.options.stride != [1, 1] {
             panic!("padding='same' is not supported for strided convolutions");
@@ -189,6 +197,7 @@ impl Conv2d {
     }
 
     /// The convolution of `input`, `[N, C, H, W]` or `[C, H, W]`.
+    #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::conv2d(input, &self.weight, self.bias.as_deref(), self.options)
     }

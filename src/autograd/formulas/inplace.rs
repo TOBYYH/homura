@@ -8,6 +8,7 @@ use crate::{DType, Device, Shape, Tensor};
 
 /// Records the backward node of `target.copy_(src)`, with `target` before the write as the first
 /// input and as the output.
+#[track_caller]
 pub(crate) fn copy(target: &Tensor, src: &Tensor) {
     let (src_shape, src_dtype, src_device) = (src.shape(), src.dtype(), src.device());
     record(&[Some(target), Some(src)], &[target], |_| CopyBackwards {
@@ -20,6 +21,7 @@ pub(crate) fn copy(target: &Tensor, src: &Tensor) {
 /// Records the backward node `name` of an in-place write that sets every element of `target` to
 /// a value that doesn't depend on any tensor: `fill_` with a scalar, `zero_`, `uniform_` and
 /// `normal_`.
+#[track_caller]
 pub(crate) fn overwrite(target: &Tensor, name: &'static str) {
     record(&[Some(target)], &[target], |_| OverwriteBackward { name });
 }

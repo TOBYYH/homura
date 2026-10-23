@@ -6,6 +6,7 @@ use crate::ops::{cast_data, clone_data};
 use crate::{DType, Device, Element};
 
 impl Tensor {
+    #[track_caller]
     fn host_data<T: Element>(&self, what: &str) -> crate::tensor::TensorData {
         let data = self.data();
         let readable = data.dtype == T::DTYPE
@@ -25,6 +26,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if `T` doesn't match the dtype; `f16` and `bf16` tensors may also be read as `f32`.
+    #[track_caller]
     pub fn to_vec<T: Element>(&self) -> Vec<T> {
         cpu::read_host(&self.host_data::<T>("to_vec"))
     }
@@ -35,6 +37,7 @@ impl Tensor {
     ///
     /// Panics if the tensor doesn't have exactly one element or if `T` doesn't match the dtype
     /// (as in [`to_vec`](Tensor::to_vec)).
+    #[track_caller]
     pub fn item<T: Element>(&self) -> T {
         let n = self.num_elements();
         if n != 1 {
@@ -46,6 +49,7 @@ impl Tensor {
     /// Converts to another dtype and/or device: `x.to(DType::F16)`, `x.to(Device::Meta)` or
     /// `x.to((DType::F16, device))`. Returns `self` (a handle to the same tensor) when nothing
     /// changes.
+    #[track_caller]
     pub fn to(&self, options: impl Into<TensorOptions>) -> Tensor {
         let o = options.into();
         let data = self.data();
@@ -107,6 +111,7 @@ pub(crate) fn conversion_error(from: Device, to: Device) -> Option<String> {
 /// # Panics
 ///
 /// Panics with [`conversion_error`]'s message if the devices don't allow the conversion.
+#[track_caller]
 pub(crate) fn convert_data(data: &TensorData, dtype: DType, device: Device) -> TensorData {
     if let Some(e) = conversion_error(data.device(), device) {
         panic!("{e}");

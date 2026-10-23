@@ -10,6 +10,7 @@ use crate::nn::functional::Reduction;
 use crate::{DType, Tensor, where_};
 
 /// Records `out = mse_loss(input, target)` for an `input` and `target` of the same shape.
+#[track_caller]
 pub(crate) fn mse_loss(input: &Tensor, target: &Tensor, reduction: Reduction, out: &Tensor) {
     record(&[Some(input), Some(target)], &[out], |b| MseLossBackward0 {
         input: b.save(input),
@@ -60,6 +61,7 @@ pub(crate) struct NllLoss {
 /// Records `out = nll_loss(input, target)`. `weight` has one element per class, in any shape
 /// (saved as the caller's tensor, so that its version is checked), and `total_weight` is the
 /// divisor of the mean, both of the input's dtype.
+#[track_caller]
 pub(crate) fn nll_loss(
     input: &Tensor,
     target: &Tensor,
@@ -155,6 +157,7 @@ impl Node for NllLossBackward0 {
 
 /// Records `out = binary_cross_entropy_with_logits(input, target)`; `weight` and `pos_weight`
 /// broadcast to the input's shape.
+#[track_caller]
 pub(crate) fn binary_cross_entropy_with_logits(
     input: &Tensor,
     target: &Tensor,

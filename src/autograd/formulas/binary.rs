@@ -28,6 +28,7 @@ fn shape(o: &Operand) -> Shape {
 /// As in PyTorch, a scalar operand has no edge, and a scalar on the left of `+` or `*` is
 /// recorded on the right (`2 * x` is `x * 2`), while `scalar - x` is `RsubBackward1` with a
 /// single edge.
+#[track_caller]
 pub(crate) fn binary(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
     use BinaryOp::*;
     match op {
@@ -71,6 +72,7 @@ pub(crate) fn binary(op: BinaryOp, lhs: &Operand, rhs: &Operand, out: &Tensor) {
 /// on the left: `s / x` is a `DivBackward0` whose first input, the scalar, has no edge, like
 /// PyTorch's `torch.div(torch.tensor(s), x)`. (PyTorch's Python operator computes
 /// `x.reciprocal() * s` instead, and records two nodes.)
+#[track_caller]
 fn div(lhs: &Operand, rhs: &Operand, out: &Tensor) {
     let (a, b) = (tensor(lhs), tensor(rhs));
     let shapes = [shape(lhs), shape(rhs)];
@@ -156,6 +158,7 @@ extrema_nodes! {
 
 /// Records the backward node of `out = where_(condition, x, y)`. The condition has no edge, and
 /// neither has a scalar `x` or `y`.
+#[track_caller]
 pub(crate) fn where_(condition: &Tensor, x: &Operand, y: &Operand, out: &Tensor) {
     let (tx, ty) = (tensor(x), tensor(y));
     let shapes = [shape(x), shape(y)];

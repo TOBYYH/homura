@@ -14,6 +14,7 @@ use crate::{Shape, Strides};
 ///
 /// Panics with PyTorch's messages if `shape` is zero-dimensional or `dim` or `index` is out of
 /// range.
+#[track_caller]
 pub(crate) fn select_position(shape: &Shape, dim: i64, index: i64) -> (usize, usize) {
     if shape.is_empty() {
         panic!("select() cannot be applied to a 0-dim tensor.");
@@ -34,6 +35,7 @@ pub(crate) fn select_position(shape: &Shape, dim: i64, index: i64) -> (usize, us
 /// # Panics
 ///
 /// Panics if `step` is not positive.
+#[track_caller]
 pub(crate) fn slice_bounds(
     size: usize,
     start: Option<i64>,
@@ -58,6 +60,7 @@ pub(crate) fn slice_bounds(
 impl Tensor {
     /// A view with a different shape (one dimension may be `-1`). The memory layout must allow
     /// it without copying; [`reshape`](Tensor::reshape) copies when needed.
+    #[track_caller]
     pub fn view(&self, shape: impl IntoShapeSpec) -> Tensor {
         let out = self.make_view(self.view_layout(shape));
         formulas::view(self, &out);
@@ -68,12 +71,14 @@ impl Tensor {
     /// PyTorch's `_unsafe_view`: the result is not recorded as a view, since no one else holds the
     /// tensor whose storage it shares. Otherwise in-place operations on the result would be
     /// treated as writes to a view. It is still differentiable: gradients flow through it.
+    #[track_caller]
     pub(crate) fn unsafe_view(&self, shape: impl IntoShapeSpec) -> Tensor {
         let out = self.with_layout(self.view_layout(shape));
         formulas::unsafe_view(self, &out);
         out
     }
 
+    #[track_caller]
     fn view_layout(&self, shape: impl IntoShapeSpec) -> Layout {
         let l = self.layout();
         let shape = infer_size(&shape.into_shape_spec(), l.num_elements());
@@ -92,6 +97,7 @@ impl Tensor {
 
     /// A tensor with a different shape (one dimension may be `-1`): a view when the memory
     /// layout allows it, otherwise a contiguous copy.
+    #[track_caller]
     pub fn reshape(&self, shape: impl IntoShapeSpec) -> Tensor {
         let l = self.layout();
         let shape = infer_size(&shape.into_shape_spec(), l.num_elements());
@@ -110,6 +116,7 @@ impl Tensor {
     }
 
     /// Reorders the dimensions: dimension `i` of the result is dimension `dims[i]` of `self`.
+    #[track_caller]
     pub fn permute(&self, dims: impl Dims) -> Tensor {
         let l = self.layout();
         let dims = dims.into_dims();
@@ -146,6 +153,7 @@ impl Tensor {
     }
 
     /// Swaps two dimensions.
+    #[track_caller]
     pub fn transpose(&self, dim0: i64, dim1: i64) -> Tensor {
         let mut l = self.layout();
         let n = l.shape.len();
@@ -164,6 +172,7 @@ impl Tensor {
 
     /// A view broadcast to `shape`: size-1 dimensions may grow and new leading dimensions may be
     /// added; `-1` keeps a size. No memory is copied.
+    #[track_caller]
     pub fn expand(&self, shape: impl IntoShapeSpec) -> Tensor {
         let l = self.layout();
         let spec = shape.into_shape_spec();
@@ -196,11 +205,13 @@ impl Tensor {
     }
 
     /// [`expand`](Tensor::expand) to the shape of `other`.
+    #[track_caller]
     pub fn expand_as(&self, other: &Tensor) -> Tensor {
         self.expand(other.shape())
     }
 
     /// Removes all dimensions of size 1.
+    #[track_caller]
     pub fn squeeze(&self) -> Tensor {
         let l = self.layout();
         let remove: Vec<bool> = l.shape.iter().map(|&size| size == 1).collect();
@@ -209,6 +220,7 @@ impl Tensor {
 
     /// Removes the given dimensions if they have size 1 (others are left alone, like PyTorch).
     /// An empty list removes none.
+    #[track_caller]
     pub fn squeeze_dim(&self, dims: impl Dims) -> Tensor {
         let kind = if dims.is_single() {
             Squeeze::Dim
@@ -231,6 +243,7 @@ impl Tensor {
     }
 
     /// The view of `l` without the dimensions `d` where `remove[d]` holds.
+    #[track_caller]
     fn remove_dims(&self, kind: Squeeze, l: &Layout, remove: &[bool]) -> Tensor {
         let keep = || (0..l.shape.len()).filter(|&d| !remove[d]);
         let out = self.make_view(Layout {
@@ -244,6 +257,7 @@ impl Tensor {
     }
 
     /// Inserts a dimension of size 1 at position `dim` (`-1` appends at the end).
+    #[track_caller]
     pub fn unsqueeze(&self, dim: i64) -> Tensor {
         let l = self.layout();
         let d = normalize_dim(dim, l.shape.len() + 1);
@@ -254,6 +268,7 @@ impl Tensor {
 
     /// A view of all of `self` with the same layout (PyTorch's `alias`): what indexing returns
     /// when no index item changes anything, so that the result is still a new tensor.
+    #[track_caller]
     pub(crate) fn alias(&self) -> Tensor {
         let out = self.make_view(self.layout());
         formulas::alias(self, &out);
@@ -262,6 +277,7 @@ impl Tensor {
 
     /// The `length` elements along `dim` starting at `start` (negative values count from the
     /// end).
+    #[track_caller]
     pub fn narrow(&self, dim: i64, start: i64, length: usize) -> Tensor {
         let l = self.layout();
         if l.shape.is_empty() {
@@ -289,6 +305,7 @@ impl Tensor {
     }
 
     /// The slice at `index` along `dim`, with that dimension removed.
+    #[track_caller]
     pub fn select(&self, dim: i64, index: i64) -> Tensor {
         let l = self.layout();
         let (d, index) = select_position(&l.shape, dim, index);
@@ -299,6 +316,7 @@ impl Tensor {
 
     /// A Python-style slice `start:end:step` along `dim`: bounds may be negative and are clamped
     /// to the size.
+    #[track_caller]
     pub(crate) fn slice(
         &self,
         dim: usize,
@@ -314,6 +332,7 @@ impl Tensor {
     }
 
     /// Merges dimensions `start_dim..=end_dim` into one.
+    #[track_caller]
     pub fn flatten(&self, start_dim: i64, end_dim: i64) -> Tensor {
         let shape = self.shape();
         if shape.is_empty() {
@@ -358,6 +377,7 @@ impl Tensor {
     ///
     /// Panics with PyTorch's messages if `dim` is out of range, `size` exceeds the size of `dim`
     /// or `step` is zero.
+    #[track_caller]
     pub fn unfold(&self, dim: i64, size: usize, step: usize) -> Tensor {
         let l = self.layout();
         let nd = l.shape.len();
@@ -393,6 +413,7 @@ impl Tensor {
     /// # Panics
     ///
     /// Panics if the view would reach outside the storage.
+    #[track_caller]
     pub fn as_strided(
         &self,
         size: impl IntoShape,
@@ -414,6 +435,7 @@ impl Tensor {
     }
 
     /// `self` if it is already contiguous, otherwise a contiguous copy.
+    #[track_caller]
     pub fn contiguous(&self) -> Tensor {
         if self.is_contiguous() {
             self.clone()

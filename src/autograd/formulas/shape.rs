@@ -9,6 +9,7 @@ use crate::{Scalar, Tensor};
 /// Records the backward node of `out = concat(inputs, dim)`, with `dim` already wrapped.
 /// `lengths` holds the size of each input along `dim`, `None` for a one-dimensional empty input
 /// that was skipped.
+#[track_caller]
 pub(crate) fn concat(
     inputs: &[Option<&Tensor>],
     dim: usize,
@@ -19,22 +20,26 @@ pub(crate) fn concat(
 }
 
 /// Records the backward node of `out = x.flip(dims)`, with `dims` already wrapped.
+#[track_caller]
 pub(crate) fn flip(x: &Tensor, dims: Vec<i64>, out: &Tensor) {
     record(&[Some(x)], &[out], |_| FlipBackward0 { dims });
 }
 
 /// Records the backward node of `out = x.triu(diagonal)` (`upper`) or `x.tril(diagonal)`.
+#[track_caller]
 pub(crate) fn triangle(x: &Tensor, diagonal: i64, upper: bool, out: &Tensor) {
     record(&[Some(x)], &[out], |_| TriangleBackward { diagonal, upper });
 }
 
 /// Records the backward node of `out = constant_pad_nd(x, pad, value)`.
+#[track_caller]
 pub(crate) fn constant_pad_nd(x: &Tensor, pad: Vec<i64>, out: &Tensor) {
     record(&[Some(x)], &[out], |_| ConstantPadNdBackward0 { pad });
 }
 
 /// Records the backward node of `out = unfold_backward(grad, .., dim, size, step)`, the gradient
 /// of an unfold, with `dim` already wrapped.
+#[track_caller]
 pub(crate) fn unfold_backward(grad: &Tensor, dim: usize, size: usize, step: usize, out: &Tensor) {
     record(&[Some(grad)], &[out], |_| UnfoldBackwardBackward0 {
         dim,

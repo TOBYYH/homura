@@ -15,6 +15,7 @@ thread_local! {
 }
 
 /// The dtype used for floating point tensors when none is given (`F32` unless changed).
+#[track_caller]
 pub fn default_dtype() -> DType {
     let v = DEFAULT_DTYPE.load(Ordering::Relaxed);
     DType::ALL.into_iter().find(|&d| d as u8 == v).unwrap()
@@ -25,6 +26,7 @@ pub fn default_dtype() -> DType {
 /// # Panics
 ///
 /// Panics if `dtype` is not a floating point type.
+#[track_caller]
 pub fn set_default_dtype(dtype: DType) {
     assert!(
         dtype.is_floating_point(),
@@ -35,6 +37,7 @@ pub fn set_default_dtype(dtype: DType) {
 
 /// The device used for new tensors when none is given: the innermost active [`device_scope`] on
 /// this thread, otherwise the process-wide default (`Device::Cpu` unless changed).
+#[track_caller]
 pub fn default_device() -> Device {
     DEVICE_SCOPE
         .with(Cell::get)
@@ -42,6 +45,7 @@ pub fn default_device() -> Device {
 }
 
 /// Sets the process-wide default device.
+#[track_caller]
 pub fn set_default_device(device: Device) {
     *DEFAULT_DEVICE.write().unwrap_or_else(|e| e.into_inner()) = device;
 }
@@ -52,6 +56,7 @@ pub fn set_default_device(device: Device) {
 /// let _guard = homura::device_scope(homura::Device::Meta);
 /// assert_eq!(homura::zeros([2, 3]).device(), homura::Device::Meta);
 /// ```
+#[track_caller]
 pub fn device_scope(device: Device) -> DeviceScope {
     let previous = DEVICE_SCOPE.with(|s| s.replace(Some(device)));
     DeviceScope {

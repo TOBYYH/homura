@@ -19,6 +19,7 @@ use crate::{Device, Scalar, Shape, Tensor};
 ///
 /// Panics with PyTorch's messages if `pad` has odd length or more than two entries per
 /// dimension, if a crop would leave a negative size, or if `value` overflows the dtype.
+#[track_caller]
 pub(crate) fn constant_pad_nd(input: &Tensor, pad: &[i64], value: Scalar) -> Tensor {
     let src = input.data();
     let shape = &src.layout.shape;
@@ -57,9 +58,10 @@ pub(crate) fn constant_pad_nd(input: &Tensor, pad: &[i64], value: Scalar) -> Ten
         out_start[d] = before.max(0) as usize;
         crop_shape[d] = len as usize;
         let padded = len + before.max(0) as i128 + after.max(0) as i128;
-        out_shape[d] = usize::try_from(padded).unwrap_or_else(|_| {
+        let Ok(padded) = usize::try_from(padded) else {
             panic!("constant_pad_nd(): the padded size {padded} of dimension {d} is too large")
-        });
+        };
+        out_shape[d] = padded;
     }
     let (dtype, device) = (src.dtype, src.device());
     // The cropped input, if it has elements: an empty layout may have arbitrary strides.

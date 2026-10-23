@@ -48,6 +48,7 @@ pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool)
 
 /// `out` = the slices of `src` along `dim` picked by the 1-D integer tensor `index`. Negative
 /// indices count from the end when `allow_negative` is set.
+#[track_caller]
 pub(crate) fn index_select(
     out: &TensorData,
     src: &TensorData,

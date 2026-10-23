@@ -34,6 +34,7 @@ use crate::Tensor;
 /// this trait lets a [`Sequential`] call it on layers of any type.
 pub trait Forward: Module {
     /// The output of the layer for `input`.
+    #[track_caller]
     fn forward(&self, input: &Tensor) -> Tensor;
 }
 
@@ -49,6 +50,7 @@ impl<T: Forward> Forward for Arc<T> {
 /// (`[3, 2]`), like PyTorch's `int | tuple[int, int]` arguments.
 pub trait IntoPair {
     /// The pair: `[n, n]` for a number.
+    #[track_caller]
     fn into_pair(self) -> [usize; 2];
 }
 

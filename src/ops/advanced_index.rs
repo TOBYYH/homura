@@ -19,6 +19,7 @@ use crate::{DType, Device, Shape, Tensor};
 
 /// Panics unless `dtype` is a dtype that indexing accepts: `i64` or `i32` positions, or a `bool`
 /// mask. PyTorch also takes `u8` tensors, as deprecated masks.
+#[track_caller]
 pub(crate) fn check_index_dtype(dtype: DType) {
     if !matches!(dtype, DType::I64 | DType::I32 | DType::Bool) {
         let hint = if dtype == DType::U8 {
@@ -85,6 +86,7 @@ impl AdvancedIndex {
     /// the target), mask shapes, the number of indices, broadcasting, and indices into empty
     /// dimensions. The positions are checked later, by [`positions`](Self::positions) or
     /// [`check_bounds`](Self::check_bounds).
+    #[track_caller]
     fn new(target: &TensorData, indices: &[Option<Tensor>]) -> AdvancedIndex {
         let device = target.device();
         let shape = &target.layout.shape;
@@ -167,18 +169,20 @@ impl AdvancedIndex {
         let coords: Vec<Coords> = perm.iter().filter_map(|&k| slots[k].take()).collect();
         let broadcast = coords
             .iter()
-            .try_fold(Shape::scalar(), |acc, c| broadcast(&acc, &c.shape))
-            .unwrap_or_else(|| {
-                let shapes: Vec<String> = coords.iter().map(|c| format!("{:?}", c.shape)).collect();
-                panic!(
-                    "shape mismatch: indexing tensors could not be broadcast together with shapes \
-                     {}",
-                    shapes.join(", ")
-                )
-            });
+            .try_fold(Shape::scalar(), |acc, c| broadcast(&acc, &c.shape));
+        // `match` / `let else` rather than closures on the paths that panic: `#[track_caller]`
+        // doesn't pass through closures.
+        let Some(broadcast) = broadcast else {
+            let shapes: Vec<String> = coords.iter().map(|c| format!("{:?}", c.shape)).collect();
+            panic!(
+                "shape mismatch: indexing tensors could not be broadcast together with shapes {}",
+                shapes.join(", ")
+            )
+        };
         let n = coords.len();
-        let num_positions = checked_num_elements(&broadcast)
-            .unwrap_or_else(|| panic!("the indices broadcast to a shape {broadcast:?} too large"));
+        let Some(num_positions) = checked_num_elements(&broadcast) else {
+            panic!("the indices broadcast to a shape {broadcast:?} too large")
+        };
         if num_positions > 0 && shape[first..first + n].contains(&0) {
             panic!("index is out of bounds for dimension with size 0");
         }
@@ -218,6 +222,7 @@ impl AdvancedIndex {
     /// Panics unless every position of the indices on the CPU is in range: from `-size` to
     /// `size - 1` along its dimension. Unlike PyTorch, this holds even when the result is empty
     /// and for meta targets. Indices on the meta device have no positions to check.
+    #[track_caller]
     fn check_bounds(&self) {
         for (k, (c, &size)) in self.coords.iter().zip(self.indexed_sizes()).enumerate() {
             let size = size as i64;
@@ -231,6 +236,7 @@ impl AdvancedIndex {
     /// The linear position in the indexed subspace (row-major over the indexed dimensions) for
     /// every element of the broadcast shape, in row-major order, after
     /// [`check_bounds`](Self::check_bounds). All indices must be on the CPU.
+    #[track_caller]
     fn positions(&self) -> Vec<usize> {
         self.check_bounds();
         let sizes = self.indexed_sizes();
@@ -283,6 +289,7 @@ impl AdvancedIndex {
     }
 
     /// The indexing result for a CPU target: a new contiguous tensor of `out_shape`.
+    #[track_caller]
     fn gather(&self, target: &TensorData) -> Tensor {
         let out = Tensor::empty_on(self.out_shape.clone(), target.dtype, Device::Cpu);
         if self.out_shape.num_elements() == 0 {
@@ -308,6 +315,7 @@ impl AdvancedIndex {
     /// Panics unless `values` can be written into the indexing result of `target`: it has the
     /// dtype and device of the target and broadcasts to `out_shape` without dropping leading
     /// dimensions of size 1.
+    #[track_caller]
     fn check_values(&self, target: &TensorData, values: &TensorData) {
         if values.dtype != target.dtype {
             panic!(
@@ -334,6 +342,7 @@ impl AdvancedIndex {
     /// with `accumulate`, otherwise copied, with the last of repeated positions winning. The
     /// work happens on a contiguous copy with the dimensions in the order of `perm`, which the
     /// result sees in the original order: new storage, possibly not contiguous.
+    #[track_caller]
     fn scatter(&self, target: &TensorData, values: &TensorData, accumulate: bool) -> Tensor {
         let work = clone_data(&self.permuted(target));
         if self.out_shape.num_elements() == 0 {
@@ -377,6 +386,7 @@ impl AdvancedIndex {
 /// them, before anything is copied: the elements of `target` are distinct memory locations, and
 /// neither `values` nor an index may share memory with it. The out-of-place `index_put` writes
 /// into a copy and accepts all of these.
+#[track_caller]
 pub(crate) fn check_index_put_target(target: &Tensor, indices: &[Option<Tensor>], values: &Tensor) {
     let dst = target.data();
     check_writable(&dst);
@@ -389,6 +399,7 @@ impl Tensor {
     /// dimension (`None` keeps the dimension), as described in the module documentation. The
     /// result is new memory, never a view, and records `IndexBackward0`, which saves the index
     /// tensors as given.
+    #[track_caller]
     pub(crate) fn index_tensors(&self, indices: &[Option<Tensor>]) -> Tensor {
         let data = self.data();
         let info = AdvancedIndex::new(&data, indices);
@@ -405,6 +416,7 @@ impl Tensor {
     /// ATen's `index_put`: a copy of `self` with `values` written where
     /// [`index_tensors`](Tensor::index_tensors) would read, added with `accumulate`. Records
     /// `IndexPutBackward0`.
+    #[track_caller]
     pub(crate) fn index_put_tensors(
         &self,
         indices: &[Option<Tensor>],

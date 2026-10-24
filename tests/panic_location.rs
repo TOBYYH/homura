@@ -1,9 +1,10 @@
 //! Panics for invalid arguments report the caller's line (`#[track_caller]`), through every kind
 //! of entry point: tensor methods and operators, free functions, `nn` functions, layers and
 //! module methods (directly and through `Forward` / `Sequential`), optimizers (concrete and
-//! `dyn`), autograd entry points and `Function::apply`, and through the internal checks those
-//! entry points share (argument checks, CPU kernels that validate indices or dtypes, the
-//! stale-view check of the recording).
+//! `dyn`), autograd entry points and `Function::apply`, user code in the scope closures
+//! (`with_no_grad`, `with_device`), and through the internal checks those entry points share
+//! (argument checks, CPU kernels that validate indices or dtypes, the stale-view check of the
+//! recording).
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
@@ -356,6 +357,23 @@ impl Function for Passthrough {
     }
 }
 
+/// `2 x`.
+struct Double;
+
+impl Function for Double {
+    fn forward(&mut self, _ctx: &mut ForwardContext, inputs: &[&Tensor]) -> Vec<Tensor> {
+        vec![inputs[0] * 2.0]
+    }
+
+    fn backward(
+        &self,
+        _ctx: &BackwardContext<'_>,
+        grads: &[Option<Tensor>],
+    ) -> Vec<Option<Tensor>> {
+        vec![grads[0].as_ref().map(|g| g * 2.0)]
+    }
+}
+
 #[test]
 fn autograd_entry_points() {
     let x = homura::ones([2]);
@@ -375,6 +393,16 @@ fn autograd_entry_points() {
     at!(autograd::backward(&[&z], &[Some(&wrong)], options.clone()));
     at!(autograd::backward(&[&no_grad], &[], options));
     at!(Passthrough.apply(&[&x]));
+    let o = GradOptions::default;
+    at!(autograd::grad_array(&[&y], [], o()));
+    at!(autograd::grad_array(&[&y], [&x, &no_grad], o()));
+    at!(autograd::grad_array(&[&w], [&x, &unused], o()));
+    let p = Parameter::new(homura::ones([2]));
+    at!(autograd::grad_array(&[&w], [&p], o()));
+    at!(Passthrough.apply_array::<1>(&[&x]));
+    at!(Double.apply_array::<2>(&[&x]));
+    at!(Double.apply_array::<0>(&[&x]));
+    at!(homura::with_no_grad(|| Double.apply_array::<2>(&[&x])));
     at!(x.backward_with(&homura::ones([5])));
     at!(homura::tensor([1i64]).requires_grad_(true));
     // In-place on a leaf that requires grad, in grad mode.
@@ -640,5 +668,30 @@ fn errors_during_the_backward_pass_are_reported_inside_homura() {
 fn panics_in_user_closures_keep_their_own_location() {
     // Not routed through homura: a sanity check of the harness itself.
     at!(Vec::<u8>::new()[1]);
+    // The scope closures: a panic of homura or of the user's code in the closure.
+    let x = homura::ones([2]);
+    at!(homura::with_no_grad(|| x.view([3])));
+    at!(homura::with_enable_grad(|| x.view([3])));
+    at!(homura::with_grad_enabled(false, || x.view([3])));
+    at!(autograd::with_no_grad(|| Vec::<u8>::new()[1]));
+    at!(homura::with_device(Device::Meta, || homura::zeros([2]).view([3])));
+    at!(homura::with_device(Device::Meta, || x.to_vec::<f32>()[5]));
+    let (m, v) = (Device::Meta, [3]);
+    at!(homura::with_no_grad(|| homura::with_device(m, || x.view(v))));
     finish();
+    // On separate lines: the line in the closure, not the line of the call.
+    let start = line!();
+    let grad_mode = panic_location(|| {
+        homura::with_no_grad(|| {
+            x.view([3]);
+        });
+    });
+    let device = panic_location(|| {
+        homura::with_device(Device::Meta, || {
+            x.view([3]);
+        });
+    });
+    let file = file!().to_string();
+    assert_eq!(grad_mode, Some((file.clone(), start + 3)));
+    assert_eq!(device, Some((file, start + 8)));
 }

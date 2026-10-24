@@ -49,9 +49,13 @@ mod tensor;
 
 pub use half::{bf16, f16};
 
-pub use autograd::{GradModeGuard, enable_grad, is_grad_enabled, no_grad, set_grad_enabled};
+pub use autograd::{
+    GradModeGuard, enable_grad, is_grad_enabled, no_grad, set_grad_enabled, with_enable_grad,
+    with_grad_enabled, with_no_grad,
+};
 pub use defaults::{
-    DeviceScope, default_device, default_dtype, device_scope, set_default_device, set_default_dtype,
+    DeviceScope, default_device, default_dtype, device_scope, set_default_device,
+    set_default_dtype, with_device,
 };
 pub use device::Device;
 pub use dtype::{DType, Element, Scalar, can_cast, promote_types};

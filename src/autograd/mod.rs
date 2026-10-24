@@ -29,14 +29,14 @@
 //! | --- | --- |
 //! | `x.requires_grad_()` | [`x.requires_grad_(true)`](Tensor::requires_grad_) |
 //! | `y.backward()`, `y.backward(g)` | [`y.backward()`](Tensor::backward), [`y.backward_with(&g)`](Tensor::backward_with) |
-//! | `torch.autograd.backward`, `torch.autograd.grad` | [`backward`], [`grad`], with [`BackwardOptions`] and [`GradOptions`] |
+//! | `torch.autograd.backward`, `torch.autograd.grad` | [`backward`], [`grad`] (or [`grad_array`] for a fixed number of inputs), with [`BackwardOptions`] and [`GradOptions`] |
 //! | `x.grad`, `x.grad = None` | [`x.grad()`](Tensor::grad), [`x.set_grad(None)`](Tensor::set_grad) |
 //! | `y.grad_fn`, `y.is_leaf`, `y.retain_grad()` | [`Tensor::grad_fn`], [`Tensor::is_leaf`], [`Tensor::retain_grad`] |
 //! | `x.detach()`, `x.detach_()` | [`Tensor::detach`], [`Tensor::detach_`] |
-//! | `with torch.no_grad():` | `let _guard = homura::no_grad();` |
+//! | `with torch.no_grad():` | [`homura::with_no_grad(\|\| ..)`](with_no_grad), or `let _guard = homura::no_grad();` |
 //! | `x.clone()` | [`x.deep_clone()`](Tensor::deep_clone) |
 //! | `repr(y)` | `format!("{y:?}")`, with the same `grad_fn=<MulBackward0>` or `requires_grad=True` |
-//! | `class F(torch.autograd.Function)`, `F.apply(x)` | `impl` [`Function`] `for F`, [`F.apply(&[&x])`](Function::apply) |
+//! | `class F(torch.autograd.Function)`, `F.apply(x)` | `impl` [`Function`] `for F`, [`F.apply(&[&x])`](Function::apply) or [`let [y] = F.apply_array(&[&x])`](Function::apply_array) |
 //! | `ctx.save_for_backward(x)`, `ctx.saved_tensors` | [`ForwardContext::save_for_backward`], [`BackwardContext::saved_tensors`] |
 //! | `ctx.needs_input_grad[i]` | [`ForwardContext::needs_input_grad`], [`BackwardContext::needs_input_grad`] |
 //! | `ctx.mark_non_differentiable(y)` | [`ForwardContext::mark_non_differentiable`] |
@@ -172,10 +172,10 @@
 //!
 //! let x = homura::tensor([0.0, 1.0]);
 //! x.requires_grad_(true);
-//! let y = Exp.apply(&[&x]).remove(0);
+//! let [y] = Exp.apply_array(&[&x]);
 //! let options = GradOptions { create_graph: true, ..Default::default() };
-//! let dx = autograd::grad(&[&y.sum()], &[&x], options).remove(0).unwrap();
-//! let d2x = autograd::grad(&[&dx.sum()], &[&x], GradOptions::default()).remove(0).unwrap();
+//! let [dx] = autograd::grad_array(&[&y.sum()], [&x], options).map(Option::unwrap);
+//! let [d2x] = autograd::grad_array(&[&dx.sum()], [&x], GradOptions::default()).map(Option::unwrap);
 //! assert_eq!(d2x.to_vec::<f32>(), x.detach().exp().to_vec::<f32>());
 //! ```
 //!
@@ -291,19 +291,28 @@
 //!
 //! # Grad mode
 //!
-//! [`no_grad`], [`enable_grad`] and [`set_grad_enabled`] turn graph recording off or on for the
-//! current thread until the returned guard is dropped. They are also re-exported at the crate
-//! root.
+//! [`with_no_grad`], [`with_enable_grad`] and [`with_grad_enabled`] run a closure with graph
+//! recording off or on for the current thread and return its value. [`no_grad`],
+//! [`enable_grad`] and [`set_grad_enabled`] do the same until the returned guard is dropped. Both
+//! restore the previous mode also when the code panics, and all of them are re-exported at the
+//! crate root.
 //!
 //! ```
 //! use homura::autograd;
 //!
+//! let x = homura::ones([2]);
+//! x.requires_grad_(true);
+//! let y = autograd::with_no_grad(|| &x * 2.0);
+//! assert!(!y.requires_grad());
 //! {
 //!     let _guard = autograd::no_grad();
 //!     assert!(!autograd::is_grad_enabled());
 //! }
 //! assert!(autograd::is_grad_enabled());
 //! ```
+//!
+//! Bind the guard to a named variable: `let _ = homura::no_grad();` drops it at once, so the
+//! following code runs with grad mode unchanged. The closures can't be misused this way.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -367,6 +376,9 @@ pub fn set_grad_enabled(enabled: bool) -> GradModeGuard {
 /// let _guard = homura::no_grad();
 /// assert!(!homura::is_grad_enabled());
 /// ```
+///
+/// The guard must be bound to a named variable: `let _ = homura::no_grad();` drops it at once,
+/// and `#[must_use]` doesn't warn about `let _ =`. [`with_no_grad`] avoids the mistake.
 #[track_caller]
 pub fn no_grad() -> GradModeGuard {
     set_grad_enabled(false)
@@ -377,6 +389,40 @@ pub fn no_grad() -> GradModeGuard {
 #[track_caller]
 pub fn enable_grad() -> GradModeGuard {
     set_grad_enabled(true)
+}
+
+/// Runs `f` with graph recording enabled or disabled on this thread and returns its value, like
+/// `with torch.set_grad_enabled(enabled):`. The previous grad mode is restored when `f` returns
+/// or panics.
+#[track_caller]
+pub fn with_grad_enabled<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let _guard = set_grad_enabled(enabled);
+    f()
+}
+
+/// Runs `f` with graph recording disabled on this thread and returns its value, like
+/// `with torch.no_grad():`. The previous grad mode is restored when `f` returns or panics.
+///
+/// ```
+/// let w = homura::ones([2]);
+/// w.requires_grad_(true);
+/// let y = (&w * 3.0).sum();
+/// y.backward();
+/// // Update the leaf in place without recording the update.
+/// homura::with_no_grad(|| w.sub_(&(w.grad().unwrap() * 0.1)));
+/// assert!(w.is_leaf());
+/// assert_eq!(w.to_vec::<f32>(), [0.7, 0.7]);
+/// ```
+#[track_caller]
+pub fn with_no_grad<R>(f: impl FnOnce() -> R) -> R {
+    with_grad_enabled(false, f)
+}
+
+/// Runs `f` with graph recording enabled on this thread and returns its value, like
+/// `with torch.enable_grad():`. The previous grad mode is restored when `f` returns or panics.
+#[track_caller]
+pub fn with_enable_grad<R>(f: impl FnOnce() -> R) -> R {
+    with_grad_enabled(true, f)
 }
 
 /// Guard returned by [`no_grad`], [`enable_grad`] and [`set_grad_enabled`]; restores the
@@ -404,7 +450,7 @@ pub struct BackwardOptions {
     pub create_graph: bool,
 }
 
-/// Options of [`grad`], with PyTorch's defaults.
+/// Options of [`grad`] and [`grad_array`], with PyTorch's defaults.
 #[derive(Clone, Debug, Default)]
 pub struct GradOptions {
     /// The gradient of each output, the vector of the vector-Jacobian product: empty, or one
@@ -492,6 +538,42 @@ pub fn grad(outputs: &[&Tensor], inputs: &[&Tensor], options: GradOptions) -> Ve
              Set allow_unused if this is the desired behavior."
         );
     }
+    grads
+}
+
+/// [`grad`] for a fixed number of inputs: returns an array with one entry per input, so that the
+/// gradients can be bound by destructuring. Otherwise the same as `grad`, including the panics;
+/// an empty `inputs` panics like `grad`.
+///
+/// The elements of `inputs` have the concrete type `&Tensor`, so an array literal can mix tensors
+/// and [`nn::Parameter`](crate::nn::Parameter)s, which dereference to tensors. A variable that
+/// is already an array of `&Parameter` isn't converted; write the array literal in the call.
+///
+/// ```
+/// use homura::autograd::{self, GradOptions};
+/// use homura::nn::Parameter;
+///
+/// let x = homura::tensor([1.0, 2.0]);
+/// x.requires_grad_(true);
+/// let w = Parameter::new(homura::tensor([3.0, 4.0]));
+/// let loss = w.mul(&x).sum();
+/// let [dx, dw] = autograd::grad_array(&[&loss], [&x, &w], GradOptions::default());
+/// assert_eq!(dx.unwrap().to_vec::<f32>(), [3.0, 4.0]);
+/// assert_eq!(dw.unwrap().to_vec::<f32>(), [1.0, 2.0]);
+/// ```
+///
+/// # Panics
+///
+/// Like [`grad`].
+#[track_caller]
+pub fn grad_array<const N: usize>(
+    outputs: &[&Tensor],
+    inputs: [&Tensor; N],
+    options: GradOptions,
+) -> [Option<Tensor>; N] {
+    let Ok(grads) = grad(outputs, &inputs, options).try_into() else {
+        unreachable!("`grad` returns one gradient per input");
+    };
     grads
 }
 

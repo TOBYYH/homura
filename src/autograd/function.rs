@@ -22,7 +22,8 @@ use crate::Tensor;
 /// `torch.autograd.Function`.
 ///
 /// Implement [`forward`](Function::forward) and [`backward`](Function::backward) and call the
-/// provided [`apply`](Function::apply), which consumes the value: its fields carry the
+/// provided [`apply`](Function::apply) (or [`apply_array`](Function::apply_array) for a fixed
+/// number of outputs), which consumes the value: its fields carry the
 /// non-tensor arguments of the operation (PyTorch's extra `forward` arguments), and `forward`
 /// can store values that `backward` needs in them (PyTorch's `ctx.attr = ...`). Tensors that
 /// `backward` needs go through [`ForwardContext::save_for_backward`].
@@ -48,7 +49,7 @@ use crate::Tensor;
 ///
 /// let x = homura::tensor([0.0, 1.0]);
 /// x.requires_grad_(true);
-/// let y = Exp.apply(&[&x]).remove(0);
+/// let [y] = Exp.apply_array(&[&x]);
 /// assert_eq!(y.grad_fn().unwrap().name(), "ExpBackward");
 /// y.sum().backward();
 /// assert_eq!(x.grad().unwrap().to_vec::<f32>(), y.detach().to_vec::<f32>());
@@ -94,6 +95,27 @@ pub trait Function: Send + Sync + Sized + 'static {
     #[track_caller]
     fn apply(self, inputs: &[&Tensor]) -> Vec<Tensor> {
         apply(self, inputs)
+    }
+
+    /// [`apply`](Function::apply) for a function with `M` outputs: returns them as an array, so
+    /// that they can be bound by destructuring, as in `let [values, indices] = f.apply_array(..)`.
+    ///
+    /// # Panics
+    ///
+    /// Like `apply`; also if `forward` returned another number of outputs. That is checked once
+    /// `apply` has finished, so the call has been recorded and whatever else `forward` did has
+    /// happened.
+    #[track_caller]
+    fn apply_array<const M: usize>(self, inputs: &[&Tensor]) -> [Tensor; M] {
+        let outputs = apply(self, inputs);
+        let n = outputs.len();
+        let Ok(outputs) = outputs.try_into() else {
+            panic!(
+                "apply_array expects {M} outputs, but {}::forward returned {n}",
+                function_name::<Self>()
+            );
+        };
+        outputs
     }
 }
 

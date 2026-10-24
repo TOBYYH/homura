@@ -449,6 +449,68 @@ fn no_outputs_and_no_inputs() {
     assert!(!y.requires_grad() && y.grad_fn().is_none());
 }
 
+#[test]
+fn apply_array_returns_the_outputs_of_apply() {
+    let x = leaf(&[-0.5, 0.0, 0.5]);
+    let [index, e, square] = ExpAndSquare.apply_array(&[&x]);
+    let expected = ExpAndSquare.apply(&[&x]);
+    for (out, expected) in [&index, &e, &square].into_iter().zip(&expected) {
+        // The value, dtype, `requires_grad` and `grad_fn`.
+        assert_eq!(format!("{out:?}"), format!("{expected:?}"));
+    }
+    assert_eq!(e.grad_fn().unwrap().name(), "ExpAndSquareBackward");
+    assert!(e.grad_fn().unwrap().is_same(&square.grad_fn().unwrap()));
+    let dx = grad1(&(&e + &square).sum(), &x, true);
+    assert_close(&vals(&dx), &vals(&(x.detach().exp() + x.detach() * 2.0)));
+    let [y] = Square.apply_array(&[&x]);
+    assert_close(&vals(&grad1(&y.sum(), &x, false)), &[-1.0, 0.0, 1.0]);
+    let [] = Nothing.apply_array(&[&x]);
+    let [y] = Nothing.apply_array(&[]);
+    assert!(!y.requires_grad());
+    // In no-grad mode, nothing is recorded, as with `apply`.
+    let [y] = homura::with_no_grad(|| Square.apply_array(&[&x]));
+    assert!(!y.requires_grad() && y.grad_fn().is_none());
+}
+
+#[test]
+fn apply_array_checks_the_number_of_outputs_after_apply() {
+    let x = leaf(&[1.0, 2.0]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = || CountForward {
+        calls: calls.clone(),
+    };
+    assert_eq!(
+        panic_message(|| drop(count().apply_array::<2>(&[&x]))),
+        "apply_array expects 2 outputs, but CountForward::forward returned 1"
+    );
+    assert_eq!(
+        panic_message(|| {
+            let _ = count().apply_array::<0>(&[&x]);
+        }),
+        "apply_array expects 0 outputs, but CountForward::forward returned 1"
+    );
+    assert_eq!(
+        panic_message(|| drop(ExpAndSquare.apply_array::<1>(&[&x]))),
+        "apply_array expects 1 outputs, but ExpAndSquare::forward returned 3"
+    );
+    assert_eq!(
+        panic_message(|| drop(Nothing.apply_array::<1>(&[&x]))),
+        "apply_array expects 1 outputs, but Nothing::forward returned 0"
+    );
+    // `forward` ran: its side effects are not undone. Grad mode is as it was.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(homura::is_grad_enabled());
+    homura::with_no_grad(|| {
+        assert!(panic_message(|| drop(count().apply_array::<3>(&[&x]))).contains("returned 1"));
+        assert!(!homura::is_grad_enabled());
+    });
+    // The checks of `apply` come first, with its messages.
+    assert_eq!(
+        panic_message(|| drop(Modify.apply_array::<2>(&[&f64s(&[1.0])]))),
+        panic_message(|| drop(Modify.apply(&[&f64s(&[1.0])])))
+    );
+}
+
 /// Builds its output with a recorded operation under `enable_grad`, and stashes the handle it
 /// returns.
 struct EnableGrad {

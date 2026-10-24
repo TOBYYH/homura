@@ -56,6 +56,9 @@ pub fn set_default_device(device: Device) {
 /// let _guard = homura::device_scope(homura::Device::Meta);
 /// assert_eq!(homura::zeros([2, 3]).device(), homura::Device::Meta);
 /// ```
+///
+/// The guard must be bound to a named variable: `let _ = homura::device_scope(..);` drops it at
+/// once. [`with_device`] avoids the mistake.
 #[track_caller]
 pub fn device_scope(device: Device) -> DeviceScope {
     let previous = DEVICE_SCOPE.with(|s| s.replace(Some(device)));
@@ -63,6 +66,22 @@ pub fn device_scope(device: Device) -> DeviceScope {
         previous,
         _not_send: PhantomData,
     }
+}
+
+/// Runs `f` with `device` as the default device on this thread, like `with torch.device(device):`,
+/// and returns its value. The previous default device is restored when `f` returns or panics.
+///
+/// ```
+/// use homura::Device;
+///
+/// let x = homura::with_device(Device::Meta, || homura::zeros([2, 3]));
+/// assert_eq!(x.device(), Device::Meta);
+/// assert_eq!(homura::zeros([2]).device(), Device::Cpu);
+/// ```
+#[track_caller]
+pub fn with_device<R>(device: Device, f: impl FnOnce() -> R) -> R {
+    let _guard = device_scope(device);
+    f()
 }
 
 /// Guard returned by [`device_scope`]; restores the previous default device when dropped.

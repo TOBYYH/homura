@@ -25,6 +25,16 @@ All notable changes to this project are documented in this file. The format is b
   learning rate of that group only, after checking the group's options with it like
   `add_param_group` (the group is unchanged if they are invalid). `Box<O>` and `&mut O` implement
   `Optimizer` and `TypedOptimizer` for an `O` that does, trait objects included.
+- `autograd::grad_array`: `autograd::grad` for a fixed number of inputs, which returns an array
+  to destructure: `let [dx, dw] = autograd::grad_array(&[&loss], [&x, &w], options)`. The
+  inputs are an array literal of `&Tensor`, so `&Parameter`s dereference as with `grad`, whose
+  signature is unchanged. `Function::apply_array` does the same for the outputs of a custom
+  function, `let [y] = MyFunction.apply_array(&[&x])`, and panics if `forward` returns another
+  number of outputs (checked after the call, which is then recorded).
+- Closure forms of the scopes: `with_no_grad(|| ..)`, `with_enable_grad`, `with_grad_enabled`
+  and `with_device(device, || ..)` run a closure with that grad mode or default device and
+  return its value; the previous state is restored also when the closure panics. Unlike the
+  guards of `no_grad` and `device_scope`, they can't be ended early by `let _ = ..`.
 
 ### Changed
 

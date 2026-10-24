@@ -58,8 +58,8 @@ assert_eq!(x.grad().unwrap().to_vec::<f32>(), [3.0, 12.0, 27.0]);
 // Keep the graph of the gradient to differentiate it again: d(sum(3x²))/dx = 6x
 let y = (&x * &x * &x).sum();
 let options = GradOptions { create_graph: true, ..Default::default() };
-let dy = autograd::grad(&[&y], &[&x], options).remove(0).unwrap();
-let d2y = autograd::grad(&[&dy.sum()], &[&x], GradOptions::default()).remove(0).unwrap();
+let [dy] = autograd::grad_array(&[&y], [&x], options).map(Option::unwrap);
+let [d2y] = autograd::grad_array(&[&dy.sum()], [&x], GradOptions::default()).map(Option::unwrap);
 assert_eq!(d2y.to_vec::<f32>(), [6.0, 12.0, 18.0]);
 ```
 

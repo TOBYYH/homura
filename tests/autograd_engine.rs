@@ -7,7 +7,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
 use homura::autograd::{self, BackwardOptions, GradFn, GradOptions};
-use homura::{DType, Device, Tensor};
+use homura::nn::Parameter;
+use homura::{DType, Device, Shape, Tensor};
 
 fn t(values: &[f32]) -> Tensor {
     Tensor::from_slice(values, [values.len()])
@@ -1203,4 +1204,215 @@ fn backward_through_meta_to_cpu_fails_like_forward_to() {
         panic_message(|| m.sum().backward()),
         "Cannot copy out of meta tensor; no data!"
     );
+}
+
+// ------------------------------------------------- arrays and closures (M3 step 0d)
+
+/// What a gradient is, bit for bit: dtype, shape, whether it requires grad and its values.
+fn signature(g: &Option<Tensor>) -> Option<(DType, Shape, bool, Vec<u32>)> {
+    g.as_ref().map(|g| {
+        let bits = vals(g).iter().map(|v| v.to_bits()).collect();
+        (g.dtype(), g.shape(), g.requires_grad(), bits)
+    })
+}
+
+fn assert_same(actual: &[Option<Tensor>], expected: &[Option<Tensor>]) {
+    let actual: Vec<_> = actual.iter().map(signature).collect();
+    let expected: Vec<_> = expected.iter().map(signature).collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn grad_array_returns_what_grad_returns() {
+    let x = leaf(&[1., -2.]);
+    let p = Parameter::new(t(&[0.5, 3.]));
+    let q = Parameter::new(t(&[-1.5, 2.]));
+    // sum(3 x p q) + sum(x²), built again for each pass.
+    let loss = || x.mul(3.0).mul(&*p).mul(&*q).sum().add(x.mul(&x).sum());
+    let o = GradOptions::default;
+    let expected = autograd::grad(&[&loss()], &[&x, &p, &q], o());
+    assert_close(&vals(expected[0].as_ref().unwrap()), &[-0.25, 14.]);
+    // Tensors and parameters mixed, tensors only, parameters only, a parameter first, and an
+    // input twice.
+    let [gx, gp, gq] = autograd::grad_array(&[&loss()], [&x, &p, &q], o());
+    assert_same(&[gx, gp, gq], &expected);
+    let [gx] = autograd::grad_array(&[&loss()], [&x], o());
+    assert_same(&[gx], &expected[..1]);
+    let [gp, gq] = autograd::grad_array(&[&loss()], [&p, &q], o());
+    assert_same(&[gp, gq], &expected[1..]);
+    let [gq, gx] = autograd::grad_array(&[&loss()], [&q, &x], o());
+    assert_same(&[gq, gx], &[expected[2].clone(), expected[0].clone()]);
+    let [a, b] = autograd::grad_array(&[&loss()], [&x, &x], o());
+    assert_same(&[a, b], &[expected[0].clone(), expected[0].clone()]);
+    // An array variable of tensors.
+    let inputs = [&x, &*q];
+    let [gx, gq] = autograd::grad_array(&[&loss()], inputs, o());
+    assert_same(&[gx, gq], &[expected[0].clone(), expected[2].clone()]);
+    assert!(x.grad().is_none() && p.grad().is_none() && q.grad().is_none());
+
+    // Several outputs with given gradients and a non-leaf input, on a retained graph.
+    let h = x.mul(2.0);
+    let (s, v) = (h.sum(), h.mul(&*p));
+    let options = || GradOptions {
+        grad_outputs: vec![None, Some(t(&[1., 0.5]))],
+        retain_graph: Some(true),
+        ..Default::default()
+    };
+    let expected = autograd::grad(&[&s, &v], &[&h, &p, &x], options());
+    let [gh, gp, gx] = autograd::grad_array(&[&s, &v], [&h, &p, &x], options());
+    assert_same(&[gh, gp, gx], &expected);
+
+    // allow_unused: `None` at the position of the unused input.
+    let w = leaf(&[3.]);
+    let unused = || GradOptions {
+        allow_unused: true,
+        ..Default::default()
+    };
+    let expected = autograd::grad(&[&x.sum()], &[&w, &x], unused());
+    let [gw, gx] = autograd::grad_array(&[&x.sum()], [&w, &x], unused());
+    assert!(gw.is_none());
+    assert_same(&[gw, gx], &expected);
+
+    // create_graph: second derivatives through the returned array. d/dx and d/dp of
+    // sum(3 p q + 2 x) are 2 and 3 q.
+    let expected = autograd::grad(&[&loss()], &[&x, &p], create_graph());
+    let [dx, dp] = autograd::grad_array(&[&loss()], [&x, &p], create_graph());
+    assert!(dx.as_ref().unwrap().requires_grad() && dp.as_ref().unwrap().requires_grad());
+    assert_same(&[dx.clone(), dp], &expected);
+    let first = expected[0].as_ref().unwrap().sum();
+    let expected = autograd::grad(&[&first], &[&x, &p], o());
+    let [d2x, d2p] = autograd::grad_array(&[&dx.unwrap().sum()], [&x, &p], o());
+    assert_eq!(vals(d2x.as_ref().unwrap()), [2., 2.]);
+    assert_eq!(vals(d2p.as_ref().unwrap()), [-4.5, 6.]);
+    assert_same(&[d2x, d2p], &expected);
+}
+
+#[test]
+fn grad_array_panics_like_grad() {
+    let x = leaf(&[1., 2.]);
+    let plain = t(&[1.]);
+    let w = leaf(&[3.]);
+    let o = GradOptions::default;
+    let same = |array: &dyn Fn(), slice: &dyn Fn()| {
+        assert_eq!(panic_message(array), panic_message(slice));
+    };
+    same(
+        &|| {
+            let _ = autograd::grad_array(&[&x.sum()], [], o());
+        },
+        &|| drop(autograd::grad(&[&x.sum()], &[], o())),
+    );
+    assert_eq!(
+        panic_message(|| {
+            let _ = autograd::grad_array(&[&x.sum()], [], o());
+        }),
+        "`inputs` argument to `grad()` cannot be empty."
+    );
+    same(
+        &|| drop(autograd::grad_array(&[&x.sum()], [&plain], o())),
+        &|| drop(autograd::grad(&[&x.sum()], &[&plain], o())),
+    );
+    same(
+        &|| drop(autograd::grad_array(&[&x.sum()], [&x, &w], o())),
+        &|| drop(autograd::grad(&[&x.sum()], &[&x, &w], o())),
+    );
+    same(&|| drop(autograd::grad_array(&[&x], [&x], o())), &|| {
+        drop(autograd::grad(&[&x], &[&x], o()))
+    });
+}
+
+/// `grad` keeps taking borrowed arrays, slices and vectors, also of parameters.
+#[test]
+fn grad_takes_arrays_slices_and_vectors() {
+    let x = leaf(&[1., 2.]);
+    let p = Parameter::new(t(&[3., 4.]));
+    let loss = || x.mul(&*p).sum();
+    let o = GradOptions::default;
+    let expected = autograd::grad(&[&loss()], &[&x, &p], o());
+    assert_eq!(vals(expected[1].as_ref().unwrap()), [1., 2.]);
+    assert_same(
+        &autograd::grad(&[&loss()], &[&p, &x], o())[..1],
+        &expected[1..],
+    );
+    let inputs: Vec<&Tensor> = vec![&x, &p];
+    assert_same(&autograd::grad(&[&loss()], &inputs, o()), &expected);
+    assert_same(&autograd::grad(&[&loss()], &inputs[..], o()), &expected);
+    let array = [&x, &*p];
+    assert_same(&autograd::grad(&[&loss()], &array, o()), &expected);
+    let outputs = [loss()];
+    let outputs: Vec<&Tensor> = outputs.iter().collect();
+    assert_same(&autograd::grad(&outputs, &inputs, o()), &expected);
+}
+
+#[test]
+fn grad_mode_closures() {
+    let x = leaf(&[1., 2.]);
+    // The value of the closure, which borrows `x`; the mode inside and after.
+    let y = homura::with_no_grad(|| {
+        assert!(!homura::is_grad_enabled());
+        &x * 2.0
+    });
+    assert!(!y.requires_grad() && homura::is_grad_enabled());
+    // Nested: each closure restores the mode it found.
+    let (inner, outer) = homura::with_no_grad(|| {
+        let inner = homura::with_enable_grad(|| {
+            assert!(homura::is_grad_enabled());
+            &x * 3.0
+        });
+        assert!(!homura::is_grad_enabled());
+        (inner, &x * 4.0)
+    });
+    assert!(inner.requires_grad() && !outer.requires_grad());
+    assert_eq!(inner.grad_fn().unwrap().name(), "MulBackward0");
+    for enabled in [false, true] {
+        assert_eq!(
+            homura::with_grad_enabled(enabled, || x.exp()).requires_grad(),
+            enabled
+        );
+        homura::with_grad_enabled(!enabled, || {
+            assert_eq!(
+                homura::with_grad_enabled(enabled, homura::is_grad_enabled),
+                enabled
+            );
+            assert_eq!(homura::is_grad_enabled(), !enabled);
+            // A guard inside a closure ends before the closure does.
+            {
+                let _guard = homura::set_grad_enabled(enabled);
+                assert_eq!(homura::is_grad_enabled(), enabled);
+            }
+            assert_eq!(homura::is_grad_enabled(), !enabled);
+        });
+        assert!(homura::is_grad_enabled());
+    }
+    assert!(!autograd::with_no_grad(autograd::is_grad_enabled));
+    assert!(autograd::with_enable_grad(autograd::is_grad_enabled));
+    // Moved and mutably borrowed captures.
+    let names = vec![String::from("a")];
+    let moved = homura::with_no_grad(move || names);
+    assert_eq!(moved, ["a"]);
+    let mut count = 0;
+    homura::with_enable_grad(|| count += 1);
+    homura::with_grad_enabled(false, || count += 1);
+    assert_eq!(count, 2);
+    // A panic keeps its message and restores the mode, also in nested closures.
+    assert_eq!(
+        panic_message(|| homura::with_no_grad(|| panic!("inside"))),
+        "inside"
+    );
+    assert!(homura::is_grad_enabled());
+    homura::with_no_grad(|| {
+        let message = panic_message(|| {
+            homura::with_enable_grad(|| {
+                assert!(homura::is_grad_enabled());
+                x.view([3]);
+            })
+        });
+        assert!(message.contains("shape '[3]' is invalid"), "{message}");
+        assert!(!homura::is_grad_enabled());
+    });
+    assert!(homura::is_grad_enabled());
+    // The mode is per thread.
+    homura::with_no_grad(|| {
+        assert!(thread::spawn(homura::is_grad_enabled).join().unwrap());
+    });
 }

@@ -90,6 +90,35 @@
 //! `#[module(crate = "path")]` on the struct. To report members in another way, implement
 //! `Module` and `Member` by hand (see [`Module`]).
 //!
+//! `#[module(extra_repr = path)]` on the struct gives the function, of the signature
+//! `fn(&Self) -> String`, that implements [`Module::extra_repr`]: the settings that
+//! [`Module::display`] prints, as PyTorch's `extra_repr()` does.
+//!
+//! ```
+//! use homura::nn::{Linear, Module};
+//!
+//! #[derive(Module)]
+//! #[module(extra_repr = Self::describe)]
+//! struct Block {
+//!     proj: Linear,
+//!     scale: f64,
+//! }
+//!
+//! impl Block {
+//!     fn describe(&self) -> String {
+//!         format!("scale={}", self.scale)
+//!     }
+//! }
+//!
+//! let block = Block { proj: Linear::new(2, 2), scale: 0.5 };
+//! let text = "\
+//! Block(
+//!   scale=0.5
+//!   (proj): Linear(in_features=2, out_features=2, bias=True)
+//! )";
+//! assert_eq!(block.display().to_string(), text);
+//! ```
+//!
 //! # Layers
 //!
 //! [`Linear`], [`Embedding`], [`LayerNorm`], [`RmsNorm`], [`Dropout`], the activations
@@ -160,6 +189,8 @@
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
 //! | `model.state_dict()`, `model.load_state_dict(sd)`, `model.load_state_dict(sd, strict=False)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd)`](Module::load_state_dict), [`model.load_state_dict_with(&sd, LoadOptions::default().strict(false))`](Module::load_state_dict_with), returning a `Result` |
 //! | `model.to(torch.float64)`, `model.to("meta")` | [`model.to(DType::F64)`](Module::to), `model.to(Device::Meta)` |
+//! | `print(model)`, `def extra_repr(self)` | [`println!("{}", model.display())`](Module::display), `#[module(extra_repr = Self::describe)]` |
+//! | `sum(p.numel() for p in model.parameters())` | [`model.num_parameters()`](Module::num_parameters) |
 //!
 //! [`Module`] describes how members are named, ordered and deduplicated.
 //!
@@ -169,6 +200,12 @@
 //!   shared submodule once, like PyTorch lists the same object once; the state dict has its
 //!   members under every path, also like PyTorch.
 //! - `BTreeMap` containers order their members by key, not by insertion like `nn.ModuleDict`.
+//! - [`Module::display`] prints homura's type names: `Relu`, `Gelu`, `Silu` and `RmsNorm` for
+//!   PyTorch's `ReLU`, `GELU`, `SiLU` and `RMSNorm`, `ModuleList` and `ModuleDict` for `Vec`,
+//!   arrays and `BTreeMap`, `None` for a `None` root (`None()`). The sizes of [`MaxPool2d`] and
+//!   [`AdaptiveAvgPool2d`] are printed as one number when the height and the width are equal,
+//!   where PyTorch prints what it was given (`(1, 1)` or `1`); [`Dropout`] prints
+//!   `inplace=False`, and floats are printed as Python prints them (`eps=1e-05`).
 //! - [`Module::load_state_dict`] and [`Module::to`] check everything they can before they
 //!   change anything, so that their errors leave the module unchanged; PyTorch's
 //!   `load_state_dict` writes the matching entries before it reports errors. This covers errors
@@ -234,6 +271,7 @@
 
 #[cfg(doctest)]
 mod derive_errors;
+mod display;
 pub mod functional;
 pub mod init;
 mod layers;
@@ -244,6 +282,10 @@ mod parameter;
 mod state_dict;
 mod training;
 
+pub use display::ModuleDisplay;
+pub(crate) use display::{
+    python_bool, python_float, python_option_float, python_size, python_tuple,
+};
 /// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
 pub use homura_derive::Module;
 pub use layers::{
@@ -259,4 +301,5 @@ pub use training::Training;
 #[doc(hidden)]
 pub mod __private {
     pub use super::module::NonPersistent;
+    pub use std::string::String;
 }

@@ -2,8 +2,8 @@ use std::fmt;
 
 use super::{Forward, IntoPair};
 use crate::Tensor;
-use crate::nn::Module;
 use crate::nn::functional::{self, MaxPool2dOptions};
+use crate::nn::{Module, python_bool, python_size};
 
 /// Max pooling over the last two dimensions, PyTorch's `nn.MaxPool2d`, with
 /// [`functional::max_pool2d`]. The options are set one after another; the sizes take a number for
@@ -22,6 +22,7 @@ use crate::nn::functional::{self, MaxPool2dOptions};
 /// assert_eq!(indices.to_vec::<i64>(), [5, 7, 13, 15]);
 /// ```
 #[derive(Module, Clone, Copy, PartialEq, Eq)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct MaxPool2d {
     /// The kernel size, stride, padding, dilation and ceil mode.
@@ -83,6 +84,19 @@ impl MaxPool2d {
     pub fn forward_with_indices(&self, input: &Tensor) -> (Tensor, Tensor) {
         functional::max_pool2d_with_indices(input, self.options)
     }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        let o = &self.options;
+        format!(
+            "kernel_size={}, stride={}, padding={}, dilation={}, ceil_mode={}",
+            python_size(o.kernel_size),
+            python_size(o.stride.unwrap_or(o.kernel_size)),
+            python_size(o.padding),
+            python_size(o.dilation),
+            python_bool(o.ceil_mode)
+        )
+    }
 }
 
 impl Forward for MaxPool2d {
@@ -117,6 +131,7 @@ impl fmt::Debug for MaxPool2d {
 /// assert_eq!(pool.forward(&x).to_vec::<f32>(), [1.5, 5.5]);
 /// ```
 #[derive(Module, Clone, Copy, Debug, PartialEq, Eq)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct AdaptiveAvgPool2d {
     /// The output height and width.
@@ -137,6 +152,11 @@ impl AdaptiveAvgPool2d {
     #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::adaptive_avg_pool2d(input, self.output_size)
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!("output_size={}", python_size(self.output_size))
     }
 }
 

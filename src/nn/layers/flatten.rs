@@ -17,6 +17,7 @@ use crate::nn::Module;
 /// assert_eq!(Flatten::new(0, 2).forward(&x).shape(), [24, 5]);
 /// ```
 #[derive(Module, Clone, Copy, Debug, PartialEq, Eq)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct Flatten {
     /// The first dimension to merge; negative counts from the end.
@@ -50,6 +51,13 @@ impl Flatten {
 impl Default for Flatten {
     fn default() -> Self {
         Flatten::new(1, -1)
+    }
+}
+
+impl Flatten {
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!("start_dim={}, end_dim={}", self.start_dim, self.end_dim)
     }
 }
 

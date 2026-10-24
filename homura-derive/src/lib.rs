@@ -31,8 +31,13 @@ use proc_macro::TokenStream;
 /// - `#[module(skip)]`: the field is not a member at all, and its type needs no `Member`
 ///   implementation.
 ///
-/// A struct attribute, `#[module(crate = "path")]`, gives the path of the homura crate for a
-/// dependency renamed in `Cargo.toml`; it is `::homura` by default.
+/// Struct attributes:
+///
+/// - `#[module(crate = "path")]`: the path of the homura crate for a dependency renamed in
+///   `Cargo.toml`; it is `::homura` by default.
+/// - `#[module(extra_repr = path)]`: the function, of the signature `fn(&Self) -> String`
+///   (usually an inherent method, `Self::describe`), that implements `Module::extra_repr`, the
+///   settings that `Module::display` prints.
 ///
 /// See the documentation of `homura::nn` for examples.
 #[proc_macro_derive(Module, attributes(module))]

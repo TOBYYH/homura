@@ -81,7 +81,7 @@ fn unknown_and_duplicate_attributes_point_at_the_attribute() {
         error("struct M {\n    #[module(crate = \"h\")]\n    a: u8,\n}"),
         (field.into(), 2, 14)
     );
-    let container = "unknown `module` attribute for a struct; expected `crate`";
+    let container = "unknown `module` attribute for a struct; expected `crate` or `extra_repr`";
     assert_eq!(
         error("#[module(skip)]\nstruct M {\n    a: u8,\n}"),
         (container.into(), 1, 10)
@@ -236,6 +236,64 @@ fn the_crate_path_can_be_given() {
     assert!(!expansion.contains("homura"));
     let expansion = expanded("#[module(crate = \"::a::b\")]\nstruct M;");
     assert!(expansion.contains(":: a :: b :: nn :: Member for M"));
+}
+
+#[test]
+fn extra_repr_calls_the_given_function() {
+    let expansion = expanded("#[module(extra_repr = Self::describe)]\nstruct M;");
+    assert!(expansion.contains(
+        "fn extra_repr (& self) -> :: homura :: nn :: __private :: String { Self :: describe (self) }"
+    ));
+    let expansion = expanded(
+        "#[module(crate = \"hm\", extra_repr = <Self as D>::describe)]\nstruct M<T> {\n    a: T,\n}",
+    );
+    assert!(expansion.contains(
+        "fn extra_repr (& self) -> hm :: nn :: __private :: String { < Self as D > :: describe (self) }"
+    ));
+    // In the `Module` implementation, after `visit`.
+    let module = expansion.find("hm :: nn :: Module for M").unwrap();
+    let member = expansion.find("hm :: nn :: Member for M").unwrap();
+    let method = expansion.find("fn extra_repr").unwrap();
+    assert!(module < method && method < member);
+    let expansion = expanded("#[module(extra_repr = describe::<u8>)]\nstruct M;");
+    assert!(expansion.contains("{ describe :: < u8 > (self) }"));
+    // Without the attribute, the provided method stays.
+    assert!(!expanded("struct M {\n    a: u8,\n}").contains("extra_repr"));
+}
+
+#[test]
+fn extra_repr_takes_one_path() {
+    let message = "`extra_repr` takes the path of a function `fn(&Self) -> String`, such as \
+                   `Self::describe`";
+    assert_eq!(
+        error("#[module(extra_repr = \"describe\")]\nstruct M;"),
+        (message.into(), 1, 23)
+    );
+    assert_eq!(
+        error("#[module(extra_repr = describe(1))]\nstruct M;"),
+        (message.into(), 1, 23)
+    );
+    assert_eq!(
+        error("#[module(extra_repr = Self::a, extra_repr = Self::b)]\nstruct M;"),
+        ("duplicate `module` attribute `extra_repr`".into(), 1, 32)
+    );
+    assert_eq!(
+        error("#[module(extra_repr = Self::a)]\n#[module(extra_repr = Self::b)]\nstruct M;"),
+        ("duplicate `module` attribute `extra_repr`".into(), 2, 10)
+    );
+    // syn's own errors: no value, and an expression that isn't one.
+    assert_eq!(error("#[module(extra_repr)]\nstruct M;").1, 1);
+    assert_eq!(error("#[module(extra_repr = |m| m)]\nstruct M;").1, 1);
+    // Errors in the struct's attributes come before those of the fields.
+    assert_eq!(
+        error("#[module(extra_repr = 1)]\nstruct M {\n    #[module(nope)]\n    a: u8,\n}"),
+        (message.into(), 1, 23)
+    );
+    // On a field, it is unknown.
+    assert_eq!(
+        error("struct M {\n    #[module(extra_repr = Self::a)]\n    a: u8,\n}").1,
+        2
+    );
 }
 
 #[test]

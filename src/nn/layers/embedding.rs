@@ -22,6 +22,7 @@ use crate::nn::{Module, Parameter, functional, init};
 /// assert_eq!(table.state_dict().keys().collect::<Vec<_>>(), ["weight"]);
 /// ```
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct Embedding {
     /// The rows, `[num_embeddings, embedding_dim]`.
@@ -90,6 +91,15 @@ impl Embedding {
     #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::embedding(input, &self.weight, self.padding_idx.map(|i| i as i64))
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        let mut s = format!("{}, {}", self.num_embeddings, self.embedding_dim);
+        if let Some(padding_idx) = self.padding_idx {
+            s += &format!(", padding_idx={padding_idx}");
+        }
+        s
     }
 }
 

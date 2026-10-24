@@ -1,7 +1,10 @@
 use std::fmt;
 
 use super::Forward;
-use crate::nn::{Module, Parameter, functional, init};
+use crate::nn::{
+    Module, Parameter, functional, init, python_bool, python_float, python_option_float,
+    python_tuple,
+};
 use crate::{IntoShape, Tensor};
 
 /// Layer normalization over the last dimensions `normalized_shape`, PyTorch's `nn.LayerNorm`,
@@ -22,6 +25,7 @@ use crate::{IntoShape, Tensor};
 /// assert!(plain.weight.is_none() && plain.bias.is_none());
 /// ```
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct LayerNorm {
     /// The scale, of the shape `normalized_shape`, with elementwise affine.
@@ -130,6 +134,19 @@ fn new_parameter(like: Option<&Tensor>, shape: &[usize], value: f64) -> Paramete
     })
 }
 
+impl LayerNorm {
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!(
+            "{}, eps={}, elementwise_affine={}, bias={}",
+            python_tuple(&self.normalized_shape),
+            python_float(self.eps),
+            python_bool(self.weight.is_some()),
+            python_bool(self.bias.is_some())
+        )
+    }
+}
+
 impl Forward for LayerNorm {
     fn forward(&self, input: &Tensor) -> Tensor {
         LayerNorm::forward(self, input)
@@ -164,6 +181,7 @@ impl fmt::Debug for LayerNorm {
 /// assert_eq!(norm.state_dict().keys().collect::<Vec<_>>(), ["weight"]);
 /// ```
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct RmsNorm {
     /// The scale, of the shape `normalized_shape`, with elementwise affine.
@@ -225,6 +243,16 @@ impl RmsNorm {
             &self.normalized_shape,
             self.weight.as_deref(),
             self.eps,
+        )
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!(
+            "{}, eps={}, elementwise_affine={}",
+            python_tuple(&self.normalized_shape),
+            python_option_float(self.eps),
+            python_bool(self.weight.is_some())
         )
     }
 }

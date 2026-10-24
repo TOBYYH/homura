@@ -48,6 +48,23 @@ All notable changes to this project are documented in this file. The format is b
   so the dtype and device of the result come from the tensors (an `I32` sum stays `I32`; one
   tensor gives a new tensor recorded as `AddBackward0` / `MulBackward0`). Without tensors, the
   result is a zero-dimensional `I64` tensor on the default device.
+- `Module::display()`, PyTorch's `print(model)`: `println!("{}", model.display())` prints the
+  module tree in PyTorch's format, with each module's type name and settings, a submodule shared
+  through an `Arc` under each of its names, and runs of equal elements of a `Vec` or an array
+  grouped as by `nn.ModuleList` (`(0-2): 3 x Linear(...)`). The built-in layers print PyTorch's
+  settings (`Linear(in_features=4, out_features=8, bias=True)`) under homura's type names
+  (`Relu`, `RmsNorm`). `nn::ModuleDisplay::new(&dyn Module)` prints the modules that
+  `named_modules` lists.
+- `Module::extra_repr` and `Module::type_name`, which `display` prints, and the struct attribute
+  `#[module(extra_repr = Self::describe)]` of `#[derive(Module)]`, which implements
+  `extra_repr` with the given function. `Box`, `Arc` and `Option` give the name and settings of
+  the module they hold; `Vec` and arrays are named `ModuleList`, `BTreeMap` `ModuleDict`.
+- `Module::num_parameters()`: the number of elements of the parameters, each parameter once
+  (`sum(p.numel() for p in model.parameters())`).
+
+  The new provided methods of `Module` (`display`, `extra_repr`, `type_name`,
+  `num_parameters`) can make a call of a method of the same name from another trait in scope
+  ambiguous; inherent methods of the same name keep precedence.
 
 ### Changed
 

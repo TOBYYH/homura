@@ -1,6 +1,6 @@
 use super::Forward;
 use crate::Tensor;
-use crate::nn::{Module, Training, functional};
+use crate::nn::{Module, Training, functional, python_float};
 
 /// Dropout, PyTorch's `nn.Dropout`: in training mode, [`functional::dropout`] with probability
 /// `p`; in evaluation mode ([`Module::eval`]), the input itself.
@@ -15,6 +15,7 @@ use crate::nn::{Module, Training, functional};
 /// assert!(dropout.forward(&x).is_same(&x));
 /// ```
 #[derive(Module, Clone, Debug)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct Dropout {
     /// The probability of zeroing an element.
@@ -51,6 +52,13 @@ impl Dropout {
 impl Default for Dropout {
     fn default() -> Self {
         Dropout::new(0.5)
+    }
+}
+
+impl Dropout {
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!("p={}, inplace=False", python_float(self.p))
     }
 }
 

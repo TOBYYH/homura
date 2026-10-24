@@ -4,7 +4,7 @@ use super::{Forward, IntoPair};
 use crate::Tensor;
 use crate::nn::functional::{Conv2dOptions, Conv2dPadding};
 use crate::nn::init::{self, FanMode, Nonlinearity};
-use crate::nn::{Module, Parameter, functional};
+use crate::nn::{Module, Parameter, functional, python_tuple};
 
 /// A 2-D convolution layer, PyTorch's `nn.Conv2d`, with [`functional::conv2d`].
 ///
@@ -32,6 +32,7 @@ use crate::nn::{Module, Parameter, functional};
 /// creating an optimizer for the parameters: [`groups`](Conv2d::groups) and
 /// [`bias`](Conv2d::bias) can replace them.
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct Conv2d {
     /// The weights, `[out_channels, in_channels / groups, kh, kw]`.
@@ -210,6 +211,38 @@ fn weight_shape(
     groups: usize,
 ) -> [usize; 4] {
     [out_channels, in_channels / groups, kh, kw]
+}
+
+impl Conv2d {
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        let o = &self.options;
+        let mut s = format!(
+            "{}, {}, kernel_size={}, stride={}",
+            self.in_channels,
+            self.out_channels,
+            python_tuple(&self.kernel_size),
+            python_tuple(&o.stride)
+        );
+        match o.padding {
+            Conv2dPadding::Explicit([0, 0]) => {}
+            Conv2dPadding::Explicit(padding) => {
+                s += &format!(", padding={}", python_tuple(&padding))
+            }
+            Conv2dPadding::Valid => s += ", padding=valid",
+            Conv2dPadding::Same => s += ", padding=same",
+        }
+        if o.dilation != [1, 1] {
+            s += &format!(", dilation={}", python_tuple(&o.dilation));
+        }
+        if o.groups != 1 {
+            s += &format!(", groups={}", o.groups);
+        }
+        if self.bias.is_none() {
+            s += ", bias=False";
+        }
+        s
+    }
 }
 
 impl Forward for Conv2d {

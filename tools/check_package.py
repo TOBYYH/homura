@@ -9,8 +9,8 @@ upload them:
 3. The tests of both unpacked packages pass (homura's unit tests and doctests, homura-derive's
    unit tests), with homura built against the unpacked homura-derive.
 4. A crate outside the workspace that depends on the unpacked homura under another name
-   (`hm = { package = "homura", ... }`) derives `Module` with `#[module(crate = "hm")]`, builds
-   and runs.
+   (`hm = { package = "homura", ... }`) derives `Module` with `#[module(crate = "hm")]` and an
+   `extra_repr`, builds and runs.
 
 The working tree must be clean, as for `cargo publish` (the tool never passes `--allow-dirty`).
 The packages are unpacked into a temporary directory outside the workspace; the build output goes
@@ -54,7 +54,7 @@ use hm::Tensor;
 use hm::nn::{self, Module};
 
 #[derive(nn::Module)]
-#[module(crate = "hm")]
+#[module(crate = "hm", extra_repr = Self::describe)]
 struct Net {
     conv: nn::Conv2d,
     bn: nn::BatchNorm2d,
@@ -65,6 +65,10 @@ struct Net {
 }
 
 impl Net {
+    fn describe(&self) -> String {
+        "classes=2".into()
+    }
+
     fn forward(&self, x: &Tensor) -> Tensor {
         let x = self.bn.forward(&self.conv.forward(x)).relu();
         self.head.forward(&x.flatten(1, -1)) * &self.scale
@@ -91,6 +95,10 @@ fn main() {
     ];
     assert_eq!(net.state_dict().keys().collect::<Vec<_>>(), keys);
     assert_eq!(net.named_buffers().len(), 4);
+    assert_eq!(net.num_parameters(), 108 + 4 + 8 + 130);
+    let text = net.display().to_string();
+    assert!(text.starts_with("Net(\n  classes=2\n  (conv): Conv2d(3, 4, kernel_size=(3, 3)"), "{text}");
+    assert!(text.contains("\n  (fc): Linear(in_features=64, out_features=2, bias=True)\n)"), "{text}");
 
     net.forward(&hm::randn([2, 3, 4, 4])).sum().backward();
     assert!(net.parameters().iter().all(|p| p.grad().is_some()));

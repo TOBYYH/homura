@@ -8,8 +8,8 @@ use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Data, DeriveInput, Error, Fields, GenericParam, Lifetime, LitStr, Path, Result,
-    Type, TypeMacro, TypePath, parse_quote,
+    Attribute, Data, DeriveInput, Error, Expr, ExprPath, Fields, GenericParam, Lifetime, LitStr,
+    Path, Result, Type, TypeMacro, TypePath, parse_quote,
 };
 
 /// How a field reports itself.
@@ -32,7 +32,7 @@ struct Field<'a> {
 /// errors in fields and their attributes, or the first error in the struct's own attributes or
 /// shape.
 pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
-    let krate = crate_path(&input.attrs)?;
+    let Container { krate, extra_repr } = container(&input.attrs)?;
     let fields: Vec<&syn::Field> = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => fields.named.iter().collect(),
@@ -167,6 +167,15 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
             },
         }
     });
+    // Resolved at the derive, but a function of another signature is reported at the path.
+    let extra_repr = extra_repr.map(|path| {
+        let span = Span::call_site().located_at(path.span());
+        quote_spanned! {span=>
+            fn extra_repr(&self) -> #krate::nn::__private::String {
+                #path(self)
+            }
+        }
+    });
     Ok(quote! {
         #[automatically_derived]
         impl #impl_generics #krate::nn::Module for #name #type_generics #where_clause {
@@ -176,6 +185,8 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
             ) {
                 #(#calls)*
             }
+
+            #extra_repr
         }
 
         #[automatically_derived]
@@ -196,24 +207,58 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
     })
 }
 
-/// The path of the homura crate: `#[module(crate = "path")]`, or `::homura`.
-fn crate_path(attrs: &[Attribute]) -> Result<Path> {
-    let mut path: Option<Path> = None;
+/// What the struct's attributes say.
+struct Container {
+    /// The path of the homura crate: `#[module(crate = "path")]`, or `::homura`.
+    krate: Path,
+    /// The function that implements `Module::extra_repr`: `#[module(extra_repr = path)]`.
+    extra_repr: Option<ExprPath>,
+}
+
+fn container(attrs: &[Attribute]) -> Result<Container> {
+    let mut krate: Option<Path> = None;
+    let mut extra_repr: Option<ExprPath> = None;
     for attr in module_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
+            let duplicate = || {
+                meta.error(format!(
+                    "duplicate `module` attribute `{}`",
+                    name(&meta.path)
+                ))
+            };
             if meta.path.is_ident("crate") {
                 let value: LitStr = meta.value()?.parse()?;
-                if path.is_some() {
-                    return Err(meta.error("duplicate `module` attribute `crate`"));
+                if krate.is_some() {
+                    return Err(duplicate());
                 }
-                path = Some(value.parse()?);
-                Ok(())
+                krate = Some(value.parse()?);
+            } else if meta.path.is_ident("extra_repr") {
+                let value: Expr = meta.value()?.parse()?;
+                if extra_repr.is_some() {
+                    return Err(duplicate());
+                }
+                match value {
+                    Expr::Path(path) if path.attrs.is_empty() => extra_repr = Some(path),
+                    other => {
+                        return Err(Error::new(
+                            other.span(),
+                            "`extra_repr` takes the path of a function `fn(&Self) -> String`, \
+                             such as `Self::describe`",
+                        ));
+                    }
+                }
             } else {
-                Err(meta.error("unknown `module` attribute for a struct; expected `crate`"))
+                return Err(meta.error(
+                    "unknown `module` attribute for a struct; expected `crate` or `extra_repr`",
+                ));
             }
+            Ok(())
         })?;
     }
-    Ok(path.unwrap_or_else(|| parse_quote!(::homura)))
+    Ok(Container {
+        krate: krate.unwrap_or_else(|| parse_quote!(::homura)),
+        extra_repr,
+    })
 }
 
 /// The member that `field` is, or `None` if it is skipped.

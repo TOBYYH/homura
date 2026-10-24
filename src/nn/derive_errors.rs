@@ -107,4 +107,46 @@
 ///     Tanh,
 /// }
 /// ```
+///
+/// `extra_repr` with a value that isn't a path, twice, or with a function of another signature:
+///
+/// ```compile_fail
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(extra_repr = "describe")]
+/// struct Norm;
+/// ```
+///
+/// ```compile_fail
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(extra_repr = Self::describe, extra_repr = Self::describe)]
+/// struct Norm;
+///
+/// impl Norm {
+///     fn describe(&self) -> String {
+///         String::new()
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(extra_repr = Self::describe)]
+/// struct Norm;
+///
+/// impl Norm {
+///     fn describe(&self) -> &'static str {
+///         "norm"
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0425
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(extra_repr = describe)]
+/// struct Norm;
+/// ```
 struct DeriveErrors;

@@ -48,6 +48,7 @@ activation!(Relu, |_s, x| x.relu());
 /// assert_eq!(gelu.forward(&homura::zeros([2])).to_vec::<f32>(), [0.0, 0.0]);
 /// ```
 #[derive(Module, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[module(extra_repr = Self::describe)]
 pub struct Gelu {
     pub approximate: GeluApproximate,
 }
@@ -65,6 +66,15 @@ impl Gelu {
     pub fn approximate(mut self, approximate: GeluApproximate) -> Gelu {
         self.approximate = approximate;
         self
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        let approximate = match self.approximate {
+            GeluApproximate::None => "none",
+            GeluApproximate::Tanh => "tanh",
+        };
+        format!("approximate='{approximate}'")
     }
 }
 
@@ -98,6 +108,7 @@ activation!(Sigmoid, |_s, x| x.sigmoid());
 /// assert_eq!(y.sum_dim(-1, false).to_vec::<f32>(), [1.0, 1.0]);
 /// ```
 #[derive(Module, Clone, Copy, Debug, PartialEq, Eq)]
+#[module(extra_repr = Self::describe)]
 pub struct Softmax {
     pub dim: i64,
 }
@@ -107,6 +118,11 @@ impl Softmax {
     #[track_caller]
     pub fn new(dim: i64) -> Softmax {
         Softmax { dim }
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!("dim={}", self.dim)
     }
 }
 

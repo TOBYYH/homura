@@ -3,7 +3,7 @@ use std::fmt;
 use super::Forward;
 use crate::Tensor;
 use crate::nn::init::{self, FanMode, Nonlinearity};
-use crate::nn::{Module, Parameter, functional};
+use crate::nn::{Module, Parameter, functional, python_bool};
 
 /// A fully connected layer, PyTorch's `nn.Linear`: `y = x @ weightᵀ + bias`, with
 /// [`functional::linear`].
@@ -26,6 +26,7 @@ use crate::nn::{Module, Parameter, functional};
 /// assert_eq!(layer.state_dict().keys().collect::<Vec<_>>(), ["weight"]);
 /// ```
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct Linear {
     /// The weights, `[out_features, in_features]`.
@@ -97,6 +98,16 @@ impl Linear {
     #[track_caller]
     pub fn forward(&self, input: &Tensor) -> Tensor {
         functional::linear(input, &self.weight, self.bias.as_deref())
+    }
+
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!(
+            "in_features={}, out_features={}, bias={}",
+            self.in_features,
+            self.out_features,
+            python_bool(self.bias.is_some())
+        )
     }
 }
 

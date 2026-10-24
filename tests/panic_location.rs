@@ -588,6 +588,9 @@ fn module_tree_checks() {
         at!(m.to(DType::F64));
         at!(m.train());
         at!(m.eval());
+        at!(m.num_parameters());
+        at!(m.display());
+        at!(nn::ModuleDisplay::new(&m));
         // Rejected before anything is converted.
         assert_eq!(m.p.dtype(), DType::F32);
     }
@@ -598,6 +601,8 @@ fn module_tree_checks() {
     at!(cycle.named_modules());
     at!(cycle.state_dict());
     at!(cycle.train());
+    at!(cycle.display());
+    at!(cycle.num_parameters());
     finish();
     // A panic in the user's own `visit` keeps its location.
     let (file, line) = panic_location(|| drop(PanicsInVisit.parameters())).expect("no panic");

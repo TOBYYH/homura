@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::{LoadError, LoadOptions, LoadReport, Parameter, StateDict, Training};
+use super::display::short_type_name;
+use super::{LoadError, LoadOptions, LoadReport, ModuleDisplay, Parameter, StateDict, Training};
 use crate::nn::functional::Reduction;
 use crate::tensor::{TensorData, checked_nbytes, conversion_error, convert_data};
 use crate::{DType, Device, GeluApproximate, Tensor, TensorOptions, bf16, f16};
@@ -139,9 +140,84 @@ pub trait Member {
 ///   distinct names. Traversals panic otherwise, with PyTorch's messages.
 /// - Module trees must not have cycles: a traversal panics if a shared submodule contains
 ///   itself. A module whose `visit` reports itself recurses until the stack overflows.
+///
+/// # Printing
+///
+/// [`display`](Module::display) prints the tree as PyTorch's `print(model)` does, with each
+/// module's [`type_name`](Module::type_name) and [`extra_repr`](Module::extra_repr); derived
+/// modules set `extra_repr` with `#[module(extra_repr = path)]`, hand-written ones override the
+/// methods.
+///
+/// ```
+/// use homura::nn::{Linear, Module, Relu, Sequential};
+///
+/// let model = Sequential::new().append(Linear::new(4, 8)).append(Relu);
+/// assert_eq!(
+///     model.display().to_string(),
+///     "Sequential(\n  (0): Linear(in_features=4, out_features=8, bias=True)\n  (1): Relu()\n)"
+/// );
+/// assert_eq!(model.num_parameters(), 40);
+/// ```
 pub trait Module: Member {
     /// Reports each member of this module to `v` (by calling `visit_as` on it with its name).
     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>);
+
+    /// The settings of this module for its [`display`](Module::display), PyTorch's
+    /// `extra_repr()`: `in_features=4, out_features=8, bias=True` for a [`Linear`](super::Linear).
+    /// Empty by default; it may have several lines. `Box`, `Arc` and `Option` give the text of
+    /// the module they hold.
+    fn extra_repr(&self) -> String {
+        String::new()
+    }
+
+    /// The name of this module for its [`display`](Module::display), PyTorch's class name: the
+    /// name of its type without the path and generic arguments, `Block` for a
+    /// `my_crate::Block<Linear>`, also through a `dyn Module`. `Box`, `Arc` and `Option` give the
+    /// name of the module they hold (`None` for none); `Vec` and arrays are `ModuleList`,
+    /// `BTreeMap` is `ModuleDict`.
+    fn type_name(&self) -> &'static str {
+        short_type_name(std::any::type_name::<Self>())
+    }
+
+    /// The number of elements of the parameters of the module tree, each parameter once, like
+    /// `sum(p.numel() for p in model.parameters())`: frozen parameters count, buffers don't.
+    #[track_caller]
+    fn num_parameters(&self) -> usize {
+        self.parameters().iter().map(|p| p.num_elements()).sum()
+    }
+
+    /// The module tree as PyTorch prints it (`print(model)`), for formatting with `{}`: see
+    /// [`ModuleDisplay`]. A submodule shared through an `Arc` appears under each of its names.
+    ///
+    /// ```
+    /// use homura::nn::{Linear, Module};
+    ///
+    /// #[derive(Module)]
+    /// struct Mlp {
+    ///     hidden: Linear,
+    ///     output: Linear,
+    /// }
+    ///
+    /// let model = Mlp { hidden: Linear::new(4, 8), output: Linear::new(8, 2) };
+    /// let text = "\
+    /// Mlp(
+    ///   (hidden): Linear(in_features=4, out_features=8, bias=True)
+    ///   (output): Linear(in_features=8, out_features=2, bias=True)
+    /// )";
+    /// assert_eq!(model.display().to_string(), text);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Like the traversals: if names are invalid or the tree has a cycle through shared
+    /// submodules.
+    #[track_caller]
+    fn display(&self) -> ModuleDisplay<'_>
+    where
+        Self: Sized,
+    {
+        ModuleDisplay::new(self)
+    }
 
     /// The parameters of the module tree with their keys, each tensor once
     /// (`named_parameters()`).
@@ -398,7 +474,7 @@ impl<'a> Visitor<'a> for Members<'a> {
 }
 
 /// What a traversal finds, with its key.
-enum Item<'a> {
+pub(super) enum Item<'a> {
     Parameter(String, &'a Parameter),
     Buffer(String, &'a Tensor, bool),
     Module(String, &'a dyn Module),
@@ -415,7 +491,11 @@ enum Item<'a> {
 ///
 /// Panics if names are invalid or the tree has a cycle through shared submodules.
 #[track_caller]
-fn walk<'a, M: Member + ?Sized>(root: &'a M, dedup: bool, emit: &mut dyn FnMut(Item<'a>)) {
+pub(super) fn walk<'a, M: Member + ?Sized>(
+    root: &'a M,
+    dedup: bool,
+    emit: &mut dyn FnMut(Item<'a>),
+) {
     let mut members = Members::default();
     root.visit_as("", &mut members);
     Walk {
@@ -780,6 +860,14 @@ impl<T: Module> Module for Option<T> {
             inner.visit(v);
         }
     }
+
+    fn extra_repr(&self) -> String {
+        self.as_ref().map(T::extra_repr).unwrap_or_default()
+    }
+
+    fn type_name(&self) -> &'static str {
+        self.as_ref().map_or("None", T::type_name)
+    }
 }
 
 impl<T: Member> Member for Box<T> {
@@ -796,6 +884,14 @@ impl<T: Module> Module for Box<T> {
     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
         (**self).visit(v);
     }
+
+    fn extra_repr(&self) -> String {
+        (**self).extra_repr()
+    }
+
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
+    }
 }
 
 impl<T: Member> Member for Arc<T> {
@@ -811,6 +907,14 @@ impl<T: Member> Member for Arc<T> {
 impl<T: Module> Module for Arc<T> {
     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
         (**self).visit(v);
+    }
+
+    fn extra_repr(&self) -> String {
+        (**self).extra_repr()
+    }
+
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
     }
 }
 
@@ -837,6 +941,14 @@ macro_rules! dyn_modules {
                 fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
                     (**self).visit(v);
                 }
+
+                fn extra_repr(&self) -> String {
+                    (**self).extra_repr()
+                }
+
+                fn type_name(&self) -> &'static str {
+                    (**self).type_name()
+                }
             }
 
             impl<'m> Member for Arc<$t> {
@@ -848,6 +960,14 @@ macro_rules! dyn_modules {
             impl<'m> Module for Arc<$t> {
                 fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
                     (**self).visit(v);
+                }
+
+                fn extra_repr(&self) -> String {
+                    (**self).extra_repr()
+                }
+
+                fn type_name(&self) -> &'static str {
+                    (**self).type_name()
                 }
             }
         )*
@@ -890,11 +1010,19 @@ impl<T: Member> Module for Vec<T> {
     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
         visit_elements(self, v);
     }
+
+    fn type_name(&self) -> &'static str {
+        "ModuleList"
+    }
 }
 
 impl<T: Member, const N: usize> Module for [T; N] {
     fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
         visit_elements(self, v);
+    }
+
+    fn type_name(&self) -> &'static str {
+        "ModuleList"
     }
 }
 
@@ -913,6 +1041,10 @@ impl<T: Member> Module for BTreeMap<String, T> {
                 value.visit_as(key, v);
             }
         }
+    }
+
+    fn type_name(&self) -> &'static str {
+        "ModuleDict"
     }
 }
 

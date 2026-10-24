@@ -2,7 +2,9 @@ use std::fmt;
 
 use super::Forward;
 use crate::nn::functional::BatchNormOptions;
-use crate::nn::{Module, Parameter, Training, functional, init};
+use crate::nn::{
+    Module, Parameter, Training, functional, init, python_bool, python_float, python_option_float,
+};
 use crate::{DType, Device, Tensor, TensorOptions};
 
 /// Batch normalization of `[N, C, H, W]` inputs over the batch and the plane, PyTorch's
@@ -35,6 +37,7 @@ use crate::{DType, Device, Tensor, TensorOptions};
 /// assert!(plain.state_dict().is_empty());
 /// ```
 #[derive(Module)]
+#[module(extra_repr = Self::describe)]
 #[non_exhaustive]
 pub struct BatchNorm2d {
     /// The scale, `[num_features]`, with affine.
@@ -264,6 +267,21 @@ impl BatchNorm2d {
 /// defaults where it has none).
 fn new_tensor(like: TensorOptions, n: usize, value: f64) -> Tensor {
     crate::full_with([n], value, (like.float_dtype(), like.device()))
+}
+
+impl BatchNorm2d {
+    /// PyTorch's `extra_repr()` text.
+    fn describe(&self) -> String {
+        format!(
+            "{}, eps={}, momentum={}, affine={}, bias={}, track_running_stats={}",
+            self.num_features,
+            python_float(self.eps),
+            python_option_float(self.momentum),
+            python_bool(self.weight.is_some()),
+            python_bool(self.bias.is_some()),
+            python_bool(self.track_running_stats)
+        )
+    }
 }
 
 impl Forward for BatchNorm2d {

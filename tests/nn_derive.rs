@@ -575,6 +575,24 @@ mod renamed {
         pub inner: M,
         pub scale: hm::nn::Parameter,
     }
+
+    pub trait Describe {
+        fn describe(&self) -> String;
+    }
+
+    /// `extra_repr` from a trait method, with the crate's path in the same attribute.
+    #[derive(hm::nn::Module)]
+    #[module(crate = "hm", extra_repr = <Self as Describe>::describe)]
+    pub struct Tagged<M> {
+        pub inner: M,
+        pub tag: &'static str,
+    }
+
+    impl<M> Describe for Tagged<M> {
+        fn describe(&self) -> String {
+            format!("tag={}", self.tag)
+        }
+    }
 }
 
 #[test]
@@ -584,6 +602,25 @@ fn the_crate_path_can_be_given() {
         scale: Parameter::new(homura::ones([1])),
     };
     assert_eq!(state_keys(&scaled), ["scale", "inner.weight"]);
+}
+
+#[test]
+fn extra_repr_gives_the_settings_to_display() {
+    let tagged = renamed::Tagged {
+        inner: Linear::new(1, 1, false),
+        tag: "x",
+    };
+    assert_eq!(tagged.extra_repr(), "tag=x");
+    let m: &dyn Module = &tagged;
+    assert_eq!((m.type_name(), m.extra_repr()), ("Tagged", "tag=x".into()));
+    assert_eq!(
+        tagged.display().to_string(),
+        "Tagged(\n  tag=x\n  (inner): Linear()\n)"
+    );
+    assert_eq!(state_keys(&tagged), ["inner.weight"]);
+    // Without the attribute, the settings are empty.
+    assert_eq!(Linear::new(1, 1, false).extra_repr(), "");
+    assert_eq!(Relu.display().to_string(), "Relu()");
 }
 
 fn linear(weight: &[f32], outputs: usize) -> Linear {

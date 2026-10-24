@@ -1,14 +1,19 @@
 """Check the reference behavior that tests/nn_load.rs encodes; does not write fixtures.
 
-Each block mirrors a test there, in the same order: `load_state_dict(sd, assign=True)` and models
-built on the meta device. Where homura differs on purpose, the block asserts PyTorch's behavior
+Each block mirrors a test there, in the same order: `load_state_dict(sd, assign=True)`, models
+built on the meta device, the versions of modules in `state_dict._metadata`, the prefixes of keys
+and old `BatchNorm2d` state dicts without `num_batches_tracked`. Where homura differs on purpose, the block asserts PyTorch's behavior
 and says what homura does instead: PyTorch replaces the parameters with new ones (homura keeps
 them and gives them the entry's data), and writes the entries that match before it reports
 errors (homura checks every entry first).
 """
 
+import collections
+import warnings
+
 import torch
 import torch.nn as nn
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
 import reference
 
@@ -210,6 +215,161 @@ def entries_are_read_before_any_is_assigned():
     m.b = nn.Parameter(torch.zeros(2))
     m.load_state_dict({"a": torch.tensor([5.0, 6.0]), "b": m.a}, assign=True)
     assert m.a.tolist() == [5.0, 6.0] and m.b.tolist() == [1.0, 2.0]
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(1, 2, 1)
+        self.bn = nn.BatchNorm2d(2)
+        self.blocks = nn.ModuleList([nn.BatchNorm2d(2), nn.BatchNorm2d(2)])
+        self.empty = nn.ModuleList()
+        self.heads = nn.ModuleDict({"a": nn.Linear(2, 2)})
+        self.register_module("skip", None)
+        # The same module under a second name.
+        self.tied = self.bn
+
+
+def versions(sd):
+    return [(path, metadata["version"]) for path, metadata in sd._metadata.items()]
+
+
+NET_VERSIONS = [
+    ("", 1),
+    ("conv", 1),
+    ("bn", 2),
+    ("blocks", 1),
+    ("blocks.0", 2),
+    ("blocks.1", 2),
+    ("empty", 1),
+    ("heads", 1),
+    ("heads.a", 1),
+    ("tied", 2),
+]
+
+
+@block
+def state_dicts_record_module_versions():
+    sd = Net().state_dict()
+    # Every module by its path, before its submodules; a shared module under each name, a
+    # `None` one not at all. Only the version is recorded.
+    assert versions(sd) == NET_VERSIONS
+    assert all(list(metadata) == ["version"] for metadata in sd._metadata.values())
+    assert versions(nn.Sequential(nn.Linear(2, 2), nn.BatchNorm2d(2)).state_dict()) == [
+        ("", 1),
+        ("0", 1),
+        ("1", 2),
+    ]
+    assert versions(nn.BatchNorm2d(2).state_dict()) == [("", 2)]
+    # Only the batch normalization layers have another version than 1.
+    for module in [nn.Linear, nn.Conv2d, nn.LayerNorm, nn.RMSNorm, nn.Embedding, nn.Dropout,
+                   nn.ReLU, nn.GELU, nn.SiLU, nn.Tanh, nn.Sigmoid, nn.Softmax, nn.MaxPool2d,
+                   nn.AdaptiveAvgPool2d, nn.Flatten, nn.Sequential, nn.ModuleList, nn.ModuleDict]:
+        assert module._version == 1, module
+    assert nn.BatchNorm2d._version == 2
+
+
+def prefixed(keys, paths, prefix):
+    sd = collections.OrderedDict((key, torch.zeros(1)) for key in keys)
+    sd._metadata = collections.OrderedDict((path, {"version": v}) for path, v in paths)
+    consume_prefix_in_state_dict_if_present(sd, prefix)
+    return list(sd), versions(sd)
+
+
+@block
+def prefixes_move_keys_and_versions():
+    # Renamed entries go last; the module named by the prefix becomes the root.
+    assert prefixed(
+        ["module.a", "b", "module.c.d"], [("", 1), ("module", 3), ("module.c", 2), ("x", 1)],
+        "module.",
+    ) == (["b", "a", "c.d"], [("", 3), ("x", 1), ("c", 2)])
+    # A new key that exists replaces that entry in its position.
+    assert prefixed(["a", "module.a"], [("", 7), ("module", 3)], "module.") == (["a"], [("", 3)])
+    # The prefix is removed once.
+    assert prefixed(["module.module.a"], [("module.module", 3)], "module.") == (
+        ["module.a"],
+        [("module", 3)],
+    )
+    # PyTorch compares the paths with the prefix without any ".": for "a.b." it renames the
+    # version of "ab" (homura that of "a.b").
+    assert prefixed(
+        ["a.b.w", "a.bw"], [("", 1), ("a", 1), ("a.b", 2), ("ab", 4), ("a.b.c", 3)], "a.b."
+    ) == (["a.bw", "w"], [("", 4), ("a", 1), ("a.b", 2), ("c", 3)])
+    # Adding a prefix: `state_dict(prefix=...)`.
+    sd = Net().state_dict(prefix="model.")
+    assert list(sd)[:2] == ["model.conv.weight", "model.conv.bias"]
+    assert versions(sd) == [("model", 1)] + [("model." + p, v) for p, v in NET_VERSIONS[1:]]
+    # The state dicts of submodules, which homura's `sub` takes out of the whole one.
+    net = Net()
+    child = net.blocks[1].state_dict()
+    assert list(child) == ["weight", "bias", "running_mean", "running_var", "num_batches_tracked"]
+    assert versions(child) == [("", 2)]
+    heads = net.heads.state_dict()
+    assert list(heads) == ["a.weight", "a.bias"] and versions(heads) == [("", 1), ("a", 1)]
+
+
+def load_old(version, device, assign, strict=True):
+    """Loads a state dict without the count into a `BatchNorm2d` whose count is 5 (on the CPU)."""
+    with torch.device(device):
+        bn = nn.BatchNorm2d(2)
+    if device == "cpu":
+        bn.num_batches_tracked.fill_(5)
+    count = bn.num_batches_tracked
+    sd = collections.OrderedDict(
+        (k, v) for k, v in nn.BatchNorm2d(2).state_dict().items() if k != "num_batches_tracked"
+    )
+    if version != "none":
+        sd._metadata = {"": {"version": version}} if version is not None else {"x": {"version": 1}}
+    try:
+        # Copying into the meta device warns that it does nothing; homura doesn't warn.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            report = bn.load_state_dict(sd, strict=strict, assign=assign)
+    except RuntimeError as e:
+        return str(e)
+    n = bn.num_batches_tracked
+    value = None if n.device.type == "meta" else n.item()
+    return report.missing_keys, n.device.type, n.dtype, value, n is count
+
+
+@block
+def old_batch_norm_state_dicts_keep_the_count():
+    missing = 'Missing key(s) in state_dict: "num_batches_tracked".'
+    # Without versions, without one for the module, or of version 1: the count stays; on the
+    # meta device, copying leaves it there and assigning gives it an I64 0 on the CPU.
+    for version in ["none", None, 1]:
+        for assign in [False, True]:
+            assert load_old(version, "cpu", assign) == ([], "cpu", torch.int64, 5, True)
+        assert load_old(version, "meta", False) == ([], "meta", torch.int64, None, True)
+        assert load_old(version, "meta", True) == ([], "cpu", torch.int64, 0, False)
+    # Version 2 has the count: it is missing.
+    for device in ["cpu", "meta"]:
+        for assign in [False, True]:
+            assert missing in load_old(2, device, assign)
+    assert load_old(2, "cpu", False, strict=False) == (
+        ["num_batches_tracked"], "cpu", torch.int64, 5, True
+    )
+    # An old state dict that has the count loads it.
+    sd = nn.BatchNorm2d(2).state_dict()
+    sd["num_batches_tracked"].fill_(3)
+    sd._metadata = {"": {"version": 1}}
+    for assign in [False, True]:
+        bn = nn.BatchNorm2d(2)
+        bn.load_state_dict(sd, assign=assign)
+        assert bn.num_batches_tracked.item() == 3
+    # The version of the module's own path counts, in a whole model.
+    sd = Net().state_dict()
+    del sd["blocks.1.num_batches_tracked"]
+    text = message(lambda: Net().load_state_dict(sd))
+    assert 'Missing key(s) in state_dict: "blocks.1.num_batches_tracked".' in text, text
+    sd._metadata["blocks.1"]["version"] = 1
+    assert Net().load_state_dict(sd).missing_keys == []
+    del sd._metadata["blocks.1"]
+    assert Net().load_state_dict(sd).missing_keys == []
+    # Without running statistics there is no count to keep.
+    plain = nn.BatchNorm2d(2, track_running_stats=False)
+    assert plain.num_batches_tracked is None
+    assert plain.load_state_dict({"weight": torch.ones(2), "bias": torch.zeros(2)}).missing_keys == []
 
 
 print(f"check_m3_load: {passed} blocks passed")

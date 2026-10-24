@@ -52,6 +52,8 @@ ALLOWED = {
     ("src/nn/module.rs", "visit"): CALLBACK,
     ("src/nn/module.rs", "extra_repr"): CALLBACK,
     ("src/nn/module.rs", "type_name"): CALLBACK,
+    ("src/nn/module.rs", "version"): CALLBACK,
+    ("src/nn/module.rs", "added_in"): CALLBACK,
     ("src/nn/module.rs", "visit_non_persistent"): CALLBACK,
 }
 

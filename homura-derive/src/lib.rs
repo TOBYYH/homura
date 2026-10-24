@@ -30,6 +30,10 @@ use proc_macro::TokenStream;
 ///   not part of the state dict (PyTorch's `persistent=False`); `to` still converts it.
 /// - `#[module(skip)]`: the field is not a member at all, and its type needs no `Member`
 ///   implementation.
+/// - `#[module(added_in = N)]`: the field, a zero-dimensional integer buffer (`Tensor` or
+///   `Option<Tensor>`, not `non_persistent`), was added in version `N` of the module, which must
+///   not be later than the struct's `version`; implements `Module::added_in`, so that loading an
+///   older state dict without it keeps its value.
 ///
 /// Struct attributes:
 ///
@@ -38,6 +42,8 @@ use proc_macro::TokenStream;
 /// - `#[module(extra_repr = path)]`: the function, of the signature `fn(&Self) -> String`
 ///   (usually an inherent method, `Self::describe`), that implements `Module::extra_repr`, the
 ///   settings that `Module::display` prints.
+/// - `#[module(version = N)]`: the version of the module's state dict, an integer from 1
+///   (PyTorch's `_version`, 1 by default), which implements `Module::version`.
 ///
 /// See the documentation of `homura::nn` for examples.
 #[proc_macro_derive(Module, attributes(module))]

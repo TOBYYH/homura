@@ -5,7 +5,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use super::display::short_type_name;
-use super::{LoadError, LoadOptions, LoadReport, ModuleDisplay, Parameter, StateDict, Training};
+use super::{
+    LoadError, LoadOptions, LoadReport, ModuleDisplay, ModuleVersions, Parameter, StateDict,
+    Training,
+};
 use crate::nn::functional::Reduction;
 use crate::tensor::{TensorData, checked_nbytes, conversion_error, convert_data};
 use crate::{DType, Device, GeluApproximate, Tensor, TensorOptions, bf16, f16};
@@ -179,6 +182,46 @@ pub trait Module: Member {
         short_type_name(std::any::type_name::<Self>())
     }
 
+    /// The version of this module's state dict, PyTorch's `_version`: 1 by default, raised when
+    /// the members of the module change. [`state_dict`](Module::state_dict) records it for every
+    /// module of the tree ([`StateDict::versions`]); loading compares it with
+    /// [`added_in`](Module::added_in). Derived modules set it with `#[module(version = N)]`;
+    /// [`BatchNorm2d`](super::BatchNorm2d) is version 2. `Box`, `Arc` and `Option` give the
+    /// version of the module they hold, the containers have version 1.
+    fn version(&self) -> u32 {
+        1
+    }
+
+    /// The version of this module that added its persistent buffer `name`, or `None` for a
+    /// member it has always had. Derived modules set it with `#[module(added_in = N)]` on the
+    /// field.
+    ///
+    /// When a state dict has no entry for such a buffer and the version it records for the
+    /// module is lower than `N` or missing (an old state dict, or one without versions), loading
+    /// doesn't count the key as missing and leaves the buffer as it is, as PyTorch's
+    /// `BatchNorm2d` does for `num_batches_tracked`; a buffer on the meta device, which has no
+    /// value, gets a zero-dimensional 0 of its dtype on the CPU with
+    /// [`assign`](super::LoadOptions::assign) (copying into it changes nothing). Only
+    /// zero-dimensional integer buffers can be added this way: loading fails for others.
+    ///
+    /// ```
+    /// use homura::nn::{BatchNorm2d, Module};
+    ///
+    /// let norm = BatchNorm2d::new(2);
+    /// assert_eq!((norm.version(), norm.added_in("num_batches_tracked")), (2, Some(2)));
+    /// let mut sd = norm.state_dict();
+    /// sd.remove("num_batches_tracked");
+    /// // Version 2 has the count: it is missing.
+    /// assert!(norm.load_state_dict(&sd).is_err());
+    /// // Without versions, the state dict counts as old.
+    /// *sd.versions_mut() = None;
+    /// norm.load_state_dict(&sd).unwrap();
+    /// ```
+    fn added_in(&self, name: &str) -> Option<u32> {
+        let _ = name;
+        None
+    }
+
     /// The number of elements of the parameters of the module tree, each parameter once, like
     /// `sum(p.numel() for p in model.parameters())`: frozen parameters count, buffers don't.
     #[track_caller]
@@ -299,17 +342,22 @@ pub trait Module: Member {
     }
 
     /// The parameters and persistent buffers of the module tree by key (`state_dict()`): every
-    /// path, so a shared tensor appears under each of its keys.
+    /// path, so a shared tensor appears under each of its keys. It also has the
+    /// [`version`](Module::version) of every module by its path, as PyTorch's `_metadata` (see
+    /// [`StateDict::versions`]).
     ///
     /// The values share the storage of the parameters and buffers, so they show later updates;
     /// they are new tensors without history that don't require grad, like PyTorch's. Use
     /// [`Tensor::deep_clone`] on them for a snapshot.
     #[track_caller]
     fn state_dict(&self) -> StateDict {
-        entries(self)
+        let (targets, versions) = targets(self);
+        let mut sd: StateDict = targets
             .into_iter()
-            .map(|(key, t)| (key, t.detach()))
-            .collect()
+            .map(|target| (target.key, target.tensor.detach()))
+            .collect();
+        *sd.versions_mut() = Some(versions);
+        sd
     }
 
     /// Copies the entries of `state_dict` into the parameters and persistent buffers with the
@@ -320,9 +368,10 @@ pub trait Module: Member {
     ///
     /// Missing and unexpected keys are errors, so the returned report has empty lists;
     /// [`load_state_dict_with`](Module::load_state_dict_with) takes [`LoadOptions`] to allow
-    /// them. Entries whose shape differs from the target's, that come from a device the target
-    /// can't copy from (the meta device), or whose target can't be written (its elements
-    /// overlap) are errors in any case.
+    /// them. A buffer that a module added in a later version than the state dict's isn't missing
+    /// (see [`added_in`](Module::added_in)). Entries whose shape differs from the target's, that
+    /// come from a device the target can't copy from (the meta device), or whose target can't be
+    /// written (its elements overlap) are errors in any case.
     ///
     /// Every entry is checked before anything is written: when loading fails, the module is
     /// unchanged. (PyTorch writes the entries that match before it reports errors.)
@@ -610,16 +659,44 @@ fn check_names(members: &[(String, Entry<'_>)]) {
     }
 }
 
-/// The parameters and persistent buffers of the tree by key, every path.
+/// A parameter or persistent buffer of a module tree.
+struct Target<'a> {
+    key: String,
+    tensor: &'a Tensor,
+    parameter: bool,
+    /// The version of its module that added it ([`Module::added_in`]).
+    added_in: Option<u32>,
+}
+
+/// The parameters and persistent buffers of the tree by key, every path, and the version of
+/// every module by its path.
 #[track_caller]
-fn entries<M: Member + ?Sized>(module: &M) -> Vec<(String, &Tensor)> {
-    let mut out = vec![];
-    walk(module, false, &mut |item| match item {
-        Item::Parameter(key, p) => out.push((key, p.as_tensor())),
-        Item::Buffer(key, t, true) => out.push((key, t)),
-        _ => {}
+fn targets<M: Member + ?Sized>(module: &M) -> (Vec<Target<'_>>, ModuleVersions) {
+    let mut targets = vec![];
+    let mut versions = ModuleVersions::new();
+    // A module's parameters and buffers come right after it, before its submodules.
+    let mut owner: Option<&dyn Module> = None;
+    walk(module, false, &mut |item| {
+        let (key, tensor, parameter) = match item {
+            Item::Module(key, m) => {
+                versions.insert(key, m.version());
+                owner = Some(m);
+                return;
+            }
+            Item::Parameter(key, p) => (key, p.as_tensor(), true),
+            Item::Buffer(key, t, true) => (key, t, false),
+            _ => return,
+        };
+        let name = key.rsplit('.').next().unwrap_or_default();
+        let added_in = owner.and_then(|m| m.added_in(name));
+        targets.push(Target {
+            key,
+            tensor,
+            parameter,
+            added_in,
+        });
     });
-    out
+    (targets, versions)
 }
 
 #[track_caller]
@@ -638,13 +715,9 @@ fn load<M: Member + ?Sized>(
     options: LoadOptions,
 ) -> Result<LoadReport, LoadError> {
     let (strict, assign) = (options.is_strict(), options.is_assign());
-    let targets = entries(module);
-    let keys: HashSet<&str> = targets.iter().map(|(k, _)| k.as_str()).collect();
-    let missing_keys: Vec<String> = targets
-        .iter()
-        .filter(|(k, _)| !state_dict.contains_key(k))
-        .map(|(k, _)| k.clone())
-        .collect();
+    let (targets, _) = targets(module);
+    let keys: HashSet<&str> = targets.iter().map(|t| t.key.as_str()).collect();
+    let mut missing_keys = vec![];
     let unexpected_keys: Vec<String> = state_dict
         .keys()
         .filter(|k| !keys.contains(k))
@@ -654,8 +727,35 @@ fn load<M: Member + ?Sized>(
     // With assignment, the data each target gets: taken now, so that writing one target can't
     // change what a later one reads when they alias.
     let mut assigned = vec![];
-    for (key, target) in &targets {
+    for Target {
+        key,
+        tensor: target,
+        parameter,
+        added_in,
+    } in &targets
+    {
+        if let Some(version) = *added_in {
+            if let Some(e) = added_in_error(target, *parameter) {
+                errors.push(format!("{key:?} {e}"));
+                continue;
+            }
+            // An old state dict: the module didn't have the buffer.
+            let path = key.rsplit_once('.').map_or("", |(path, _)| path);
+            if !state_dict.contains_key(key)
+                && state_dict.module_version(path).is_none_or(|v| v < version)
+            {
+                if assign && target.device() == Device::Meta {
+                    let zero = crate::zeros_with([], (target.dtype(), Device::Cpu)).data();
+                    match assign_error(target, &zero) {
+                        Some(e) => errors.push(format!("{key:?} can't be set to 0: {e}")),
+                        None => assigned.push((*target, zero)),
+                    }
+                }
+                continue;
+            }
+        }
         let Some(source) = state_dict.get(key) else {
+            missing_keys.push(key.clone());
             continue;
         };
         let (dst, src) = (target.data(), source.data());
@@ -698,15 +798,28 @@ fn load<M: Member + ?Sized>(
         }
     } else {
         let _guard = crate::no_grad();
-        for (key, target) in &targets {
-            if let Some(source) = state_dict.get(key) {
-                target.copy_(source);
+        for target in &targets {
+            if let Some(source) = state_dict.get(&target.key) {
+                target.tensor.copy_(source);
             }
         }
     }
     Ok(LoadReport {
         missing_keys,
         unexpected_keys,
+    })
+}
+
+/// Why `target` can't be a buffer that a later version of its module added
+/// ([`Module::added_in`]), or `None` if it can: a persistent zero-dimensional integer buffer.
+fn added_in_error(target: &Tensor, parameter: bool) -> Option<String> {
+    let what = if parameter { "a parameter" } else { "a buffer" };
+    let (shape, dtype) = (target.shape(), target.dtype());
+    (parameter || !shape.is_empty() || !dtype.is_integral()).then(|| {
+        format!(
+            "is {what} of shape {shape:?} and dtype {dtype}, but added_in only supports \
+             zero-dimensional integer buffers"
+        )
     })
 }
 
@@ -861,6 +974,21 @@ impl NonPersistent for Option<Tensor> {
     }
 }
 
+/// The fields that `#[module(added_in = N)]` accepts: buffers that can be in the state dict.
+#[diagnostic::on_unimplemented(
+    message = "`#[module(added_in = ..)]` needs a `Tensor` or `Option<Tensor>` field, not `{Self}`",
+    label = "not a buffer"
+)]
+pub trait AddedIn {}
+
+impl AddedIn for Tensor {}
+
+impl AddedIn for Option<Tensor> {}
+
+/// Checks that a field with `#[module(added_in = N)]` is a buffer.
+#[track_caller]
+pub fn added_in_field<T: AddedIn>(_: &T) {}
+
 impl Member for Parameter {
     fn visit_as<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
         v.parameter(name, self);
@@ -905,6 +1033,14 @@ impl<T: Module> Module for Option<T> {
     fn type_name(&self) -> &'static str {
         self.as_ref().map_or("None", T::type_name)
     }
+
+    fn version(&self) -> u32 {
+        self.as_ref().map_or(1, T::version)
+    }
+
+    fn added_in(&self, name: &str) -> Option<u32> {
+        self.as_ref()?.added_in(name)
+    }
 }
 
 impl<T: Member> Member for Box<T> {
@@ -929,6 +1065,14 @@ impl<T: Module> Module for Box<T> {
     fn type_name(&self) -> &'static str {
         (**self).type_name()
     }
+
+    fn version(&self) -> u32 {
+        (**self).version()
+    }
+
+    fn added_in(&self, name: &str) -> Option<u32> {
+        (**self).added_in(name)
+    }
 }
 
 impl<T: Member> Member for Arc<T> {
@@ -952,6 +1096,14 @@ impl<T: Module> Module for Arc<T> {
 
     fn type_name(&self) -> &'static str {
         (**self).type_name()
+    }
+
+    fn version(&self) -> u32 {
+        (**self).version()
+    }
+
+    fn added_in(&self, name: &str) -> Option<u32> {
+        (**self).added_in(name)
     }
 }
 
@@ -986,6 +1138,14 @@ macro_rules! dyn_modules {
                 fn type_name(&self) -> &'static str {
                     (**self).type_name()
                 }
+
+                fn version(&self) -> u32 {
+                    (**self).version()
+                }
+
+                fn added_in(&self, name: &str) -> Option<u32> {
+                    (**self).added_in(name)
+                }
             }
 
             impl<'m> Member for Arc<$t> {
@@ -1005,6 +1165,14 @@ macro_rules! dyn_modules {
 
                 fn type_name(&self) -> &'static str {
                     (**self).type_name()
+                }
+
+                fn version(&self) -> u32 {
+                    (**self).version()
+                }
+
+                fn added_in(&self, name: &str) -> Option<u32> {
+                    (**self).added_in(name)
                 }
             }
         )*

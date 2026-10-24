@@ -8,8 +8,8 @@ use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Data, DeriveInput, Error, Expr, ExprPath, Fields, GenericParam, Lifetime, LitStr,
-    Path, Result, Type, TypeMacro, TypePath, parse_quote,
+    Attribute, Data, DeriveInput, Error, Expr, ExprPath, Fields, GenericParam, Lifetime, LitInt,
+    LitStr, Path, Result, Type, TypeMacro, TypePath, parse_quote,
 };
 
 /// How a field reports itself.
@@ -26,13 +26,19 @@ struct Field<'a> {
     ty: &'a Type,
     key: LitStr,
     kind: Kind,
+    /// `#[module(added_in = N)]`: the version, and the literal for errors.
+    added_in: Option<(u32, LitInt)>,
 }
 
 /// The implementations of `Module` and `Member` for `input`, or the errors in it: all of the
 /// errors in fields and their attributes, or the first error in the struct's own attributes or
 /// shape.
 pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
-    let Container { krate, extra_repr } = container(&input.attrs)?;
+    let Container {
+        krate,
+        extra_repr,
+        version,
+    } = container(&input.attrs)?;
     let fields: Vec<&syn::Field> = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => fields.named.iter().collect(),
@@ -84,6 +90,22 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
             }
             Ok(None) => {}
             Err(e) => add_error(e),
+        }
+    }
+    // A buffer added in a later version than the module's would count as added in every state
+    // dict the module writes.
+    let module_version = version.as_ref().map_or(1, |(v, _)| *v);
+    for member in &members {
+        if let Some((added_in, literal)) = &member.added_in
+            && *added_in > module_version
+        {
+            add_error(Error::new(
+                literal.span(),
+                format!(
+                    "`added_in = {added_in}` is later than the version of the module, \
+                     {module_version}; set it with `#[module(version = {added_in})]` on the struct"
+                ),
+            ));
         }
     }
     if let Some(errors) = errors {
@@ -167,6 +189,43 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
             },
         }
     });
+    let version = version.map(|(_, literal)| {
+        quote! {
+            fn version(&self) -> ::core::primitive::u32 {
+                #literal
+            }
+        }
+    });
+    let added_in: Vec<_> = members
+        .iter()
+        .filter_map(|member| Some((member, member.added_in.as_ref()?)))
+        .collect();
+    let added_in = (!added_in.is_empty()).then(|| {
+        // Each field is checked to be a buffer, reported at its type.
+        let checks = added_in.iter().map(|(member, _)| {
+            let ident = member.ident;
+            let span = Span::call_site().located_at(member.ty.span());
+            quote_spanned! {span=>
+                #krate::nn::__private::added_in_field(&self.#ident);
+            }
+        });
+        let arms = added_in.iter().map(|(member, (_, literal))| {
+            let key = &member.key;
+            quote! { #key => ::core::option::Option::Some(#literal), }
+        });
+        quote! {
+            fn added_in(
+                &self,
+                #name_parameter: &str,
+            ) -> ::core::option::Option<::core::primitive::u32> {
+                #(#checks)*
+                match #name_parameter {
+                    #(#arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    });
     // Resolved at the derive, but a function of another signature is reported at the path.
     let extra_repr = extra_repr.map(|path| {
         let span = Span::call_site().located_at(path.span());
@@ -187,6 +246,8 @@ pub fn expand(input: &DeriveInput) -> Result<TokenStream> {
             }
 
             #extra_repr
+            #version
+            #added_in
         }
 
         #[automatically_derived]
@@ -213,11 +274,44 @@ struct Container {
     krate: Path,
     /// The function that implements `Module::extra_repr`: `#[module(extra_repr = path)]`.
     extra_repr: Option<ExprPath>,
+    /// `Module::version`: `#[module(version = N)]`, with the literal.
+    version: Option<(u32, LitInt)>,
+}
+
+/// The value of an attribute that takes a version, such as `version = 2`.
+fn version_value(meta: &syn::meta::ParseNestedMeta<'_>, name: &str) -> Result<(u32, LitInt)> {
+    let value: Expr = meta.value()?.parse()?;
+    let literal = match value {
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(literal),
+            attrs,
+        }) if attrs.is_empty() && literal.suffix().is_empty() => literal,
+        other => {
+            return Err(Error::new(
+                other.span(),
+                format!("`{name}` takes a version, an integer such as `{name} = 2`"),
+            ));
+        }
+    };
+    let version = literal.base10_parse::<u32>().map_err(|_| {
+        Error::new(
+            literal.span(),
+            format!("`{name}` takes a version from 1 to 4294967295"),
+        )
+    })?;
+    if version == 0 {
+        return Err(Error::new(
+            literal.span(),
+            format!("`{name}` takes a version from 1 to 4294967295"),
+        ));
+    }
+    Ok((version, literal))
 }
 
 fn container(attrs: &[Attribute]) -> Result<Container> {
     let mut krate: Option<Path> = None;
     let mut extra_repr: Option<ExprPath> = None;
+    let mut version: Option<(u32, LitInt)> = None;
     for attr in module_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let duplicate = || {
@@ -247,9 +341,16 @@ fn container(attrs: &[Attribute]) -> Result<Container> {
                         ));
                     }
                 }
+            } else if meta.path.is_ident("version") {
+                let value = version_value(&meta, "version")?;
+                if version.is_some() {
+                    return Err(duplicate());
+                }
+                version = Some(value);
             } else {
                 return Err(meta.error(
-                    "unknown `module` attribute for a struct; expected `crate` or `extra_repr`",
+                    "unknown `module` attribute for a struct; expected `crate`, `extra_repr` or \
+                     `version`",
                 ));
             }
             Ok(())
@@ -258,6 +359,7 @@ fn container(attrs: &[Attribute]) -> Result<Container> {
     Ok(Container {
         krate: krate.unwrap_or_else(|| parse_quote!(::homura)),
         extra_repr,
+        version,
     })
 }
 
@@ -269,6 +371,7 @@ fn member(field: &syn::Field) -> Result<Option<Field<'_>>> {
     // Where the attributes other than `skip` are, for errors.
     let mut others: Vec<(Span, &str)> = vec![];
     let mut non_persistent = false;
+    let mut added_in: Option<(u32, LitInt)> = None;
     for attr in module_attrs(&field.attrs) {
         attr.parse_nested_meta(|meta| {
             let duplicate = || {
@@ -308,10 +411,17 @@ fn member(field: &syn::Field) -> Result<Option<Field<'_>>> {
                 }
                 others.push((meta.path.span(), "non_persistent"));
                 non_persistent = true;
+            } else if meta.path.is_ident("added_in") {
+                let value = version_value(&meta, "added_in")?;
+                if added_in.is_some() {
+                    return Err(duplicate());
+                }
+                others.push((meta.path.span(), "added_in"));
+                added_in = Some(value);
             } else {
                 return Err(meta.error(
-                    "unknown `module` attribute for a field; expected `rename`, `skip` or \
-                     `non_persistent`",
+                    "unknown `module` attribute for a field; expected `rename`, `skip`, \
+                     `non_persistent` or `added_in`",
                 ));
             }
             Ok(())
@@ -326,6 +436,13 @@ fn member(field: &syn::Field) -> Result<Option<Field<'_>>> {
             None => Ok(None),
         };
     }
+    if non_persistent && let Some((_, literal)) = &added_in {
+        return Err(Error::new(
+            literal.span(),
+            "`added_in` is for buffers in the state dict, so it can't be used with \
+             `non_persistent`",
+        ));
+    }
     let key = rename.unwrap_or_else(|| LitStr::new(&ident.unraw().to_string(), ident.span()));
     Ok(Some(Field {
         ident,
@@ -336,6 +453,7 @@ fn member(field: &syn::Field) -> Result<Option<Field<'_>>> {
         } else {
             Kind::Member
         },
+        added_in,
     }))
 }
 

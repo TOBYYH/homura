@@ -149,4 +149,112 @@
 /// #[module(extra_repr = describe)]
 /// struct Norm;
 /// ```
+///
+/// Versions and `added_in`, which compile here:
+///
+/// ```
+/// use homura::Tensor;
+/// use homura::nn::{Module, Parameter};
+///
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     scale: Parameter,
+///     #[module(added_in = 2, rename = "count")]
+///     steps: Option<Tensor>,
+/// }
+/// ```
+///
+/// `added_in` on a field that isn't a buffer in the state dict: a parameter, a submodule, a
+/// container, a type parameter, a non-persistent buffer or a skipped field.
+///
+/// ```compile_fail,E0277
+/// # use homura::nn::{Module, Parameter};
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     #[module(added_in = 2)]
+///     scale: Parameter,
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use homura::nn::{Linear, Module};
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     #[module(added_in = 2)]
+///     head: Linear,
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use homura::Tensor;
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     #[module(added_in = 2)]
+///     counts: Vec<Tensor>,
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter<T> {
+///     #[module(added_in = 2)]
+///     count: T,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use homura::Tensor;
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     #[module(non_persistent, added_in = 2)]
+///     count: Tensor,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use homura::Tensor;
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = 2)]
+/// struct Counter {
+///     #[module(skip, added_in = 2)]
+///     count: Tensor,
+/// }
+/// ```
+///
+/// `added_in` later than the module's version (1 by default), and versions that aren't positive
+/// integers:
+///
+/// ```compile_fail
+/// # use homura::Tensor;
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// struct Counter {
+///     #[module(added_in = 2)]
+///     count: Tensor,
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = 0)]
+/// struct Counter;
+/// ```
+///
+/// ```compile_fail
+/// # use homura::nn::Module;
+/// #[derive(Module)]
+/// #[module(version = "2")]
+/// struct Counter;
+/// ```
 struct DeriveErrors;

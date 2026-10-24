@@ -14,7 +14,7 @@ use crate::{DType, Device, Tensor, TensorOptions};
 /// tracks running statistics in the buffers `running_mean` (zeros), `running_var` (ones) and
 /// `num_batches_tracked`, a zero-dimensional `I64` count of the training passes; all with the
 /// default dtype and device, `eps = 1e-5` and `momentum = 0.1`, like PyTorch. The state dict has
-/// PyTorch's keys and order.
+/// PyTorch's keys, order and version (2, see [`Module::added_in`]).
 ///
 /// In training mode the layer normalizes with the statistics of the batch and updates the
 /// running statistics (with a momentum of `None`, to the average of all batches so far); in
@@ -37,7 +37,7 @@ use crate::{DType, Device, Tensor, TensorOptions};
 /// assert!(plain.state_dict().is_empty());
 /// ```
 #[derive(Module)]
-#[module(extra_repr = Self::describe)]
+#[module(extra_repr = Self::describe, version = 2)]
 #[non_exhaustive]
 pub struct BatchNorm2d {
     /// The scale, `[num_features]`, with affine.
@@ -49,7 +49,9 @@ pub struct BatchNorm2d {
     /// The running variance (unbiased), `[num_features]`, when tracking running statistics.
     pub running_var: Option<Tensor>,
     /// The number of training passes, a zero-dimensional `I64` tensor, when tracking running
-    /// statistics.
+    /// statistics. Added in version 2 of the layer: loading a state dict of version 1 or without
+    /// versions keeps the count when the state dict has none.
+    #[module(added_in = 2)]
     pub num_batches_tracked: Option<Tensor>,
     pub num_features: usize,
     pub eps: f64,

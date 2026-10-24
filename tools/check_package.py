@@ -10,7 +10,7 @@ upload them:
    unit tests), with homura built against the unpacked homura-derive.
 4. A crate outside the workspace that depends on the unpacked homura under another name
    (`hm = { package = "homura", ... }`) derives `Module` with `#[module(crate = "hm")]` and an
-   `extra_repr`, builds and runs.
+   `extra_repr`, a version and an `added_in` buffer, builds and runs.
 
 The working tree must be clean, as for `cargo publish` (the tool never passes `--allow-dirty`).
 The packages are unpacked into a temporary directory outside the workspace; the build output goes
@@ -54,7 +54,7 @@ use hm::Tensor;
 use hm::nn::{self, Module};
 
 #[derive(nn::Module)]
-#[module(crate = "hm", extra_repr = Self::describe)]
+#[module(crate = "hm", extra_repr = Self::describe, version = 2)]
 struct Net {
     conv: nn::Conv2d,
     bn: nn::BatchNorm2d,
@@ -62,6 +62,8 @@ struct Net {
     head: nn::Linear,
     #[module(non_persistent)]
     scale: Tensor,
+    #[module(added_in = 2)]
+    steps: Option<Tensor>,
 }
 
 impl Net {
@@ -81,6 +83,7 @@ fn main() {
         bn: nn::BatchNorm2d::new(4),
         head: nn::Linear::new(64, 2),
         scale: hm::tensor(2.0),
+        steps: None,
     };
     let keys: Vec<&str> = vec![
         "conv.weight",
@@ -96,6 +99,13 @@ fn main() {
     assert_eq!(net.state_dict().keys().collect::<Vec<_>>(), keys);
     assert_eq!(net.named_buffers().len(), 4);
     assert_eq!(net.num_parameters(), 108 + 4 + 8 + 130);
+    assert_eq!((net.version(), net.added_in("steps")), (2, Some(2)));
+    let mut sd = net.state_dict();
+    assert_eq!(sd.module_version(""), Some(2));
+    assert_eq!(sd.module_version("bn"), Some(2));
+    sd.remove("bn.num_batches_tracked");
+    sd.set_module_version("bn", 1);
+    net.load_state_dict(&sd).unwrap();
     let text = net.display().to_string();
     assert!(text.starts_with("Net(\n  classes=2\n  (conv): Conv2d(3, 4, kernel_size=(3, 3)"), "{text}");
     assert!(text.contains("\n  (fc): Linear(in_features=64, out_features=2, bias=True)\n)"), "{text}");

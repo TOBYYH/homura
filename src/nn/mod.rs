@@ -90,6 +90,11 @@
 //! `#[module(crate = "path")]` on the struct. To report members in another way, implement
 //! `Module` and `Member` by hand (see [`Module`]).
 //!
+//! `#[module(version = N)]` on the struct sets the [`version`](Module::version) of its state dict
+//! (PyTorch's `_version`), and `#[module(added_in = N)]` on a zero-dimensional integer buffer
+//! says which version added it, so that loading an older state dict without it keeps its value
+//! ([`Module::added_in`]), as [`BatchNorm2d`] does for its `num_batches_tracked`.
+//!
 //! `#[module(extra_repr = path)]` on the struct gives the function, of the signature
 //! `fn(&Self) -> String`, that implements [`Module::extra_repr`]: the settings that
 //! [`Module::display`] prints, as PyTorch's `extra_repr()` does.
@@ -190,6 +195,8 @@
 //! | `model.state_dict()`, `model.load_state_dict(sd)`, `model.load_state_dict(sd, strict=False)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd)`](Module::load_state_dict), [`model.load_state_dict_with(&sd, LoadOptions::default().strict(false))`](Module::load_state_dict_with), returning a `Result` |
 //! | `with torch.device("meta"): model = Net()`, `model.load_state_dict(sd, assign=True)` | [`let model = homura::with_device(Device::Meta, Net::new)`](crate::with_device), [`model.load_state_dict_with(&sd, LoadOptions::default().assign(true))`](LoadOptions::assign) |
 //! | `model.to(torch.float64)`, `model.to("meta")` | [`model.to(DType::F64)`](Module::to), `model.to(Device::Meta)` |
+//! | `consume_prefix_in_state_dict_if_present(sd, "module.")`, `model.state_dict(prefix="x.")`, `sd._metadata` | [`sd.consume_prefix("module.")`](StateDict::consume_prefix), [`sd.add_prefix("x.")`](StateDict::add_prefix), [`sd.versions()`](StateDict::versions) |
+//! | `_version = 2` in the class, a hook for old state dicts in `_load_from_state_dict` | `#[module(version = 2)]`, `#[module(added_in = 2)]` on the buffer ([`Module::added_in`]) |
 //! | `print(model)`, `def extra_repr(self)` | [`println!("{}", model.display())`](Module::display), `#[module(extra_repr = Self::describe)]` |
 //! | `sum(p.numel() for p in model.parameters())` | [`model.num_parameters()`](Module::num_parameters) |
 //!
@@ -268,9 +275,12 @@
 //!   `padding_mode`, [`MaxPool2d`] returns the indices from
 //!   [`forward_with_indices`](MaxPool2d::forward_with_indices) instead of a `return_indices`
 //!   option, and [`AdaptiveAvgPool2d`] has no `None` sizes.
-//! - [`BatchNorm2d`]'s state dict must have `num_batches_tracked`: homura's state dicts have no
-//!   versions, and PyTorch takes one without version metadata for one of an old version and
-//!   keeps the count.
+//! - A buffer added in a later version ([`Module::added_in`], `num_batches_tracked` of
+//!   [`BatchNorm2d`]) that is on the meta device gets a 0 of its own dtype when an old state
+//!   dict is assigned, where PyTorch's `BatchNorm2d` uses an `I64` 0 whatever the buffer's dtype;
+//!   only zero-dimensional integer buffers can be added this way. [`StateDict::consume_prefix`]
+//!   renames the version of the module named by the prefix without its final `.`, where PyTorch
+//!   compares with the prefix without any `.` (they differ for a prefix such as `a.b.`).
 //! - The losses have no warnings ([`mse_loss`](functional::mse_loss) broadcasts silently) and
 //!   panic on the first target out of range. [`nll_loss`](functional::nll_loss) differentiates a
 //!   single sample with a `[1]` target, which PyTorch's backward rejects, and computes `U8`
@@ -301,12 +311,14 @@ pub use layers::{
 };
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;
-pub use state_dict::{LoadError, LoadOptions, LoadReport, StateDict, StateDictIter};
+pub use state_dict::{
+    LoadError, LoadOptions, LoadReport, ModuleVersions, StateDict, StateDictIter,
+};
 pub use training::Training;
 
 /// What `#[derive(Module)]` expands to uses; not part of the API.
 #[doc(hidden)]
 pub mod __private {
-    pub use super::module::NonPersistent;
+    pub use super::module::{AddedIn, NonPersistent, added_in_field};
     pub use std::string::String;
 }

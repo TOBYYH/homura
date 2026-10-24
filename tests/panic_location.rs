@@ -266,6 +266,11 @@ fn module_methods() {
     at!(shared.to(DType::I32));
     let sd = StateDict::new();
     at!(&sd["missing"]);
+    let two: StateDict = [("a", homura::ones([1])), ("b", homura::ones([1]))]
+        .into_iter()
+        .collect();
+    let same = |_: &str| Some(String::new());
+    at!(two.clone().map_keys(same));
     at!(Parameter::new(homura::tensor([1i64])));
     let (one_dim, fan_in, leaky) = (
         homura::ones([3]),

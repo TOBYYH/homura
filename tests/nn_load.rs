@@ -1,15 +1,19 @@
-//! Loading state dicts by assignment (`LoadOptions::assign`) and models built on the meta
-//! device. tools/golden/check_m3_load.py asserts the reference behavior of each test with a
+//! Loading state dicts by assignment (`LoadOptions::assign`), models built on the meta device,
+//! the versions of modules, the prefixes of keys and old state dicts without a buffer added later
+//! (`added_in`). tools/golden/check_m3_load.py asserts the reference behavior of each test with a
 //! PyTorch counterpart, in the same order; the tests after those cover what homura does
 //! differently: parameters keep their identity, and graphs and views of the old data are refused,
-//! whichever way they reach it.
+//! whichever way they reach it; and what PyTorch has no counterpart for.
 
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use homura::autograd::{self, GradOptions};
 use homura::nn::{
-    BatchNorm2d, Conv2d, Embedding, Forward, LayerNorm, Linear, LoadOptions, Module, Parameter,
-    RmsNorm, StateDict,
+    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, LayerNorm,
+    Linear, LoadOptions, MaxPool2d, Member, Module, ModuleVersions, Parameter, Relu, RmsNorm,
+    Sequential, Sigmoid, Silu, Softmax, StateDict, Tanh, Visitor,
 };
 use homura::optim::{Adam, Optimizer, Sgd};
 use homura::{DType, Device, Tensor};
@@ -326,6 +330,292 @@ fn entries_are_read_before_any_is_assigned() {
     assert_eq!(m.b.to_vec::<f32>(), [1.0, 2.0]);
 }
 
+#[derive(Module)]
+struct Net {
+    conv: Conv2d,
+    bn: Arc<BatchNorm2d>,
+    blocks: Vec<BatchNorm2d>,
+    empty: Vec<Linear>,
+    heads: BTreeMap<String, Linear>,
+    skip: Option<Linear>,
+    /// The same module under a second name.
+    tied: Arc<BatchNorm2d>,
+}
+
+impl Net {
+    fn new() -> Net {
+        let bn = Arc::new(BatchNorm2d::new(2));
+        Net {
+            conv: Conv2d::new(1, 2, 1),
+            bn: bn.clone(),
+            blocks: vec![BatchNorm2d::new(2), BatchNorm2d::new(2)],
+            empty: vec![],
+            heads: BTreeMap::from([("a".to_string(), Linear::new(2, 2))]),
+            skip: None,
+            tied: bn,
+        }
+    }
+}
+
+const NET_VERSIONS: [(&str, u32); 10] = [
+    ("", 1),
+    ("conv", 1),
+    ("bn", 2),
+    ("blocks", 1),
+    ("blocks.0", 2),
+    ("blocks.1", 2),
+    ("empty", 1),
+    ("heads", 1),
+    ("heads.a", 1),
+    ("tied", 2),
+];
+
+fn versions(sd: &StateDict) -> Vec<(&str, u32)> {
+    sd.versions().expect("versions").iter().collect()
+}
+
+fn keys(sd: &StateDict) -> Vec<&str> {
+    sd.keys().collect()
+}
+
+#[test]
+fn state_dicts_record_module_versions() {
+    // Every module by its path, before its submodules; a shared module under each name, a `None`
+    // one not at all.
+    assert_eq!(versions(&Net::new().state_dict()), NET_VERSIONS);
+    let model = Sequential::new()
+        .append(Linear::new(2, 2))
+        .append(BatchNorm2d::new(2));
+    assert_eq!(versions(&model.state_dict()), [("", 1), ("0", 1), ("1", 2)]);
+    assert_eq!(versions(&BatchNorm2d::new(2).state_dict()), [("", 2)]);
+    // Only the batch normalization layers have another version than 1.
+    let others: Vec<Box<dyn Module>> = vec![
+        Box::new(Linear::new(2, 2)),
+        Box::new(Conv2d::new(1, 1, 1)),
+        Box::new(LayerNorm::new([2])),
+        Box::new(RmsNorm::new([2])),
+        Box::new(Embedding::new(2, 2)),
+        Box::new(Dropout::new(0.1)),
+        Box::new(Relu),
+        Box::new(Gelu::new()),
+        Box::new(Silu),
+        Box::new(Tanh),
+        Box::new(Sigmoid),
+        Box::new(Softmax::new(-1)),
+        Box::new(MaxPool2d::new(2)),
+        Box::new(AdaptiveAvgPool2d::new(1)),
+        Box::new(Flatten::default()),
+        Box::new(Sequential::new()),
+        Box::new(Vec::<Linear>::new()),
+        Box::new(BTreeMap::<String, Linear>::new()),
+    ];
+    for m in others {
+        assert_eq!(m.version(), 1, "{}", m.type_name());
+    }
+    assert_eq!(BatchNorm2d::new(2).version(), 2);
+}
+
+/// A state dict with `keys` and the versions `paths`, after `consume_prefix(prefix)`.
+fn consumed(keys: &[&str], paths: &[(&str, u32)], prefix: &str) -> StateDict {
+    let mut sd: StateDict = keys.iter().map(|&k| (k, homura::zeros([1]))).collect();
+    *sd.versions_mut() = Some(paths.iter().copied().collect());
+    sd.consume_prefix(prefix);
+    sd
+}
+
+#[test]
+fn prefixes_move_keys_and_versions() {
+    // Renamed entries go last; the module named by the prefix becomes the root.
+    let sd = consumed(
+        &["module.a", "b", "module.c.d"],
+        &[("", 1), ("module", 3), ("module.c", 2), ("x", 1)],
+        "module.",
+    );
+    assert_eq!(keys(&sd), ["b", "a", "c.d"]);
+    assert_eq!(versions(&sd), [("", 3), ("x", 1), ("c", 2)]);
+    // A new key that exists replaces that entry in its position.
+    let mut sd = consumed(&["a", "module.a"], &[("", 7), ("module", 3)], "module.");
+    assert_eq!(keys(&sd), ["a"]);
+    assert_eq!(versions(&sd), [("", 3)]);
+    // The prefix is removed once.
+    let sd2 = consumed(&["module.module.a"], &[("module.module", 3)], "module.");
+    assert_eq!(
+        (keys(&sd2), versions(&sd2)),
+        (vec!["module.a"], vec![("module", 3)])
+    );
+    // With a "." inside the prefix, homura renames the version of "a.b" (PyTorch that of "ab").
+    let sd2 = consumed(
+        &["a.b.w", "a.bw"],
+        &[("", 1), ("a", 1), ("a.b", 2), ("ab", 4), ("a.b.c", 3)],
+        "a.b.",
+    );
+    assert_eq!(keys(&sd2), ["a.bw", "w"]);
+    assert_eq!(versions(&sd2), [("", 2), ("a", 1), ("ab", 4), ("c", 3)]);
+    // Without versions, only the keys change.
+    *sd.versions_mut() = None;
+    sd.consume_prefix("a");
+    assert_eq!((keys(&sd), sd.versions()), (vec![""], None));
+
+    // Adding a prefix, as `state_dict(prefix=...)`.
+    let net = Net::new();
+    let mut sd = net.state_dict();
+    sd.add_prefix("model.");
+    assert_eq!(keys(&sd)[..2], ["model.conv.weight", "model.conv.bias"]);
+    let mut expected = vec![("model".to_string(), 1)];
+    expected.extend(
+        NET_VERSIONS[1..]
+            .iter()
+            .map(|&(p, v)| (format!("model.{p}"), v)),
+    );
+    let expected: Vec<(&str, u32)> = expected.iter().map(|(p, v)| (p.as_str(), *v)).collect();
+    assert_eq!(versions(&sd), expected);
+    // `consume_prefix` undoes it.
+    sd.consume_prefix("model.");
+    assert_eq!(versions(&sd), NET_VERSIONS);
+    assert_eq!(keys(&sd), keys(&net.state_dict()));
+
+    // The state dicts of submodules, as their own `state_dict()` in PyTorch.
+    let sd = net.state_dict();
+    let child = sd.sub("blocks.1.");
+    assert_eq!(
+        keys(&child),
+        [
+            "weight",
+            "bias",
+            "running_mean",
+            "running_var",
+            "num_batches_tracked"
+        ]
+    );
+    assert_eq!(versions(&child), [("", 2)]);
+    assert!(child["weight"].is_same(&sd["blocks.1.weight"]));
+    net.blocks[1].load_state_dict(&child).unwrap();
+    let heads = sd.sub("heads.");
+    assert_eq!(keys(&heads), ["a.weight", "a.bias"]);
+    assert_eq!(versions(&heads), [("", 1), ("a", 1)]);
+    net.heads.load_state_dict(&heads).unwrap();
+    assert!(sd.sub("nothing.").is_empty());
+    assert_eq!(versions(&sd.sub("nothing.")), []);
+}
+
+/// What `versions` a state dict without the count of a `BatchNorm2d` has.
+#[derive(Clone, Copy)]
+enum Old {
+    /// No versions.
+    Absent,
+    /// Versions, without one for the layer.
+    Elsewhere,
+    Version(u32),
+}
+
+/// The missing keys, then the device, dtype and value of the count, and whether its data stayed.
+type Count = (Vec<String>, Device, DType, Option<i64>, bool);
+
+/// Loads a state dict without the count into a `BatchNorm2d` whose count is 5 (on the CPU).
+fn load_old(old: Old, device: Device, assign: bool, strict: bool) -> Result<Count, String> {
+    let bn = homura::with_device(device, || BatchNorm2d::new(2));
+    let count = bn.num_batches_tracked.clone().unwrap();
+    if device == Device::Cpu {
+        count.fill_(5);
+    }
+    let alias = count.detach();
+    let mut sd = BatchNorm2d::new(2).state_dict();
+    sd.remove("num_batches_tracked");
+    *sd.versions_mut() = match old {
+        Old::Absent => None,
+        Old::Elsewhere => Some(ModuleVersions::from_iter([("x", 1)])),
+        Old::Version(v) => Some(ModuleVersions::from_iter([("", v)])),
+    };
+    let options = LoadOptions::default().strict(strict).assign(assign);
+    let report = bn
+        .load_state_dict_with(&sd, options)
+        .map_err(|e| e.to_string())?;
+    let n = bn.num_batches_tracked.as_ref().unwrap();
+    let (value, kept) = match n.device() {
+        Device::Meta => (None, alias.device() == Device::Meta),
+        _ => {
+            let value = n.item::<i64>();
+            n.fill_(9);
+            let kept = alias.device() == n.device() && alias.item::<i64>() == 9;
+            (Some(value), kept)
+        }
+    };
+    Ok((report.missing_keys, n.device(), n.dtype(), value, kept))
+}
+
+#[test]
+fn old_batch_norm_state_dicts_keep_the_count() {
+    let cpu = Device::Cpu;
+    // Without versions, without one for the module, or of version 1: the count stays; on the
+    // meta device, copying leaves it there and assigning gives it a 0 on the CPU.
+    for old in [Old::Absent, Old::Elsewhere, Old::Version(1)] {
+        for assign in [false, true] {
+            let count = load_old(old, cpu, assign, true).unwrap();
+            assert_eq!(count, (vec![], cpu, DType::I64, Some(5), true));
+        }
+        let count = load_old(old, Device::Meta, false, true).unwrap();
+        assert_eq!(count, (vec![], Device::Meta, DType::I64, None, true));
+        let count = load_old(old, Device::Meta, true, true).unwrap();
+        assert_eq!(count, (vec![], cpu, DType::I64, Some(0), false));
+    }
+    // Version 2 has the count: it is missing.
+    let missing = "Missing key(s) in state_dict: \"num_batches_tracked\".";
+    for device in [cpu, Device::Meta] {
+        for assign in [false, true] {
+            let e = load_old(Old::Version(2), device, assign, true).unwrap_err();
+            assert!(e.contains(missing), "{e}");
+        }
+    }
+    let count = load_old(Old::Version(2), cpu, false, false).unwrap();
+    let missing_keys = vec!["num_batches_tracked".to_string()];
+    assert_eq!(count, (missing_keys, cpu, DType::I64, Some(5), true));
+    // An old state dict that has the count loads it.
+    let mut sd = BatchNorm2d::new(2).state_dict();
+    sd["num_batches_tracked"].fill_(3);
+    sd.set_module_version("", 1);
+    for options in [LoadOptions::default(), assign()] {
+        let bn = BatchNorm2d::new(2);
+        bn.load_state_dict_with(&sd, options).unwrap();
+        assert_eq!(bn.num_batches_tracked.as_ref().unwrap().item::<i64>(), 3);
+    }
+    // The version of the module's own path counts, in a whole model.
+    let mut sd = Net::new().state_dict();
+    sd.remove("blocks.1.num_batches_tracked");
+    let e = Net::new().load_state_dict(&sd).unwrap_err();
+    assert_eq!(e.missing_keys, ["blocks.1.num_batches_tracked"]);
+    sd.set_module_version("blocks.1", 1);
+    assert!(
+        Net::new()
+            .load_state_dict(&sd)
+            .unwrap()
+            .missing_keys
+            .is_empty()
+    );
+    sd.versions_mut().as_mut().unwrap().remove("blocks.1");
+    assert!(
+        Net::new()
+            .load_state_dict(&sd)
+            .unwrap()
+            .missing_keys
+            .is_empty()
+    );
+    // Without running statistics there is no count to keep.
+    let plain = BatchNorm2d::new(2).track_running_stats(false);
+    assert!(plain.num_batches_tracked.is_none());
+    let entries = sd_of(&[("weight", homura::ones([2])), ("bias", homura::zeros([2]))]);
+    assert!(
+        plain
+            .load_state_dict(&entries)
+            .unwrap()
+            .missing_keys
+            .is_empty()
+    );
+}
+
+fn sd_of(entries: &[(&str, Tensor)]) -> StateDict {
+    entries.iter().map(|(k, t)| (*k, t.clone())).collect()
+}
+
 // What follows has no counterpart in PyTorch, which replaces the parameters: graphs and views
 // recorded before keep the old parameter there.
 
@@ -532,4 +822,254 @@ fn optimizers_keep_the_parameters_but_not_always_their_state() {
          the parameter has shape [2], dtype f64 and device cpu; move the model before creating the \
          optimizer"
     );
+}
+
+// What follows has no counterpart in PyTorch: `added_in` on other modules than batch
+// normalization, and the API of versions and keys.
+
+#[derive(Module)]
+#[module(version = 3)]
+struct Counted {
+    w: Parameter,
+    #[module(added_in = 2)]
+    count: Tensor,
+    #[module(added_in = 3, rename = "steps")]
+    maybe: Option<Tensor>,
+}
+
+impl Counted {
+    fn new(count: Tensor, maybe: Option<Tensor>) -> Counted {
+        Counted {
+            w: Parameter::new(homura::zeros([2])),
+            count,
+            maybe,
+        }
+    }
+}
+
+#[test]
+fn added_in_buffers_follow_their_versions() {
+    let m = Counted::new(homura::zeros_with([], DType::I32), None);
+    assert_eq!(
+        (m.version(), m.added_in("count"), m.added_in("steps")),
+        (3, Some(2), Some(3))
+    );
+    assert_eq!((m.added_in("maybe"), m.added_in("w")), (None, None));
+    m.count.fill_(4);
+    let w = sd_of(&[("w", homura::ones([2]))]);
+    // A `None` buffer has no key; the count is kept below version 2.
+    for old in [None, Some(1)] {
+        let mut sd = w.clone();
+        if let Some(v) = old {
+            sd.set_module_version("", v);
+        }
+        assert!(m.load_state_dict(&sd).unwrap().missing_keys.is_empty());
+        assert_eq!(m.count.item::<i32>(), 4);
+    }
+    let mut sd = w.clone();
+    sd.set_module_version("", 2);
+    assert_eq!(m.load_state_dict(&sd).unwrap_err().missing_keys, ["count"]);
+    // A renamed field, under its key.
+    let m = Counted::new(homura::tensor(1i64), Some(homura::tensor(2i64)));
+    sd.insert("count", homura::tensor(7i64));
+    assert!(m.load_state_dict(&sd).unwrap().missing_keys.is_empty());
+    assert_eq!(
+        (
+            m.count.item::<i64>(),
+            m.maybe.as_ref().unwrap().item::<i64>()
+        ),
+        (7, 2)
+    );
+    sd.set_module_version("", 3);
+    assert_eq!(m.load_state_dict(&sd).unwrap_err().missing_keys, ["steps"]);
+    // On the meta device, assignment gives a 0 of the buffer's own dtype (PyTorch's BatchNorm2d
+    // always an I64 one).
+    let m = homura::with_device(Device::Meta, || {
+        Counted::new(homura::zeros_with([], DType::I32), None)
+    });
+    m.load_state_dict_with(&w, assign()).unwrap();
+    assert_eq!(
+        (m.count.device(), m.count.dtype()),
+        (Device::Cpu, DType::I32)
+    );
+    assert_eq!(m.count.item::<i32>(), 0);
+    assert_eq!(m.w.device(), Device::Cpu);
+    // A view can't get it; copying leaves it alone.
+    let view = homura::with_device(Device::Meta, || homura::zeros_with([2], DType::I64)).index(0);
+    let m = Counted::new(view, None);
+    let e = m.load_state_dict_with(&w, assign()).unwrap_err();
+    assert_eq!(
+        e.errors,
+        [
+            "\"count\" can't be set to 0: it is a view or has a history, so its data can't be \
+             replaced; load it without assign"
+        ]
+    );
+    assert_eq!(m.w.to_vec::<f32>(), [0.0, 0.0]);
+    m.load_state_dict(&w).unwrap();
+    assert_eq!(m.count.device(), Device::Meta);
+}
+
+#[test]
+fn added_in_needs_zero_dimensional_integer_buffers() {
+    let error = |what: &str| {
+        format!("\"count\" is {what}, but added_in only supports zero-dimensional integer buffers")
+    };
+    let cases = [
+        (
+            homura::zeros_with([2], DType::I64),
+            "a buffer of shape [2] and dtype i64",
+        ),
+        (homura::zeros([]), "a buffer of shape [] and dtype f32"),
+        (homura::tensor(true), "a buffer of shape [] and dtype bool"),
+    ];
+    for (count, what) in cases {
+        let m = Counted::new(count, None);
+        // Also with the entry, and without strict or with assign: nothing is written.
+        let entries = sd_of(&[("w", homura::ones([2])), ("count", m.count.clone())]);
+        for options in [
+            LoadOptions::default(),
+            LoadOptions::default().strict(false),
+            assign(),
+        ] {
+            let e = m.load_state_dict_with(&entries, options).unwrap_err();
+            assert_eq!(e.errors, [error(what)]);
+            assert!(e.missing_keys.is_empty());
+            assert_eq!(m.w.to_vec::<f32>(), [0.0, 0.0]);
+        }
+    }
+    // A hand-written module that says it added a parameter, or a buffer outside the state dict.
+    struct Hand {
+        count: Parameter,
+        cache: Tensor,
+    }
+    impl Module for Hand {
+        fn visit<'a>(&'a self, v: &mut dyn Visitor<'a>) {
+            self.count.visit_as("count", v);
+            v.buffer("cache", &self.cache, false);
+        }
+
+        fn added_in(&self, _: &str) -> Option<u32> {
+            Some(2)
+        }
+    }
+    impl Member for Hand {
+        fn visit_as<'a>(&'a self, name: &str, v: &mut dyn Visitor<'a>) {
+            v.module(name, self, None);
+        }
+    }
+    let hand = Hand {
+        count: Parameter::with_requires_grad(homura::zeros_with([], DType::I64), false),
+        cache: homura::zeros([2]),
+    };
+    let e = hand.load_state_dict(&StateDict::new()).unwrap_err();
+    assert_eq!(e.errors, [error("a parameter of shape [] and dtype i64")]);
+}
+
+#[test]
+fn wrappers_give_the_versions_of_their_modules() {
+    let bn = || BatchNorm2d::new(2);
+    let key = "num_batches_tracked";
+    let dynamic: Box<dyn Module> = Box::new(bn());
+    let shared: Arc<dyn Module + Send + Sync> = Arc::new(bn());
+    let wrapped: [&dyn Module; 5] = [
+        &Box::new(bn()),
+        &Arc::new(bn()),
+        &Some(bn()),
+        &dynamic,
+        &shared,
+    ];
+    for m in wrapped {
+        assert_eq!((m.version(), m.added_in(key)), (2, Some(2)));
+        assert_eq!(versions(&m.state_dict()), [("", 2)]);
+    }
+    let none: Option<BatchNorm2d> = None;
+    assert_eq!((none.version(), none.added_in(key)), (1, None));
+    assert_eq!(versions(&none.state_dict()), []);
+    // A derived module's field of a wrapper type.
+    #[derive(Module)]
+    struct Holder {
+        norm: Box<BatchNorm2d>,
+    }
+    let holder = Holder {
+        norm: Box::new(bn()),
+    };
+    assert_eq!(versions(&holder.state_dict()), [("", 1), ("norm", 2)]);
+    let mut sd = holder.state_dict();
+    sd.remove("norm.num_batches_tracked");
+    assert_eq!(
+        holder.load_state_dict(&sd).unwrap_err().missing_keys,
+        ["norm.num_batches_tracked"]
+    );
+    sd.set_module_version("norm", 1);
+    holder.load_state_dict(&sd).unwrap();
+}
+
+#[test]
+fn versions_can_be_read_and_changed() {
+    let mut sd = Linear::new(2, 2).state_dict();
+    assert_eq!(sd.module_version(""), Some(1));
+    assert_eq!(sd.module_version("x"), None);
+    assert_eq!(sd.set_module_version("x", 4), None);
+    assert_eq!(sd.set_module_version("", 2), Some(1));
+    assert_eq!(versions(&sd), [("", 2), ("x", 4)]);
+    // Clones keep them; inserting and removing entries leaves them alone.
+    let copy = sd.clone();
+    sd.remove("weight");
+    sd.insert("other", homura::zeros([1]));
+    assert_eq!(copy.versions(), sd.versions());
+    // A state dict collected from entries has none until one is set.
+    let mut collected: StateDict = sd.iter().map(|(k, t)| (k, t.clone())).collect();
+    assert!(collected.versions().is_none() && StateDict::new().versions().is_none());
+    assert_eq!(collected.module_version(""), None);
+    collected.set_module_version("", 2);
+    assert_eq!(versions(&collected), [("", 2)]);
+    *collected.versions_mut() = None;
+    assert!(collected.versions().is_none());
+    let mut sub = collected.sub("");
+    assert!(sub.versions().is_none());
+    sub.add_prefix("p.");
+    assert!(sub.versions().is_none());
+    // ModuleVersions: ordered, compared in order.
+    let mut v = ModuleVersions::from_iter([("a", 1), ("b", 2)]);
+    assert_eq!(
+        (v.len(), v.is_empty(), v.get("b"), v.get("c")),
+        (2, false, Some(2), None)
+    );
+    assert_eq!(v.insert("a", 3), Some(1));
+    assert_eq!(v.iter().collect::<Vec<_>>(), [("a", 3), ("b", 2)]);
+    assert_ne!(v, ModuleVersions::from_iter([("b", 2), ("a", 3)]));
+    assert_eq!(format!("{v:?}"), r#"{"a": 3, "b": 2}"#);
+    assert_eq!(v.remove("a"), Some(3));
+    assert_eq!(v.remove("a"), None);
+    v.extend([("c", 1)]);
+    let owned: Vec<(String, u32)> = v.into_iter().collect();
+    assert_eq!(owned, [("b".to_string(), 2), ("c".to_string(), 1)]);
+    assert!(ModuleVersions::new().is_empty());
+}
+
+#[test]
+fn map_keys_renames_keys_and_drops_the_versions() {
+    let sd = Net::new().state_dict();
+    let renamed = sd.clone().map_keys(|k| {
+        k.strip_prefix("blocks.")
+            .map(|rest| format!("layers.{rest}"))
+    });
+    assert_eq!(keys(&renamed)[..2], ["layers.0.weight", "layers.0.bias"]);
+    assert_eq!(renamed.len(), 10);
+    assert!(renamed.versions().is_none());
+    assert!(renamed["layers.1.weight"].is_same(&sd["blocks.1.weight"]));
+    // Two entries with the same new key: every entry is renamed first.
+    let mut calls = 0;
+    let message = panic_message(|| {
+        let _ = sd.clone().map_keys(|k| {
+            calls += 1;
+            Some(k.rsplit('.').next().unwrap().to_string())
+        });
+    });
+    assert_eq!(
+        message,
+        r#"map_keys gave the key "weight" to both "conv.weight" and "bn.weight""#
+    );
+    assert_eq!(calls, sd.len());
 }

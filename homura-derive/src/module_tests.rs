@@ -71,8 +71,8 @@ fn only_structs_with_named_fields_or_none_are_modules() {
 
 #[test]
 fn unknown_and_duplicate_attributes_point_at_the_attribute() {
-    let field = "unknown `module` attribute for a field; expected `rename`, `skip` or \
-                 `non_persistent`";
+    let field = "unknown `module` attribute for a field; expected `rename`, `skip`, \
+                 `non_persistent` or `added_in`";
     assert_eq!(
         error("struct M {\n    #[module(skip, persistent)]\n    a: u8,\n}"),
         (field.into(), 2, 20)
@@ -81,7 +81,8 @@ fn unknown_and_duplicate_attributes_point_at_the_attribute() {
         error("struct M {\n    #[module(crate = \"h\")]\n    a: u8,\n}"),
         (field.into(), 2, 14)
     );
-    let container = "unknown `module` attribute for a struct; expected `crate` or `extra_repr`";
+    let container =
+        "unknown `module` attribute for a struct; expected `crate`, `extra_repr` or `version`";
     assert_eq!(
         error("#[module(skip)]\nstruct M {\n    a: u8,\n}"),
         (container.into(), 1, 10)
@@ -128,6 +129,121 @@ fn skipped_fields_take_no_other_attributes() {
     assert_eq!(
         error("struct M {\n    #[module(skip)]\n    #[module(non_persistent)]\n    a: u8,\n}"),
         (message("non_persistent"), 3, 14)
+    );
+    assert_eq!(
+        error("struct M {\n    #[module(skip, added_in = 1)]\n    a: u8,\n}"),
+        (message("added_in"), 2, 20)
+    );
+}
+
+#[test]
+fn versions_and_added_in_generate_methods() {
+    let expansion = expanded(
+        "#[module(version = 3)]\nstruct M {\n    #[module(added_in = 2, rename = \"n\")]\n    \
+         a: Option<Tensor>,\n    #[module(added_in = 3)]\n    b: Tensor,\n    c: Tensor,\n}",
+    );
+    assert!(
+        expansion.contains("fn version (& self) -> :: core :: primitive :: u32 { 3 }"),
+        "{expansion}"
+    );
+    assert!(expansion.contains(
+        "fn added_in (& self , __name : & str ,) -> :: core :: option :: Option < :: core :: \
+         primitive :: u32 > { :: homura :: nn :: __private :: added_in_field (& self . a) ; :: \
+         homura :: nn :: __private :: added_in_field (& self . b) ; match __name { \"n\" => :: \
+         core :: option :: Option :: Some (2) , \"b\" => :: core :: option :: Option :: Some (3) \
+         , _ => :: core :: option :: Option :: None , } }"
+    ));
+    // The defaults of `Module` without the attributes.
+    let expansion = expanded("struct M {\n    a: Tensor,\n}");
+    assert!(!expansion.contains("fn version") && !expansion.contains("fn added_in"));
+    // A buffer can be added in the default version, 1; the name avoids generic parameters.
+    let expansion = expanded(
+        "#[module(crate = \"hm\")]\nstruct M<__name> {\n    #[module(added_in = 1)]\n    a: \
+         Tensor,\n    b: __name,\n}",
+    );
+    assert!(
+        expansion.contains("fn added_in (& self , __name1 : & str"),
+        "{expansion}"
+    );
+    assert!(expansion.contains("hm :: nn :: __private :: added_in_field (& self . a)"));
+    assert!(!expansion.contains("fn version"));
+}
+
+#[test]
+fn versions_are_integers_from_one() {
+    let message = |name: &str| format!("`{name}` takes a version, an integer such as `{name} = 2`");
+    let range = |name: &str| format!("`{name}` takes a version from 1 to 4294967295");
+    assert_eq!(
+        error("#[module(version = \"2\")]\nstruct M;"),
+        (message("version"), 1, 20)
+    );
+    assert_eq!(
+        error("#[module(version = 2u32)]\nstruct M;"),
+        (message("version"), 1, 20)
+    );
+    assert_eq!(
+        error("#[module(version = 0)]\nstruct M;"),
+        (range("version"), 1, 20)
+    );
+    assert_eq!(
+        error("#[module(version = 4294967296)]\nstruct M;"),
+        (range("version"), 1, 20)
+    );
+    assert_eq!(
+        error("#[module(version = 2, version = 2)]\nstruct M;"),
+        ("duplicate `module` attribute `version`".into(), 1, 23)
+    );
+    assert_eq!(
+        error("struct M {\n    #[module(added_in = -1)]\n    a: Tensor,\n}"),
+        (message("added_in"), 2, 25)
+    );
+    assert_eq!(
+        error("struct M {\n    #[module(added_in = 1, added_in = 1)]\n    a: Tensor,\n}"),
+        ("duplicate `module` attribute `added_in`".into(), 2, 28)
+    );
+    // syn's own error for a missing value.
+    assert_eq!(error("#[module(version)]\nstruct M;").1, 1);
+}
+
+#[test]
+fn added_in_needs_a_buffer_of_the_state_dict_and_a_version() {
+    assert_eq!(
+        error("struct M {\n    #[module(non_persistent, added_in = 1)]\n    a: Tensor,\n}"),
+        (
+            "`added_in` is for buffers in the state dict, so it can't be used with \
+             `non_persistent`"
+                .into(),
+            2,
+            41
+        )
+    );
+    let later = |n: u32, v: u32| {
+        format!(
+            "`added_in = {n}` is later than the version of the module, {v}; set it with \
+             `#[module(version = {n})]` on the struct"
+        )
+    };
+    assert_eq!(
+        error("struct M {\n    #[module(added_in = 2)]\n    a: Tensor,\n}"),
+        (later(2, 1), 2, 25)
+    );
+    // Every field is reported, with the other errors.
+    assert_eq!(
+        errors(
+            "#[module(version = 2)]\nstruct M {\n    #[module(added_in = 3)]\n    a: Tensor,\n    \
+             #[module(nope)]\n    b: Tensor,\n    #[module(added_in = 4)]\n    c: Tensor,\n}"
+        ),
+        [
+            (
+                "unknown `module` attribute for a field; expected `rename`, `skip`, \
+                 `non_persistent` or `added_in`"
+                    .into(),
+                5,
+                14
+            ),
+            (later(3, 2), 3, 25),
+            (later(4, 2), 7, 25),
+        ]
     );
 }
 

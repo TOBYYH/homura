@@ -699,18 +699,22 @@ fn batch_norm_layers_load_state_dicts() {
     let other = BatchNorm2d::new(2);
     other.load_state_dict(&sd).unwrap();
     assert_eq!(count(&other), 7);
-    // A state dict without the count fails a strict load, and a non-strict load lists it, like
-    // PyTorch for a state dict of the current version. (PyTorch takes one without version
-    // metadata for one of an old version and keeps the count; homura's have no versions.)
-    let mut old = bn.state_dict();
-    old.remove("num_batches_tracked");
-    let e = other.load_state_dict(&old).unwrap_err();
+    // A state dict of the current version without the count fails a strict load, and a
+    // non-strict load lists it.
+    let mut current = bn.state_dict();
+    current.remove("num_batches_tracked");
+    let e = other.load_state_dict(&current).unwrap_err();
     assert_eq!(e.missing_keys, ["num_batches_tracked"]);
     let report = other
-        .load_state_dict_with(&old, LoadOptions::default().strict(false))
+        .load_state_dict_with(&current, LoadOptions::default().strict(false))
         .unwrap();
     assert_eq!(report.missing_keys, ["num_batches_tracked"]);
     assert_eq!(count(&other), 7);
+    // One without versions counts as old: the count stays (tests/nn_load.rs has the rest).
+    let old: StateDict = current.into_iter().collect();
+    other.num_batches_tracked.as_ref().unwrap().fill_(5);
+    assert!(other.load_state_dict(&old).unwrap().missing_keys.is_empty());
+    assert_eq!(count(&other), 5);
 }
 
 #[test]

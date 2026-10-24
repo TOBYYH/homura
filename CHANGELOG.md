@@ -63,7 +63,7 @@ All notable changes to this project are documented in this file. The format is b
   (`sum(p.numel() for p in model.parameters())`).
 
   The new provided methods of `Module` (`display`, `extra_repr`, `type_name`,
-  `num_parameters`) can make a call of a method of the same name from another trait in scope
+  `num_parameters`, and `version` and `added_in` below) can make a call of a method of the same name from another trait in scope
   ambiguous; inherent methods of the same name keep precedence.
 - Loading by assignment, PyTorch's `load_state_dict(sd, assign=True)`:
   `LoadOptions::default().assign(true)` (read with `is_assign()`) gives the parameters and
@@ -73,6 +73,22 @@ All notable changes to this project are documented in this file. The format is b
   names see the new data, a parameter keeps whether it requires grad and loses its `.grad`, and
   graphs and views of the old data panic instead of using it. Targets that are views or have a
   history, and integer entries for parameters that require grad, are load errors.
+- Module versions, PyTorch's `_version` and `state_dict._metadata`: `Module::version()` (1 by
+  default, set with the struct attribute `#[module(version = N)]`), recorded by `state_dict()`
+  for every module path in the new `nn::ModuleVersions`, read and changed with
+  `StateDict::versions`, `versions_mut`, `module_version` and `set_module_version`. State dicts
+  collected from entries (from safetensors, for example) have none.
+- Old state dicts without a buffer that a module added in a later version: the field attribute
+  `#[module(added_in = N)]` (`Module::added_in`), for zero-dimensional integer buffers. When such
+  a key is missing and the state dict's version of the module is lower or absent, loading keeps
+  the buffer (on the meta device, assignment gives it a 0 on the CPU). `BatchNorm2d` is version 2
+  with `num_batches_tracked` added in 2, so it loads PyTorch state dicts saved before the count
+  existed and plain state dicts without it, as PyTorch does; a state dict of version 2 without
+  the count still reports it missing.
+- Key transforms on `StateDict`: `consume_prefix` (PyTorch's
+  `consume_prefix_in_state_dict_if_present`, for `module.*` keys), `add_prefix`, `sub(prefix)`,
+  the state dict of a submodule, and `map_keys(f)`, which renames or drops each key (and drops
+  the versions). Versions follow the prefixes.
 
 ### Changed
 

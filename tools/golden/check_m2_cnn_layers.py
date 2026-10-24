@@ -298,9 +298,8 @@ bn.eval()
 assert bn(x).shape == x.shape
 
 # batch_norm_layers_load_state_dicts: a state dict of the current version without the count
-# fails a strict load, like homura's; a non-strict load lists it. PyTorch takes a state dict
-# without version metadata for one of an old version and keeps the count (homura has no
-# versions and reports it missing).
+# fails a strict load; a non-strict load lists it. A state dict without version metadata counts
+# as one of an old version, which keeps the count.
 bn = nn.BatchNorm2d(2)
 bn.num_batches_tracked.fill_(7)
 other = nn.BatchNorm2d(2)

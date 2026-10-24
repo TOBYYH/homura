@@ -7,7 +7,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use homura::autograd::{self, GradOptions};
-use homura::nn::{LoadReport, Member, Module, Parameter, StateDict, Training, Visitor};
+use homura::nn::{
+    LoadOptions, LoadReport, Member, Module, Parameter, StateDict, Training, Visitor,
+};
 use homura::{DType, Device, Tensor, TensorOptions};
 
 fn panic_message(f: impl FnOnce()) -> String {
@@ -597,7 +599,7 @@ fn load_state_dict_converts_into_the_same_tensors() {
     ]
     .into_iter()
     .collect();
-    let report = tied.load_state_dict(&sd, true).unwrap();
+    let report = tied.load_state_dict(&sd).unwrap();
     assert_eq!(report, LoadReport::default());
     assert!(tied.c.weight.is_same(&weight) && weight.dtype() == DType::F32);
     // The last key of a shared tensor wins.
@@ -607,13 +609,15 @@ fn load_state_dict_converts_into_the_same_tensors() {
     let mut sd = net.state_dict();
     sd.remove("head.weight");
     sd.insert("extra", homura::zeros([1]));
-    let report = net.load_state_dict(&sd, false).unwrap();
+    let report = net
+        .load_state_dict_with(&sd, LoadOptions::default().strict(false))
+        .unwrap();
     assert_eq!(report.missing_keys, ["head.weight"]);
     assert_eq!(report.unexpected_keys, ["extra"]);
     sd.insert("blocks.1.lin.bias", homura::zeros([5]));
     let mismatch = "size mismatch for blocks.1.lin.bias: copying a param with shape [5] from \
                     checkpoint, the shape in current model is [3].";
-    let error = net.load_state_dict(&sd, true).unwrap_err();
+    let error = net.load_state_dict(&sd).unwrap_err();
     assert_eq!(error.missing_keys, ["head.weight"]);
     assert_eq!(error.unexpected_keys, ["extra"]);
     assert_eq!(error.errors, [mismatch]);
@@ -624,7 +628,9 @@ fn load_state_dict_converts_into_the_same_tensors() {
              \n\tUnexpected key(s) in state_dict: \"extra\". \n\t{mismatch}"
         )
     );
-    let error = net.load_state_dict(&sd, false).unwrap_err();
+    let error = net
+        .load_state_dict_with(&sd, LoadOptions::default().strict(false))
+        .unwrap_err();
     assert!(error.missing_keys.is_empty() && error.unexpected_keys.is_empty());
     assert_eq!(
         error.to_string(),
@@ -639,7 +645,7 @@ fn load_state_dict_converts_into_the_same_tensors() {
     ]
     .into_iter()
     .collect();
-    stats.load_state_dict(&sd, true).unwrap();
+    stats.load_state_dict(&sd).unwrap();
     assert_eq!(stats.num_batches_tracked.dtype(), DType::I64);
     assert_eq!(stats.num_batches_tracked.item::<i64>(), 3);
 }
@@ -659,7 +665,7 @@ fn load_errors_leave_the_module_unchanged() {
         .collect();
     // The last entry comes from the meta device.
     sd.insert("table.b.bias", homura::zeros_with([1], Device::Meta));
-    let error = net.load_state_dict(&sd, true).unwrap_err();
+    let error = net.load_state_dict(&sd).unwrap_err();
     assert_eq!(
         error.errors,
         [
@@ -683,7 +689,7 @@ fn load_errors_leave_the_module_unchanged() {
         ..Stats::new()
     };
     let sd = stats.state_dict();
-    let error = stats.load_state_dict(&sd, true).unwrap_err();
+    let error = stats.load_state_dict(&sd).unwrap_err();
     assert!(
         error.errors[0].starts_with("While copying the parameter named \"running_mean\"")
             && error.errors[0].ends_with(
@@ -694,6 +700,65 @@ fn load_errors_leave_the_module_unchanged() {
         "{}",
         error.errors[0]
     );
+}
+
+#[test]
+fn load_options_choose_strictness() {
+    let options = LoadOptions::default();
+    assert!(options.is_strict());
+    let lax = options.strict(false);
+    assert!(!lax.is_strict() && options.is_strict());
+    assert_eq!(lax.strict(true), LoadOptions::default());
+
+    let unchanged = |net: &Net| {
+        net.state_dict().iter().all(|(key, value)| {
+            value
+                .to(DType::F64)
+                .to_vec::<f64>()
+                .iter()
+                .all(|&v| v == f64::from(key == "scale"))
+        })
+    };
+    let net = Net::new();
+    let mut sd: StateDict = net
+        .state_dict()
+        .into_iter()
+        .map(|(k, v)| (k, homura::full_like(&v, 7)))
+        .collect();
+    sd.remove("head.weight");
+    sd.insert("extra", homura::zeros([1]));
+
+    // Missing and unexpected keys alone: a strict load fails before writing anything, with the
+    // default options as with `load_state_dict`; a lax one writes the other entries.
+    for error in [
+        net.load_state_dict(&sd).unwrap_err(),
+        net.load_state_dict_with(&sd, options).unwrap_err(),
+    ] {
+        assert_eq!(error.missing_keys, ["head.weight"]);
+        assert_eq!(error.unexpected_keys, ["extra"]);
+        assert!(error.errors.is_empty());
+        assert!(unchanged(&net));
+    }
+
+    // An entry that can't be loaded fails both, before writing anything.
+    let mut bad = sd.clone();
+    bad.insert("blocks.1.lin.bias", homura::zeros([5]));
+    for lax_load in [false, true] {
+        let error = if lax_load {
+            net.load_state_dict_with(&bad, lax).unwrap_err()
+        } else {
+            net.load_state_dict(&bad).unwrap_err()
+        };
+        assert_eq!(error.errors.len(), 1);
+        assert_eq!(error.missing_keys.is_empty(), lax_load);
+        assert!(unchanged(&net));
+    }
+
+    let report = net.load_state_dict_with(&sd, lax).unwrap();
+    assert_eq!(report.missing_keys, ["head.weight"]);
+    assert_eq!(report.unexpected_keys, ["extra"]);
+    assert_eq!(net.embed.to_vec::<f32>(), [7.0; 12]);
+    assert_eq!(net.head.weight.to_vec::<f32>(), [0.0; 6]);
 }
 
 #[test]

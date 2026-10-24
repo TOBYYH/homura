@@ -515,25 +515,25 @@ impl Tensor {
     }
 
     /// Writes `values` into the elements of `self` that advanced indexing with `indices` picks,
-    /// in place (`index_put_`, Python's `x[indices] = values` or, with `accumulate`,
-    /// `x[indices] += values` where repeated positions add up). See
-    /// [`index_put`](Tensor::index_put) for the indices and values.
+    /// in place (`index_put_`, Python's `x[indices] = values`). See
+    /// [`index_put`](Tensor::index_put) for the indices and values, and
+    /// [`index_put_accumulate_`](Tensor::index_put_accumulate_) to add instead.
     ///
     /// ```
     /// use homura::tensor;
     /// let x = homura::zeros([2, 3]);
-    /// x.index_put_((.., &tensor([2i64, 0])), &tensor([1.0, 2.0]), false); // x[:, [2, 0]] = ..
+    /// x.index_put_((.., &tensor([2i64, 0])), &tensor([1.0, 2.0])); // x[:, [2, 0]] = ..
     /// assert_eq!(x.to_vec::<f32>(), [2.0, 0.0, 1.0, 2.0, 0.0, 1.0]);
     /// let mask = x.greater(1.5);
-    /// x.index_put_(&mask, &tensor(-1.0), false); // x[mask] = -1
+    /// x.index_put_(&mask, &tensor(-1.0)); // x[mask] = -1
     /// assert_eq!(x.to_vec::<f32>(), [-1.0, 0.0, 1.0, -1.0, 0.0, 1.0]);
     /// ```
     ///
     /// Python's `x[0, idx] = v` indexes a view first; this works where the
     /// [in-place rules](crate::autograd#in-place-operations) allow writing into a view, such as
-    /// updating a parameter in no-grad mode: `x.index(0).index_put_((&idx,), &v, false)`. Where
+    /// updating a parameter in no-grad mode: `x.index(0).index_put_((&idx,), &v)`. Where
     /// gradients are needed, index with tensors only, broadcasting together:
-    /// `x.index_put_((&tensor([0i64]), &idx), &v, false)`.
+    /// `x.index_put_((&tensor([0i64]), &idx), &v)`.
     ///
     /// # Panics
     ///
@@ -542,7 +542,32 @@ impl Tensor {
     /// `values` or an index tensor may share memory with `self`. Every check runs before the
     /// write, so a call that panics changes nothing.
     #[track_caller]
-    pub fn index_put_(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> &Self {
+    pub fn index_put_(&self, indices: impl IndexSpec, values: &Tensor) -> &Self {
+        self.put_in_place(indices, values, false)
+    }
+
+    /// Adds `values` to the elements of `self` that advanced indexing with `indices` picks, in
+    /// place (`index_put_(..., accumulate=True)`, Python's `x[indices] += values` except that
+    /// repeated positions add up). See [`index_put_accumulate`](Tensor::index_put_accumulate)
+    /// for the sums, and [`index_put_`](Tensor::index_put_) for the in-place rules.
+    ///
+    /// ```
+    /// use homura::tensor;
+    /// let x = homura::zeros([4]);
+    /// x.index_put_accumulate_((&tensor([1i64, 3, 1]),), &tensor(1.0));
+    /// assert_eq!(x.to_vec::<f32>(), [0.0, 2.0, 0.0, 1.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics like [`index_put_`](Tensor::index_put_).
+    #[track_caller]
+    pub fn index_put_accumulate_(&self, indices: impl IndexSpec, values: &Tensor) -> &Self {
+        self.put_in_place(indices, values, true)
+    }
+
+    #[track_caller]
+    fn put_in_place(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> &Self {
         let entries = self.put_entries(indices.into_indices());
         let begun = self.begin_in_place(&[Some(values)]);
         let computed = {
@@ -555,7 +580,8 @@ impl Tensor {
     }
 
     /// A copy of `self` with `values` written into the elements that advanced indexing with
-    /// `indices` picks (`torch.index_put`): copied, or added with `accumulate`.
+    /// `indices` picks (`torch.index_put`). [`index_put_accumulate`](Tensor::index_put_accumulate)
+    /// adds them instead.
     ///
     /// `indices` holds index tensors, as in [`index`](Tensor::index), full slices `..` for
     /// dimensions to keep, and at most one [`Ellipsis`]: it corresponds to PyTorch's list of
@@ -564,26 +590,22 @@ impl Tensor {
     /// zero-dimensional masks are not accepted.
     ///
     /// `values` has the dtype and device of `self` and broadcasts to the shape of
-    /// `self.index(indices)`, without dropping leading dimensions of size 1. Without
-    /// `accumulate`, which of several values for a repeated position is written is unspecified,
-    /// as in PyTorch (the CPU backend happens to write the last; don't rely on it). With it,
-    /// repeated positions add up, summed like [`index_add`](Tensor::index_add): in `f64` for
-    /// floating point dtypes and rounded once, which can differ from PyTorch's sums, rounded
-    /// after each addition, by more than the last bit (`2048 + 1 - 2048` is 1 here and 0 in
-    /// PyTorch in `f16`). Integer sums wrap around, and bool sums are a logical or.
+    /// `self.index(indices)`, without dropping leading dimensions of size 1. Which of several
+    /// values for a repeated position is written is unspecified, as in PyTorch (the CPU backend
+    /// happens to write the last; don't rely on it).
     ///
     /// Unlike the in-place [`index_put_`](Tensor::index_put_), `values` and the indices may
     /// share memory with `self`. The result is new memory. On the CPU it is contiguous with its
     /// dimensions in the order the indexing works in, so it is not contiguous when the indexed
     /// dimensions aren't adjacent; it doesn't keep the strides of `self`. For autograd, the node
-    /// is `IndexPutBackward0`: `self` gets the gradient with the written positions zeroed (unless
-    /// `accumulate`), and `values` the gradient at those positions, summed to its shape.
+    /// is `IndexPutBackward0`: `self` gets the gradient with the written positions zeroed, and
+    /// `values` the gradient at those positions, summed to its shape.
     ///
     /// ```
     /// use homura::tensor;
     /// let x = homura::zeros([4]);
-    /// let y = x.index_put((&tensor([1i64, 3, 1]),), &tensor(1.0), true);
-    /// assert_eq!(y.to_vec::<f32>(), [0.0, 2.0, 0.0, 1.0]);
+    /// let y = x.index_put((&tensor([1i64, 3]),), &tensor(1.0));
+    /// assert_eq!(y.to_vec::<f32>(), [0.0, 1.0, 0.0, 1.0]);
     /// ```
     ///
     /// # Panics
@@ -592,9 +614,36 @@ impl Tensor {
     /// zero-dimensional masks, if the indices are invalid as in `index`, or if `values` doesn't
     /// have the dtype, device or a shape as described.
     #[track_caller]
-    pub fn index_put(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> Tensor {
+    pub fn index_put(&self, indices: impl IndexSpec, values: &Tensor) -> Tensor {
         let entries = self.put_entries(indices.into_indices());
-        self.index_put_tensors(&entries, values, accumulate)
+        self.index_put_tensors(&entries, values, false)
+    }
+
+    /// A copy of `self` with `values` added to the elements that advanced indexing with
+    /// `indices` picks (`torch.index_put(..., accumulate=True)`); the indices and values are as
+    /// in [`index_put`](Tensor::index_put).
+    ///
+    /// Repeated positions add up, summed like [`index_add`](Tensor::index_add): in `f64` for
+    /// floating point dtypes and rounded once, which can differ from PyTorch's sums, rounded
+    /// after each addition, by more than the last bit (`2048 + 1 - 2048` is 1 here and 0 in
+    /// PyTorch in `f16`). Integer sums wrap around, and bool sums are a logical or. For
+    /// autograd, the node is `IndexPutBackward0`: `self` gets the whole gradient, and `values`
+    /// the gradient at the indexed positions, summed to its shape.
+    ///
+    /// ```
+    /// use homura::tensor;
+    /// let x = homura::zeros([4]);
+    /// let y = x.index_put_accumulate((&tensor([1i64, 3, 1]),), &tensor(1.0));
+    /// assert_eq!(y.to_vec::<f32>(), [0.0, 2.0, 0.0, 1.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics like [`index_put`](Tensor::index_put).
+    #[track_caller]
+    pub fn index_put_accumulate(&self, indices: impl IndexSpec, values: &Tensor) -> Tensor {
+        let entries = self.put_entries(indices.into_indices());
+        self.index_put_tensors(&entries, values, true)
     }
 
     /// The entries for the advanced indexing core from the items of `index_put` and

@@ -64,8 +64,8 @@ pub use io::{
     load_safetensors, load_safetensors_from_bytes, save_safetensors, save_safetensors_to_bytes,
 };
 pub use ops::{
-    GeluApproximate, Number, Operand, concat, manual_seed, rand, rand_like, rand_with, randint,
-    randint_with, randn, randn_like, randn_with, stack, where_,
+    GeluApproximate, Number, Operand, ValuesAndIndices, concat, manual_seed, rand, rand_like,
+    rand_with, randint, randint_with, randn, randn_like, randn_with, stack, where_,
 };
 pub use shape::{DimSize, Dims, IntoShape, IntoShapeSpec, Shape, Strides};
 pub use tensor::{

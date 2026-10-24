@@ -206,6 +206,53 @@ impl fmt::Debug for StateDict {
     }
 }
 
+/// Options of [`Module::load_state_dict_with`](super::Module::load_state_dict_with), built
+/// from the default with setters: `LoadOptions::default().strict(false)`.
+///
+/// ```
+/// use homura::nn::LoadOptions;
+///
+/// assert!(LoadOptions::default().is_strict());
+/// assert!(!LoadOptions::default().strict(false).is_strict());
+/// ```
+///
+/// More options will be added, so the fields are private and it can't be built with a struct
+/// expression from another crate:
+///
+/// ```compile_fail,E0639
+/// use homura::nn::LoadOptions;
+///
+/// let options = LoadOptions { strict: false, ..Default::default() };
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LoadOptions {
+    strict: bool,
+}
+
+impl Default for LoadOptions {
+    /// Strict, like [`Module::load_state_dict`](super::Module::load_state_dict).
+    fn default() -> Self {
+        LoadOptions { strict: true }
+    }
+}
+
+impl LoadOptions {
+    /// Whether missing and unexpected keys are errors (`strict`, true by default). If not, the
+    /// [`LoadReport`] lists them.
+    #[must_use]
+    #[track_caller]
+    pub fn strict(self, strict: bool) -> Self {
+        LoadOptions { strict }
+    }
+
+    /// The value set by [`strict`](LoadOptions::strict).
+    #[track_caller]
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+}
+
 /// The keys that [`Module::load_state_dict`](super::Module::load_state_dict) didn't match when it
 /// succeeded, like PyTorch's `_IncompatibleKeys`. Both lists are empty after a strict load.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

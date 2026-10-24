@@ -224,9 +224,7 @@ fn cnn_training_matches_pytorch() {
 
             let model = cnn();
             model.to(dtype);
-            model
-                .load_state_dict(&initial_state(&data, dtype), true)
-                .unwrap();
+            model.load_state_dict(&initial_state(&data, dtype)).unwrap();
             let params = model.named_parameters();
             params[1].1.requires_grad_(false);
             let keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();

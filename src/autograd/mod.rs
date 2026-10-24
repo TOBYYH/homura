@@ -220,7 +220,7 @@
 //! in f64. This differs from some PyTorch kernels: extreme cancellation can change finite,
 //! infinity and NaN results, even for finite inputs. Scaled matrix products also use rules
 //! independent of size and layout; see [`Tensor::addmm`]. The sums at repeated positions of
-//! advanced indexing's backward pass and of `index_put` with `accumulate` are computed the same
+//! advanced indexing's backward pass and of [`Tensor::index_put_accumulate`] are computed the same
 //! way, so they can differ from PyTorch's, which round after each addition, by more than the
 //! last bit.
 //!

@@ -89,7 +89,7 @@ fn softmax(x: &Tensor, dim: i64, log: bool) -> Tensor {
 /// The same function built from other differentiable operations. The maximum is detached: the
 /// result doesn't depend on the shift, so neither do its derivatives.
 fn composite(x: &Tensor, dim: i64, log: bool) -> Tensor {
-    let shifted = x - &x.max_dim(dim, true).0.detach();
+    let shifted = x - &x.max_dim(dim, true).values.detach();
     let e = shifted.exp();
     if log {
         &shifted - &e.sum_dim(dim, true).log()

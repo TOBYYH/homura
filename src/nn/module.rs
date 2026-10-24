@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::{LoadError, LoadReport, Parameter, StateDict, Training};
+use super::{LoadError, LoadOptions, LoadReport, Parameter, StateDict, Training};
 use crate::nn::functional::Reduction;
 use crate::tensor::{TensorData, checked_nbytes, conversion_error, convert_data};
 use crate::{DType, Device, GeluApproximate, Tensor, TensorOptions, bf16, f16};
@@ -237,14 +237,16 @@ pub trait Module: Member {
     }
 
     /// Copies the entries of `state_dict` into the parameters and persistent buffers with the
-    /// same keys (`load_state_dict(state_dict, strict)`), converting them to the dtype of each
-    /// target. The parameters and buffers stay the same tensors, so optimizers holding them stay
-    /// valid. A tensor with several keys (a shared parameter) gets the entry of its last key.
+    /// same keys (`load_state_dict(state_dict)`, strict as PyTorch's default), converting them to
+    /// the dtype of each target. The parameters and buffers stay the same tensors, so optimizers
+    /// holding them stay valid. A tensor with several keys (a shared parameter) gets the entry of
+    /// its last key.
     ///
-    /// With `strict`, missing and unexpected keys are errors; otherwise the result lists them.
-    /// Entries whose shape differs from the target's, that come from a device the target can't
-    /// copy from (the meta device), or whose target can't be written (its elements overlap) are
-    /// errors in both cases.
+    /// Missing and unexpected keys are errors, so the returned report has empty lists;
+    /// [`load_state_dict_with`](Module::load_state_dict_with) takes [`LoadOptions`] to allow
+    /// them. Entries whose shape differs from the target's, that come from a device the target
+    /// can't copy from (the meta device), or whose target can't be written (its elements
+    /// overlap) are errors in any case.
     ///
     /// Every entry is checked before anything is written: when loading fails, the module is
     /// unchanged. (PyTorch writes the entries that match before it reports errors.)
@@ -255,7 +257,7 @@ pub trait Module: Member {
     /// let layers = vec![Parameter::new(homura::zeros([2]))];
     /// let mut sd = layers.state_dict();
     /// sd.insert("0", homura::tensor([1.0f64, 2.0]));
-    /// layers.load_state_dict(&sd, true).unwrap();
+    /// layers.load_state_dict(&sd).unwrap();
     /// assert_eq!(layers[0].to_vec::<f32>(), [1.0, 2.0]);
     /// ```
     ///
@@ -263,12 +265,38 @@ pub trait Module: Member {
     ///
     /// Returns a [`LoadError`] listing every problem found; nothing has been written then.
     #[track_caller]
-    fn load_state_dict(
+    fn load_state_dict(&self, state_dict: &StateDict) -> Result<LoadReport, LoadError> {
+        load(self, state_dict, LoadOptions::default())
+    }
+
+    /// [`load_state_dict`](Module::load_state_dict) with options
+    /// (`load_state_dict(state_dict, strict=False)`): with
+    /// [`strict(false)`](LoadOptions::strict), missing and unexpected keys are listed in the
+    /// returned report instead of being errors.
+    ///
+    /// ```
+    /// use homura::nn::{LoadOptions, Module, Parameter};
+    ///
+    /// let layers = vec![Parameter::new(homura::zeros([2]))];
+    /// let mut sd = layers.state_dict();
+    /// sd.insert("1", homura::tensor([3.0]));
+    /// assert!(layers.load_state_dict(&sd).is_err());
+    /// let report = layers
+    ///     .load_state_dict_with(&sd, LoadOptions::default().strict(false))
+    ///     .unwrap();
+    /// assert_eq!(report.unexpected_keys, ["1"]);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] listing every problem found; nothing has been written then.
+    #[track_caller]
+    fn load_state_dict_with(
         &self,
         state_dict: &StateDict,
-        strict: bool,
+        options: LoadOptions,
     ) -> Result<LoadReport, LoadError> {
-        load(self, state_dict, strict)
+        load(self, state_dict, options)
     }
 
     /// Converts the parameters and buffers of the module tree in place to another dtype and/or
@@ -522,8 +550,9 @@ fn set_training<M: Member + ?Sized>(module: &M, training: bool) {
 fn load<M: Member + ?Sized>(
     module: &M,
     state_dict: &StateDict,
-    strict: bool,
+    options: LoadOptions,
 ) -> Result<LoadReport, LoadError> {
+    let strict = options.is_strict();
     let targets = entries(module);
     let keys: HashSet<&str> = targets.iter().map(|(k, _)| k.as_str()).collect();
     let missing_keys: Vec<String> = targets

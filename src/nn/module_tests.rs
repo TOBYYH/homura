@@ -52,7 +52,7 @@ fn failed_loads_and_conversions_keep_every_version() {
     ]
     .into_iter()
     .collect();
-    assert!(modules.load_state_dict(&sd, true).is_err());
+    assert!(modules.load_state_dict(&sd).is_err());
     assert_eq!(versions(&[&a, &b]), before);
 
     let x = crate::ones([2]);
@@ -83,7 +83,7 @@ fn failed_loads_and_conversions_keep_every_version() {
     let sd: StateDict = [("0", crate::ones([2])), ("1", crate::ones([2]))]
         .into_iter()
         .collect();
-    modules.load_state_dict(&sd, true).unwrap();
+    modules.load_state_dict(&sd).unwrap();
     assert_eq!(versions(&[&a, &b]), [2, 3]);
 }
 

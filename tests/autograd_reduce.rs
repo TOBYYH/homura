@@ -5,7 +5,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
-use homura::{DType, Device, Tensor};
+use homura::{DType, Device, Tensor, ValuesAndIndices};
 
 const NO_DIMS: [i64; 0] = [];
 
@@ -345,21 +345,21 @@ fn max_and_min_split_ties_select_nan_and_return_indices() {
     }
     let x = leaf(&[1., 3., 3., nan, 2., nan], [2, 3]);
     same(
-        &grad_of(&x.max_dim(1, false).0, &x, &[inf, 5.]),
+        &grad_of(&x.max_dim(1, false).values, &x, &[inf, 5.]),
         &[0., inf, 0., 5., 0., 0.],
     );
     let x = leaf(&[1., 3., 1., nan], [2, 2]);
     same(
-        &grad_of(&x.min_dim(0, false).0, &x, &[2., inf]),
+        &grad_of(&x.min_dim(0, false).values, &x, &[2., inf]),
         &[2., 0., 0., inf],
     );
     let x = leaf(&[1., 3., 3., 4., 2., 1.], [2, 3]);
     same(
-        &grad_of(&x.max_dim(-1, true).0, &x, &[1., 2.]),
+        &grad_of(&x.max_dim(-1, true).values, &x, &[1., 2.]),
         &[0., 1., 0., 2., 0., 0.],
     );
     let s = leaf(&[3.], ());
-    same(&grad_of(&s.max_dim(0, false).0, &s, &[2.]), &[2.]);
+    same(&grad_of(&s.max_dim(0, false).values, &s, &[2.]), &[2.]);
     // The share of each tie depends on the upstream gradient, also in a second pass.
     let x = leaf(&[1., 3., 3.], [3]);
     let g = leaf(&[2.], ());
@@ -369,15 +369,25 @@ fn max_and_min_split_ties_select_nan_and_return_indices() {
     for (out, name) in [
         (x.max(), "MaxBackward1"),
         (x.min(), "MinBackward1"),
-        (x.max_dim(0, false).0, "MaxBackward0"),
-        (x.min_dim(0, true).0, "MinBackward0"),
+        (x.max_dim(0, false).values, "MaxBackward0"),
+        (x.min_dim(0, true).values, "MinBackward0"),
     ] {
         let node = out.grad_fn().unwrap();
         assert_eq!((node.name(), node.next_functions().len()), (name, 1));
     }
-    let (values, indices) = x.max_dim(0, false);
+    let ValuesAndIndices { values, indices } = x.max_dim(0, false);
     assert!(values.requires_grad() && !indices.requires_grad());
     assert!(indices.grad_fn().is_none());
+    // The struct only wraps the pair: its clone and its tuple hold the same tensors.
+    let pair = x.min_dim(0, true);
+    let copy = pair.clone();
+    let (v, i) = pair.into();
+    assert!(v.is_same(&copy.values) && i.is_same(&copy.indices));
+    assert_eq!(
+        (v.shape(), i.shape(), i.dtype()),
+        ([1].into(), [1].into(), DType::I64)
+    );
+    assert!(format!("{copy:?}").starts_with("ValuesAndIndices { values: tensor([1."));
 }
 
 #[test]
@@ -555,9 +565,9 @@ fn reductions_pass_both_gradient_checks() {
         ("max and min", |t| vec![t[0].max(), t[0].min()]),
         ("max_dim and min_dim", |t| {
             vec![
-                t[0].max_dim(0, false).0,
-                t[0].min_dim(-1, true).0,
-                t[0].max_dim(1, true).0,
+                t[0].max_dim(0, false).values,
+                t[0].min_dim(-1, true).values,
+                t[0].max_dim(1, true).values,
             ]
         }),
         ("var", |t| {
@@ -583,7 +593,7 @@ fn reductions_pass_both_gradient_checks() {
                 t[1].prod(),
                 t[1].prod_dim(0, false),
                 t[1].max(),
-                t[1].min_dim(0, false).0,
+                t[1].min_dim(0, false).values,
                 t[1].var(0),
             ]
         }),
@@ -611,8 +621,8 @@ fn empty_and_meta_inputs_get_gradients_of_their_shape() {
             x.prod(),
             x.prod_dim(0, false),
             x.prod_dim(1, true),
-            x.max_dim(1, false).0,
-            x.min_dim(1, true).0,
+            x.max_dim(1, false).values,
+            x.min_dim(1, true).values,
             x.var(1),
             x.var_dim(0, 1, false),
             x.var_dim(1, 0, true),
@@ -620,7 +630,7 @@ fn empty_and_meta_inputs_get_gradients_of_their_shape() {
             x.std_dim(0, 1, true),
         ];
         if device == Device::Meta {
-            outs.extend([x.max(), x.min(), x.max_dim(0, false).0]);
+            outs.extend([x.max(), x.min(), x.max_dim(0, false).values]);
         }
         for out in outs {
             let g = homura::ones_like(&out);
@@ -646,8 +656,8 @@ fn new_nodes_check_and_release_saved_values() {
         ("ProdBackward1", |x| x.prod_dim(1, false), true, true),
         ("MaxBackward1", |x| x.max(), true, true),
         ("MinBackward1", |x| x.min(), true, true),
-        ("MaxBackward0", |x| x.max_dim(1, false).0, true, false),
-        ("MinBackward0", |x| x.min_dim(0, true).0, true, false),
+        ("MaxBackward0", |x| x.max_dim(1, false).values, true, false),
+        ("MinBackward0", |x| x.min_dim(0, true).values, true, false),
         ("VarBackward0", |x| x.var(1), true, true),
         ("VarBackward0", |x| x.var_dim(1, 1, false), true, true),
         ("StdBackward0", |x| x.std(1), true, true),
@@ -695,7 +705,7 @@ fn new_nodes_check_and_release_saved_values() {
         assert!(actual.contains(message), "{actual}");
     }
     let x = leaf(&[1., 3., 2., 4., 6., 5.], [2, 3]);
-    let (values, indices) = x.max_dim(1, false);
+    let (values, indices) = x.max_dim(1, false).into();
     {
         let _guard = homura::no_grad();
         indices.add_(1i64);

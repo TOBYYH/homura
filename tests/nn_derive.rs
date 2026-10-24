@@ -254,10 +254,10 @@ fn attributes_rename_skip_and_keep_buffers_out_of_the_state_dict() {
 
     let mut sd = StateDict::new();
     sd.insert("weight", homura::full([4], 2.0));
-    norm.load_state_dict(&sd, true).unwrap();
+    norm.load_state_dict(&sd).unwrap();
     assert_eq!(norm.scale.to_vec::<f64>(), [2.0; 4]);
     sd.insert("cache", homura::zeros([4]));
-    let error = norm.load_state_dict(&sd, true).unwrap_err();
+    let error = norm.load_state_dict(&sd).unwrap_err();
     assert_eq!(error.unexpected_keys, ["cache"]);
 
     let with_mask = Norm {

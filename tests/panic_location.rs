@@ -1,12 +1,13 @@
 //! Panics for invalid arguments report the caller's line (`#[track_caller]`), through every kind
-//! of entry point: tensor methods and operators, free functions, `nn` functions, layers and
-//! module methods (directly and through `Forward` / `Sequential`), optimizers (concrete and
-//! `dyn`), autograd entry points and `Function::apply`, user code in the scope closures
-//! (`with_no_grad`, `with_device`), and through the internal checks those entry points share
-//! (argument checks, CPU kernels that validate indices or dtypes, the stale-view check of the
-//! recording).
+//! of entry point: tensor methods and operators, `Sum` / `Product` called directly, free
+//! functions, `nn` functions, layers and module methods (directly and through `Forward` /
+//! `Sequential`), optimizers (concrete and `dyn`), autograd entry points and `Function::apply`,
+//! user code in the scope closures (`with_no_grad`, `with_device`), and through the internal
+//! checks those entry points share (argument checks, CPU kernels that validate indices or dtypes,
+//! the stale-view check of the recording).
 
 use std::cell::RefCell;
+use std::iter::{Product, Sum};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
@@ -16,7 +17,7 @@ use homura::autograd::{
 use homura::nn::functional::{
     self as F, BatchNormOptions, Conv2dOptions, Conv2dPadding, CrossEntropyOptions, Reduction,
 };
-use homura::nn::{self, Forward, Member, Module, Parameter, StateDict, Visitor};
+use homura::nn::{self, Forward, LoadOptions, Member, Module, Parameter, StateDict, Visitor};
 use homura::optim::{Adam, Optimizer, ParamGroup, Sgd, SgdOptions, TypedOptimizer};
 use homura::{DType, Device, Tensor};
 
@@ -121,6 +122,12 @@ fn binary_operators_and_methods() {
     at!(a.add_(&b));
     let mask = homura::tensor([true, false, true, false]);
     at!(homura::where_(&mask, &a, 0.0));
+    // `Sum` and `Product` called directly; through `Iterator::sum` the location is in `std`.
+    let pair = [a.clone(), b.clone()];
+    at!(<Tensor as Sum<&Tensor>>::sum(pair.iter()));
+    at!(<Tensor as Product>::product(pair.clone().into_iter()));
+    let (file, _) = panic_location(|| drop(pair.iter().sum::<Tensor>())).unwrap();
+    assert!(file.contains("iter"), "reported at {file}");
     finish();
 }
 
@@ -140,11 +147,15 @@ fn views_indexing_and_reductions() {
     at!(a.index((.., 9)));
     at!(a.sum_dim(3, false));
     at!(a.max_dim(4, false));
+    at!(a.min_dim(4, false));
     at!(a.softmax(2));
     at!(a.flatten(1, 0));
     at!(a.matmul(&homura::ones([4, 2])));
     at!(a.item::<f32>());
-    at!(a.index_put_((&homura::tensor([5i64]),), &homura::ones([3]), false));
+    at!(a.index_put_((&homura::tensor([5i64]),), &homura::ones([3])));
+    at!(a.index_put_accumulate_((&homura::tensor([5i64]),), &homura::ones([3])));
+    at!(a.index_put((&homura::tensor([5i64]),), &homura::ones([3])));
+    at!(a.index_put_accumulate((&homura::tensor([5i64]),), &homura::ones([3])));
     at!(a.index_select(0, &homura::tensor([1.5])));
     at!(a.index((&homura::tensor([0i64, 1]), &homura::tensor([0i64, 1, 2]))));
     at!(homura::zeros([2]).scatter_add(0, &homura::tensor([5i64]), &homura::ones([1])));
@@ -428,11 +439,12 @@ fn shared_tensor_checks() {
     at!(x.slice_scatter(&x, 0, None, None, 0));
     at!(x.index(homura::tensor([5i64])));
     at!(x.index(homura::tensor([0.5f32])));
-    at!(x.index_put_((&floats,), &homura::ones([3]), false));
+    at!(x.index_put_((&floats,), &homura::ones([3])));
     let expanded = homura::ones([3]).expand([2, 3]);
-    at!(expanded.index_put_((&homura::tensor([0i64]),), &homura::ones([3]), false));
+    at!(expanded.index_put_((&homura::tensor([0i64]),), &homura::ones([3])));
+    at!(expanded.index_put_accumulate_((&homura::tensor([0i64]),), &homura::ones([3])));
     at!(expanded.copy_(&x));
-    at!(x.index_put_((&homura::tensor([0i64]),), &x.select(0, 1), false));
+    at!(x.index_put_((&homura::tensor([0i64]),), &x.select(0, 1)));
     at!(x.clamp(homura::ones([4]), 1.0));
     at!(x.copy_(&homura::ones([4])));
     at!(x.masked_fill(&homura::tensor([true, false, true]), homura::ones([2])));
@@ -559,6 +571,7 @@ impl Module for PanicsInVisit {
 #[test]
 fn module_tree_checks() {
     let sd = StateDict::new();
+    let lax = LoadOptions::default().strict(false);
     for m in [
         Named::new("p", true),
         Named::new("", false),
@@ -570,7 +583,8 @@ fn module_tree_checks() {
         at!(m.named_children());
         at!(m.parameters());
         at!(m.state_dict());
-        at!(m.load_state_dict(&sd, false));
+        at!(m.load_state_dict(&sd));
+        at!(m.load_state_dict_with(&sd, lax));
         at!(m.to(DType::F64));
         at!(m.train());
         at!(m.eval());

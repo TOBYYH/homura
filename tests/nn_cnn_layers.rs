@@ -20,8 +20,8 @@ use homura::nn::functional::{
     self, BatchNormOptions, Conv2dOptions, Conv2dPadding, MaxPool2dOptions,
 };
 use homura::nn::{
-    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Flatten, Forward, Linear, MaxPool2d, Module, Relu,
-    Sequential, StateDict,
+    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Flatten, Forward, Linear, LoadOptions, MaxPool2d,
+    Module, Relu, Sequential, StateDict,
 };
 use homura::{DType, Device, Tensor};
 
@@ -428,7 +428,7 @@ fn batch_norm_layers_match_pytorch() {
         let dtype = if tag == "f64" { DType::F64 } else { DType::F32 };
         let bn = golden_batch_norm(variant);
         bn.to(dtype);
-        bn.load_state_dict(&golden_state(&c, "init"), true).unwrap();
+        bn.load_state_dict(&golden_state(&c, "init")).unwrap();
         let params: Vec<(String, homura::nn::Parameter)> = bn.named_parameters();
         for (i, (training, n)) in SEQUENCE.into_iter().enumerate() {
             if training {
@@ -598,7 +598,7 @@ fn with_count(dtype: DType, count: i64, momentum: Option<f64>) -> BatchNorm2d {
     bn.to(dtype);
     let mut state = bn.state_dict();
     state.insert("num_batches_tracked", homura::tensor(count));
-    bn.load_state_dict(&state, true).unwrap();
+    bn.load_state_dict(&state).unwrap();
     bn
 }
 
@@ -697,16 +697,18 @@ fn batch_norm_layers_load_state_dicts() {
     bn.num_batches_tracked.as_ref().unwrap().fill_(7);
     let sd = bn.state_dict();
     let other = BatchNorm2d::new(2);
-    other.load_state_dict(&sd, true).unwrap();
+    other.load_state_dict(&sd).unwrap();
     assert_eq!(count(&other), 7);
     // A state dict without the count fails a strict load, and a non-strict load lists it, like
     // PyTorch for a state dict of the current version. (PyTorch takes one without version
     // metadata for one of an old version and keeps the count; homura's have no versions.)
     let mut old = bn.state_dict();
     old.remove("num_batches_tracked");
-    let e = other.load_state_dict(&old, true).unwrap_err();
+    let e = other.load_state_dict(&old).unwrap_err();
     assert_eq!(e.missing_keys, ["num_batches_tracked"]);
-    let report = other.load_state_dict(&old, false).unwrap();
+    let report = other
+        .load_state_dict_with(&old, LoadOptions::default().strict(false))
+        .unwrap();
     assert_eq!(report.missing_keys, ["num_batches_tracked"]);
     assert_eq!(count(&other), 7);
 }
@@ -969,9 +971,7 @@ fn cnn_matches_pytorch() {
     want.extend(["4.weight", "4.bias", "7.weight", "7.bias"]);
     assert_eq!(keys(&model), want);
     model.to(DType::F64);
-    model
-        .load_state_dict(&golden_state(&c, "param"), true)
-        .unwrap();
+    model.load_state_dict(&golden_state(&c, "param")).unwrap();
     let x = c.input("x");
     x.requires_grad_(true);
     let out = model.forward(&x);
@@ -1071,7 +1071,7 @@ fn layers_are_modules() {
     // State dicts go back and forth.
     let other = cnn();
     other.to(DType::F64);
-    other.load_state_dict(&model.state_dict(), true).unwrap();
+    other.load_state_dict(&model.state_dict()).unwrap();
     other.eval();
     model.eval();
     assert_equal(&other.forward(&x), &model.forward(&x), "loaded");

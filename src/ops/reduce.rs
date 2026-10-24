@@ -6,6 +6,39 @@ use crate::backend::cpu;
 use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
 use crate::{DType, Device, Shape, Tensor};
 
+/// Values along a dimension and their indices, as [`Tensor::max_dim`] and [`Tensor::min_dim`]
+/// return them (PyTorch's `torch.return_types.max` / `min`). Take them by field, by
+/// destructuring, or as a tuple with `into()`:
+///
+/// ```
+/// use homura::{ValuesAndIndices, tensor};
+///
+/// let x = tensor([[1.0, 5.0, 3.0], [4.0, 2.0, 4.0]]);
+/// let max = x.max_dim(1, false);
+/// assert_eq!(max.values.to_vec::<f32>(), [5.0, 4.0]);
+/// assert_eq!(max.indices.to_vec::<i64>(), [1, 0]);
+/// let ValuesAndIndices { values, indices } = x.min_dim(0, false);
+/// assert_eq!(values.to_vec::<f32>(), [1.0, 2.0, 3.0]);
+/// assert_eq!(indices.to_vec::<i64>(), [0, 1, 0]);
+/// let (values, indices) = x.max_dim(0, true).into();
+/// assert_eq!(values.shape(), [1, 3]);
+/// assert_eq!(indices.shape(), [1, 3]);
+/// ```
+#[derive(Clone, Debug)]
+pub struct ValuesAndIndices {
+    /// The values.
+    pub values: Tensor,
+    /// Their indices along the dimension, as `I64`.
+    pub indices: Tensor,
+}
+
+impl From<ValuesAndIndices> for (Tensor, Tensor) {
+    /// `(values, indices)`.
+    fn from(v: ValuesAndIndices) -> Self {
+        (v.values, v.indices)
+    }
+}
+
 /// The shape left after reducing the dimensions in `mask`.
 fn reduced_shape(shape: &Shape, mask: &[bool], keepdim: bool) -> Shape {
     let mut out = vec![];
@@ -229,14 +262,18 @@ impl Tensor {
         out
     }
 
-    /// Largest values along `dim` and their indices (the first one on ties).
+    /// Largest values along `dim` and their indices (the first one on ties), like
+    /// `x.max(dim, keepdim)`.
     #[track_caller]
-    pub fn max_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
+    pub fn max_dim(&self, dim: i64, keepdim: bool) -> ValuesAndIndices {
         let (v, i) = arg_op(self, Some(dim), keepdim, true, true, "max");
         let v = v.unwrap();
         let dim = normalize_dim(dim, self.num_dims());
         formulas::extremum_dim(self, dim, keepdim, true, &v, &i);
-        (v, i)
+        ValuesAndIndices {
+            values: v,
+            indices: i,
+        }
     }
 
     /// Smallest element (NaN if there is any).
@@ -247,14 +284,18 @@ impl Tensor {
         out
     }
 
-    /// Smallest values along `dim` and their indices (the first one on ties).
+    /// Smallest values along `dim` and their indices (the first one on ties), like
+    /// `x.min(dim, keepdim)`.
     #[track_caller]
-    pub fn min_dim(&self, dim: i64, keepdim: bool) -> (Tensor, Tensor) {
+    pub fn min_dim(&self, dim: i64, keepdim: bool) -> ValuesAndIndices {
         let (v, i) = arg_op(self, Some(dim), keepdim, false, true, "min");
         let v = v.unwrap();
         let dim = normalize_dim(dim, self.num_dims());
         formulas::extremum_dim(self, dim, keepdim, false, &v, &i);
-        (v, i)
+        ValuesAndIndices {
+            values: v,
+            indices: i,
+        }
     }
 
     /// Index of the largest element in the flattened tensor.

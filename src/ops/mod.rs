@@ -35,6 +35,7 @@ pub(crate) use pool::{
 pub use random::{
     manual_seed, rand, rand_like, rand_with, randint, randint_with, randn, randn_like, randn_with,
 };
+pub use reduce::ValuesAndIndices;
 pub(crate) use reduce::exclusive_cumprod;
 pub(crate) use shape_ops::unfold_backward;
 pub use shape_ops::{concat, stack};
@@ -469,11 +470,11 @@ mod tests {
             }),
             ("index_put_", |x| {
                 let index = crate::tensor([2i64, 0, 2]);
-                x.index_put_((.., &index), &crate::ones_with([1], x.device()), false);
+                x.index_put_((.., &index), &crate::ones_with([1], x.device()));
             }),
             ("index_put_ accumulate", |x| {
                 let mask = crate::tensor([true, false, true]);
-                x.index_put_((.., &mask), &crate::ones_with([2], x.device()), true);
+                x.index_put_accumulate_((.., &mask), &crate::ones_with([2], x.device()));
             }),
         ];
         for device in [Device::Cpu, Device::Meta] {

@@ -193,7 +193,7 @@ fn reductions_and_softmax_of_empty_layouts_ignore_their_strides() {
             ("log_softmax", |t| t.log_softmax(1)),
             ("triu", |t| t.unsqueeze(1).triu(0)),
             ("max_dim over the nonempty dimension", |t| {
-                t.max_dim(0, false).0
+                t.max_dim(0, false).values
             }),
         ];
         for (name, op) in ops {

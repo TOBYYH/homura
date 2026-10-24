@@ -10,7 +10,33 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use common::{Case, Golden};
 use homura::autograd::{self, GradOptions, GradcheckOptions, gradcheck, gradgradcheck};
-use homura::{DType, Device, Ellipsis, IndexItem, NewAxis, Tensor, TensorIndex, tensor};
+use homura::{DType, Device, Ellipsis, IndexItem, IndexSpec, NewAxis, Tensor, TensorIndex, tensor};
+
+/// `index_put` / `index_put_` or their `_accumulate` forms, for loops over both.
+trait Put {
+    fn put(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> Tensor;
+    fn put_(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> &Self;
+}
+
+impl Put for Tensor {
+    #[track_caller]
+    fn put(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> Tensor {
+        if accumulate {
+            self.index_put_accumulate(indices, values)
+        } else {
+            self.index_put(indices, values)
+        }
+    }
+
+    #[track_caller]
+    fn put_(&self, indices: impl IndexSpec, values: &Tensor, accumulate: bool) -> &Self {
+        if accumulate {
+            self.index_put_accumulate_(indices, values)
+        } else {
+            self.index_put_(indices, values)
+        }
+    }
+}
 
 fn panic_message(f: impl FnOnce()) -> String {
     let payload = catch_unwind(AssertUnwindSafe(f)).expect_err("expected a panic");
@@ -151,7 +177,7 @@ fn golden_cases_match_pytorch() {
             None => x.index(spec(name, &i)),
             Some(v) => {
                 v.requires_grad_(true);
-                x.index_put(spec(name, &i), v, name.ends_with("_acc"))
+                x.put(spec(name, &i), v, name.ends_with("_acc"))
             }
         };
         c.check("out", &out);
@@ -230,7 +256,7 @@ fn result_positions_follow_pytorch() {
     assert_eq!(x.index((&i21, &ints(&[0, 1, 2]))).shape(), [2, 3, 6, 7]);
     // A mask covers as many dimensions as it has and counts as one entry: `x[m, :, j]`.
     let m2 = homura::ones_with([4, 5], DType::Bool);
-    m2.index_put_((&ints(&[0]), &ints(&[0])), &tensor(false), false);
+    m2.index_put_((&ints(&[0]), &ints(&[0])), &tensor(false));
     assert_eq!(x.index((&m2, .., &ints(&[1]))).shape(), [19, 6]);
     // Basic items after the mask apply to the dimensions after the ones it covers.
     assert_eq!(x.index((&m2, 0)).shape(), [19, 7]);
@@ -289,11 +315,11 @@ fn index_records_one_node_after_the_views() {
     assert_eq!(picked.storage_offset(), 4);
     // index_put records one node with edges to the target and the values.
     let v = counting(&[2, 4]);
-    let y = x.index_put((&i,), &v, false);
+    let y = x.index_put((&i,), &v);
     assert_eq!(chain(&y), ["IndexPutBackward0", acc, acc]);
-    let y = (&x * 1.0).index_put((&i,), &v.detach(), true);
+    let y = (&x * 1.0).index_put_accumulate((&i,), &v.detach());
     assert_eq!(chain(&y), ["IndexPutBackward0", "MulBackward0", acc]);
-    let y = x.detach().index_put((&i,), &v, true);
+    let y = x.detach().index_put_accumulate((&i,), &v);
     assert_eq!(chain(&y), ["IndexPutBackward0", acc]);
     let names: Vec<_> = y
         .grad_fn()
@@ -416,7 +442,7 @@ fn index_put_errors_change_nothing() {
     let put = |indices: Vec<TensorIndex>, v: &Tensor| {
         let (x, v) = (x.clone(), v.clone());
         move || {
-            x.index_put_(indices, &v, false);
+            x.index_put_(indices, &v);
         }
     };
     let t = |t: &Tensor| TensorIndex::Tensor(t.clone());
@@ -493,7 +519,7 @@ fn index_put_errors_change_nothing() {
     );
     // Out-of-place calls check the same, except where noted below.
     assert_panics(
-        || drop(x.index_put((&i,), &v.to(DType::F32), false)),
+        || drop(x.index_put((&i,), &v.to(DType::F32))),
         "Index put requires the source and destination dtypes match",
     );
 }
@@ -507,40 +533,34 @@ fn only_in_place_index_put_rejects_aliasing() {
     // Values that are the target or part of it.
     let x = homura::arange(4.0);
     let reverse = ints(&[3, 2, 1, 0]);
-    assert_eq!(
-        values(&x.index_put((&reverse,), &x, false)),
-        [3.0, 2.0, 1.0, 0.0]
-    );
+    assert_eq!(values(&x.index_put((&reverse,), &x)), [3.0, 2.0, 1.0, 0.0]);
     assert_eq!(values(&x), [0.0, 1.0, 2.0, 3.0]);
     assert_rejected(
         &x,
         || {
-            x.index_put_((&reverse,), &x, false);
+            x.index_put_((&reverse,), &x);
         },
         overlap,
     );
     let part = x.narrow(0, 0, 2);
     let i = ints(&[2, 3]);
     assert_eq!(
-        values(&x.index_put((&i,), &part, true)),
+        values(&x.index_put_accumulate((&i,), &part)),
         [0.0, 1.0, 2.0, 4.0]
     );
     assert_rejected(
         &x,
         || {
-            x.index_put_((&i,), &part, true);
+            x.index_put_accumulate_((&i,), &part);
         },
         overlap,
     );
     // An integer target as its own index.
     let n = Tensor::from_slice(&[0i64, 1, 2], [3]);
-    assert_eq!(
-        n.index_put((&n,), &tensor(9i64), false).to_vec::<i64>(),
-        [9, 9, 9]
-    );
+    assert_eq!(n.index_put((&n,), &tensor(9i64)).to_vec::<i64>(), [9, 9, 9]);
     assert_panics(
         || {
-            n.index_put_((&n,), &tensor(9i64), false);
+            n.index_put_((&n,), &tensor(9i64));
         },
         overlap,
     );
@@ -548,13 +568,13 @@ fn only_in_place_index_put_rejects_aliasing() {
     // An expanded target: its elements share memory.
     let e = homura::ones([1]).expand([3]);
     assert_eq!(
-        values(&e.index_put((&ints(&[1]),), &tensor(5.0), false)),
+        values(&e.index_put((&ints(&[1]),), &tensor(5.0))),
         [1.0, 5.0, 1.0]
     );
     assert_rejected(
         &e,
         || {
-            e.index_put_((&ints(&[1]),), &tensor(5.0), false);
+            e.index_put_((&ints(&[1]),), &tensor(5.0));
         },
         "more than one element of the written-to tensor may refer to a single memory location",
     );
@@ -562,21 +582,21 @@ fn only_in_place_index_put_rejects_aliasing() {
     // are rejected, conservatively.
     let base = homura::arange(6.0);
     base.narrow(0, 0, 3)
-        .index_put_((&ints(&[0, 2]),), &base.narrow(0, 3, 2), false);
+        .index_put_((&ints(&[0, 2]),), &base.narrow(0, 3, 2));
     assert_eq!(values(&base), [3.0, 1.0, 4.0, 3.0, 4.0, 5.0]);
     let even = base.index((0..).step_by(2));
     let odd = base.index((1..).step_by(2));
     assert_rejected(
         &even,
         || {
-            even.index_put_((&ints(&[0, 1, 2]),), &odd, false);
+            even.index_put_((&ints(&[0, 1, 2]),), &odd);
         },
         overlap,
     );
     // The gradient of the out-of-place put accepts upstream gradients of any layout.
     let x = counting(&[3, 2]);
     let v = counting(&[2]);
-    let y = x.index_put((&ints(&[1]),), &v, false);
+    let y = x.index_put((&ints(&[1]),), &v);
     for g in [
         f64t(1.0f64).expand([3, 2]),
         Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]).transpose(0, 1),
@@ -634,7 +654,7 @@ fn index_put_handles_any_target_layout() {
         for accumulate in [false, true] {
             let original = values(x);
             // Not adjacent: the broadcast dimension comes first, as `v` is laid out.
-            let y = x.index_put((&i, .., &j), &v, accumulate);
+            let y = x.put((&i, .., &j), &v, accumulate);
             assert_eq!(y.shape(), [4, 3, 4]);
             assert_eq!(
                 values(&y),
@@ -644,7 +664,7 @@ fn index_put_handles_any_target_layout() {
             assert_eq!(values(x), original, "{name}");
             // Adjacent: the same positions through a transposed target.
             let xt = x.transpose(0, 1);
-            let yt = xt.index_put((.., &i, &j), &v.transpose(0, 1), accumulate);
+            let yt = xt.put((.., &i, &j), &v.transpose(0, 1), accumulate);
             assert_eq!(
                 values(&yt.transpose(0, 1).contiguous()),
                 values(&y),
@@ -657,7 +677,7 @@ fn index_put_handles_any_target_layout() {
             let probe_w = homura::ones([6, 3, 4]);
             probe_w.requires_grad_(true);
             let probe = (&probe_w * &big).sum();
-            view.index_put_((&i, .., &j), &v, accumulate);
+            view.put_((&i, .., &j), &v, accumulate);
             let expected = put_loops(x, &rows, &cols, &v, accumulate);
             assert_eq!(values(&view), expected, "{name}");
             let whole = values(&big);
@@ -725,7 +745,7 @@ fn in_place_index_put_writes_through_non_contiguous_targets() {
                     written[k]
                 };
             }
-            target.index_put_(indices, &v, accumulate);
+            target.put_(indices, &v, accumulate);
             assert_eq!(
                 values(&base),
                 expected,
@@ -742,15 +762,15 @@ fn advanced_indexing_results_are_new_tensors() {
     // The result is contiguous in the order the indexing works in; it doesn't keep the strides
     // of its input (PyTorch keeps them).
     let t = homura::arange(12.0).view([3, 4]).transpose(0, 1);
-    let y = t.index_put((&ints(&[0]),), &tensor(9.0), false);
+    let y = t.index_put((&ints(&[0]),), &tensor(9.0));
     assert_eq!((t.stride(), y.stride()), ([1, 4].into(), [3, 1].into()));
     let results = [
         x.index((.., &i)),
         x.index((&ints(&[1]), .., &ints(&[3]))),
         x.index(x.greater(5.0)),
         x.index(true),
-        x.index_put((.., &i), &tensor(1.0), false),
-        x.index_put((&ints(&[1]), .., &ints(&[3])), &tensor(1.0), true),
+        x.index_put((.., &i), &tensor(1.0)),
+        x.index_put_accumulate((&ints(&[1]), .., &ints(&[3])), &tensor(1.0)),
     ];
     for r in &results {
         // A later in-place write changes only the result.
@@ -812,10 +832,10 @@ fn saved_indices_are_version_checked_unless_consumed_by_value() {
                 let i = Tensor::from_slice(&[1i64], []).to(dtype);
                 let y = &x * 1.0;
                 let y = if in_place {
-                    y.index_put_((&i,), &v, accumulate);
+                    y.put_((&i,), &v, accumulate);
                     y
                 } else {
-                    y.index_put((&i,), &v, accumulate)
+                    y.put((&i,), &v, accumulate)
                 };
                 assert_eq!(y.shape(), [3]);
                 i.fill_(2);
@@ -831,7 +851,7 @@ fn saved_indices_are_version_checked_unless_consumed_by_value() {
     let x = counting(&[3]);
     let v = counting(&[]);
     let i = tensor(1i64);
-    let y = x.index_put((&i,), &v, false);
+    let y = x.index_put((&i,), &v);
     let g = homura::ones_with([3], DType::F64);
     g.requires_grad_(true);
     let gv = grads(&y, &[&v], &g, true).remove(0).unwrap();
@@ -871,22 +891,22 @@ fn accumulation_sums_in_f64_and_rounds_once() {
     ] {
         let x = tensor([start]).to(dtype);
         let v = tensor([1.0, -start]).to(dtype);
-        let y = x.index_put((&ints(&[0, 0]),), &v, true);
+        let y = x.index_put_accumulate((&ints(&[0, 0]),), &v);
         assert_eq!(values(&y), [1.0], "{dtype}");
     }
     let inf = f64::INFINITY;
     let x = Tensor::from_vec(vec![inf, 1.0, f64::NAN, 0.0], [4]);
     let v = Tensor::from_vec(vec![-inf, 2.0, 3.0, inf, inf], [5]);
-    let y = x.index_put((&ints(&[0, 1, 2, 3, 3]),), &v, true);
+    let y = x.index_put_accumulate((&ints(&[0, 1, 2, 3, 3]),), &v);
     let r = values(&y);
     assert!(r[0].is_nan() && r[2].is_nan());
     assert_eq!((r[1], r[3]), (3.0, inf));
     // Integer sums wrap around, bool sums are a logical or.
     let n = Tensor::from_slice(&[i8::MAX], [1]);
-    let y = n.index_put((&ints(&[0, 0]),), &Tensor::from_slice(&[1i8, 1], [2]), true);
+    let y = n.index_put_accumulate((&ints(&[0, 0]),), &Tensor::from_slice(&[1i8, 1], [2]));
     assert_eq!(y.to_vec::<i8>(), [i8::MIN + 1]);
     let b = mask(&[false, true, false]);
-    let y = b.index_put((&ints(&[0, 0, 1]),), &mask(&[true, true, false]), true);
+    let y = b.index_put_accumulate((&ints(&[0, 0, 1]),), &mask(&[true, true, false]));
     assert_eq!(y.to_vec::<bool>(), [true, true, false]);
 }
 
@@ -897,14 +917,14 @@ fn overwriting_puts_zero_the_gradient_where_they_write() {
     let x = counting(&[3]);
     let v = Tensor::from_vec(vec![5.0, 6.0], [2]);
     v.requires_grad_(true);
-    let y = x.index_put((&ints(&[1, 1]),), &v, false);
+    let y = x.index_put((&ints(&[1, 1]),), &v);
     assert!([5.0, 6.0].contains(&values(&y)[1]));
     let r = grads(&y, &[&x, &v], &f64t([1.0f64, 2.0, 3.0]), false);
     assert_eq!(values(r[0].as_ref().unwrap()), [1.0, 0.0, 3.0]);
     assert_eq!(values(r[1].as_ref().unwrap()), [2.0, 2.0]);
     // Written, not multiplied by zero: infinite and NaN gradients vanish there too.
     let v = counting(&[2]);
-    let y = x.index_put((&ints(&[1, 2]),), &v, false);
+    let y = x.index_put((&ints(&[1, 2]),), &v);
     let g = Tensor::from_vec(vec![1.0, f64::INFINITY, f64::NAN], [3]);
     let r = grads(&y, &[&x, &v], &g, false);
     assert_eq!(values(r[0].as_ref().unwrap()), [1.0, 0.0, 0.0]);
@@ -938,25 +958,25 @@ fn gradients_pass_gradcheck() {
         let k = ints(&[3, 0, 1]);
         check(
             "put",
-            &|t| vec![t[0].index_put((&k, .., &j), &t[1], accumulate)],
+            &|t| vec![t[0].put((&k, .., &j), &t[1], accumulate)],
             &[&x, &v],
         );
         let row = counting(&[3]);
         check(
             "put broadcast values",
-            &|t| vec![t[0].index_put((&k, .., &j), &t[1], accumulate)],
+            &|t| vec![t[0].put((&k, .., &j), &t[1], accumulate)],
             &[&x, &row],
         );
         let s = counting(&[]);
         check(
             "put mask",
-            &|t| vec![t[0].index_put((.., &m), &t[1], accumulate)],
+            &|t| vec![t[0].put((.., &m), &t[1], accumulate)],
             &[&x, &s],
         );
     }
     check(
         "put repeated accumulate",
-        &|t| vec![t[0].index_put((&ints(&[1, 1, 3]),), &t[1], true)],
+        &|t| vec![t[0].index_put_accumulate((&ints(&[1, 1, 3]),), &t[1])],
         &[&x, &counting(&[3, 3, 5])],
     );
     // Values computed from the target itself: both paths to it get their gradients.
@@ -966,7 +986,7 @@ fn gradients_pass_gradcheck() {
         check(
             "put values of self",
             &|t| {
-                let put = t[0].index_put((&reversed,), &t[0].pow(2.0), accumulate);
+                let put = t[0].put((&reversed,), &t[0].pow(2.0), accumulate);
                 vec![put.index((.., &ints(&[2, 0]))).pow(2.0)]
             },
             &[&y],
@@ -997,7 +1017,7 @@ fn derivatives_connect_to_the_upstream_gradient() {
     assert_eq!(values(&third), [0.0, 4.0, 0.0, 2.0]);
     // index_put: the target's gradient and the values' both connect to `g`.
     let v = counting(&[2]);
-    let y = x.index_put((&ints(&[0, 2]),), &v, false);
+    let y = x.index_put((&ints(&[0, 2]),), &v);
     let g = f64t([1.0f64, 2.0, 3.0, 4.0]);
     g.requires_grad_(true);
     let r = grads(&y, &[&x, &v], &g, true);
@@ -1061,7 +1081,7 @@ fn degenerate_indices_keep_their_gradients() {
     // Scalar values and whole coverage in index_put.
     let x = counting(&[3]);
     let s = counting(&[]);
-    let y = x.index_put((&ints(&[0, 1, 2]),), &s, false);
+    let y = x.index_put((&ints(&[0, 1, 2]),), &s);
     let r = grads(&y, &[&x, &s], &f64t([1.0f64, 2.0, 3.0]), false);
     assert_eq!(values(r[0].as_ref().unwrap()), [0.0; 3]);
     assert_eq!(values(r[1].as_ref().unwrap()), [6.0]);
@@ -1088,7 +1108,7 @@ fn meta_targets_index_by_shape() {
     let v = homura::zeros_with([3, 6], Device::Meta);
     v.requires_grad_(true);
     for accumulate in [false, true] {
-        let y = x.index_put((.., &m), &v, accumulate);
+        let y = x.put((.., &m), &v, accumulate);
         let g = homura::zeros_with([4, 5, 6], Device::Meta);
         let r = grads(&y, &[&x, &v], &g, false);
         assert_eq!(r[0].as_ref().unwrap().shape(), [4, 5, 6]);
@@ -1098,10 +1118,10 @@ fn meta_targets_index_by_shape() {
     let meta_mask = homura::zeros_with([5], (DType::Bool, Device::Meta));
     let rejected = "on the meta device is not supported";
     assert_panics(|| drop(x.index((.., &meta_mask))), rejected);
-    assert_panics(|| drop(x.index_put((.., &meta_mask), &v, false)), rejected);
+    assert_panics(|| drop(x.index_put((.., &meta_mask), &v)), rejected);
     assert_panics(
         || {
-            x.detach().index_put_((.., &meta_mask), &v.detach(), false);
+            x.detach().index_put_((.., &meta_mask), &v.detach());
         },
         rejected,
     );
@@ -1118,7 +1138,7 @@ fn meta_targets_index_by_shape() {
     let s = homura::zeros_with([], Device::Meta);
     s.requires_grad_(true);
     for accumulate in [false, true] {
-        let y = (&x1 * 1.0).index_put((&meta_scalar,), &s, accumulate);
+        let y = (&x1 * 1.0).put((&meta_scalar,), &s, accumulate);
         assert_eq!(y.shape(), [3]);
         let g = homura::zeros_with([3], Device::Meta);
         g.requires_grad_(true);
@@ -1129,7 +1149,7 @@ fn meta_targets_index_by_shape() {
         let dg = grads(&gs, &[&g], &homura::zeros_with([], Device::Meta), false);
         assert_eq!(dg[0].as_ref().unwrap().shape(), [3]);
         let z = (&x1 * 1.0).detach();
-        z.index_put_((&meta_scalar,), &s.detach(), accumulate);
+        z.put_((&meta_scalar,), &s.detach(), accumulate);
     }
     // Large logical sizes allocate nothing on the host.
     let huge = homura::zeros_with([1 << 20, 1 << 20], Device::Meta);
@@ -1138,7 +1158,7 @@ fn meta_targets_index_by_shape() {
     assert_eq!(huge.index((&column, &row)).shape(), [1 << 16, 1 << 16]);
     // Values are on the device of the target (PyTorch also takes CPU scalars).
     assert_panics(
-        || drop(x.index_put((&ints(&[0]),), &tensor(1.0), false)),
+        || drop(x.index_put((&ints(&[0]),), &tensor(1.0))),
         "Expected all tensors to be on the same device",
     );
 }
@@ -1166,7 +1186,7 @@ fn index_put_follows_the_in_place_rules() {
     assert_rejected(
         &leaf,
         || {
-            leaf.index_put_((&i,), &f64t([1.0f64, 2.0]), false);
+            leaf.index_put_((&i,), &f64t([1.0f64, 2.0]));
         },
         "a leaf Variable that requires grad is being used in an in-place operation.",
     );
@@ -1174,29 +1194,28 @@ fn index_put_follows_the_in_place_rules() {
     let view = y.narrow(0, 0, 3);
     assert_panics(
         || {
-            view.index_put_((&i,), &f64t([1.0f64, 2.0]), false);
+            view.index_put_((&i,), &f64t([1.0f64, 2.0]));
         },
         "in-place operations on a view are not supported yet",
     );
     // In no-grad mode, parameters can be updated, also through views.
     {
         let _no_grad = homura::no_grad();
-        leaf.index_put_((&i,), &f64t([10.0f64, 20.0]), true);
-        leaf.index(0..2)
-            .index_put_((&ints(&[1]),), &f64t(-1.0f64), false);
+        leaf.index_put_accumulate_((&i,), &f64t([10.0f64, 20.0]));
+        leaf.index(0..2).index_put_((&ints(&[1]),), &f64t(-1.0f64));
     }
     assert_eq!(values(&leaf), [10.0, -1.0, 22.0]);
     // A target that doesn't require grad joins the graph when the values do.
     let buffer = homura::zeros_with([3], DType::F64);
     let v = counting(&[2]);
-    buffer.index_put_((&i,), &v, false);
+    buffer.index_put_((&i,), &v);
     assert_eq!(chain(&buffer), ["IndexPutBackward0", "AccumulateGrad"]);
     let r = grads(&buffer, &[&v], &f64t([1.0f64, 2.0, 3.0]), false);
     assert_eq!(values(r[0].as_ref().unwrap()), [1.0, 3.0]);
     // A recorded write into a computed tensor: its old history gets the masked gradient.
     let x = counting(&[3]);
     let y = &x * 2.0;
-    y.index_put_((&ints(&[1]),), &v.index(0..1), false);
+    y.index_put_((&ints(&[1]),), &v.index(0..1));
     assert_eq!(chain(&y)[..2], ["IndexPutBackward0", "MulBackward0"]);
     let r = grads(&y, &[&x, &v], &f64t([1.0f64, 1.0, 1.0]), false);
     assert_eq!(values(r[0].as_ref().unwrap()), [2.0, 0.0, 2.0]);

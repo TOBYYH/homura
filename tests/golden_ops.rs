@@ -7,7 +7,7 @@ mod common;
 use std::sync::OnceLock;
 
 use common::{Case, Golden};
-use homura::{DType, Ellipsis, GeluApproximate, NewAxis, Tensor};
+use homura::{DType, Ellipsis, GeluApproximate, NewAxis, Tensor, ValuesAndIndices};
 
 fn golden() -> &'static Golden {
     static G: OnceLock<Golden> = OnceLock::new();
@@ -50,9 +50,9 @@ fn run(c: &Case) -> bool {
     let x = || c.input("x");
     let (a, b) = (|| c.input("a"), || c.input("b"));
     let out = |t: Tensor| c.check("out", &t);
-    let values_indices = |(v, i): (Tensor, Tensor)| {
-        c.check("values", &v);
-        c.check("indices", &i);
+    let values_indices = |v: ValuesAndIndices| {
+        c.check("values", &v.values);
+        c.check("indices", &v.indices);
     };
     match category(name) {
         "unary" | "unary_wide" | "unary_special" | "unary_f16" | "unary_bf16" | "unary_f64"

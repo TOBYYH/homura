@@ -35,6 +35,19 @@ All notable changes to this project are documented in this file. The format is b
   and `with_device(device, || ..)` run a closure with that grad mode or default device and
   return its value; the previous state is restored also when the closure panics. Unlike the
   guards of `no_grad` and `device_scope`, they can't be ended early by `let _ = ..`.
+- `Tensor::index_put_accumulate` and `index_put_accumulate_` (PyTorch's `accumulate=True`), now
+  that `index_put` / `index_put_` have no `accumulate` argument.
+- `Module::load_state_dict_with(&sd, options)` with `nn::LoadOptions`, which is built from its
+  default with setters, `LoadOptions::default().strict(false)` (PyTorch's `strict=False`), and
+  read with getters such as `is_strict()`. Its fields are private, so that later options (such
+  as `assign`) can be added without breaking callers.
+- `ValuesAndIndices { values, indices }`, which `max_dim` and `min_dim` now return (PyTorch's
+  `torch.return_types.max`); `into()` converts it to the former tuple.
+- `Sum` and `Product` for `Tensor`, over tensors and references to them:
+  `losses.iter().sum::<Tensor>()` is Python's `sum(losses)`. The start is a plain integer 0 or 1,
+  so the dtype and device of the result come from the tensors (an `I32` sum stays `I32`; one
+  tensor gives a new tensor recorded as `AddBackward0` / `MulBackward0`). Without tensors, the
+  result is a zero-dimensional `I64` tensor on the default device.
 
 ### Changed
 
@@ -55,6 +68,20 @@ All notable changes to this project are documented in this file. The format is b
     `permute([])`: write `view(())` or `view(Shape::scalar())` for a zero-dimensional shape and
     `[] as [i64; 0]` for an empty list of dimensions. `zeros([])` and the other functions that
     take an `IntoShape` are not affected.
+- **Breaking**: `Tensor::index_put(indices, values)` and `index_put_` lost their `accumulate`
+  argument; `accumulate=True` is `index_put_accumulate` / `index_put_accumulate_`. Replace
+  `x.index_put_(i, &v, false)` by `x.index_put_(i, &v)` and `x.index_put_(i, &v, true)` by
+  `x.index_put_accumulate_(i, &v)`. The autograd node stays `IndexPutBackward0`.
+- **Breaking**: `Module::load_state_dict(&sd)` is always strict (PyTorch's default) and lost its
+  `strict` argument. Replace `load_state_dict(&sd, true)` by `load_state_dict(&sd)` and
+  `load_state_dict(&sd, false)` by
+  `load_state_dict_with(&sd, LoadOptions::default().strict(false))`. Both return
+  `Result<LoadReport, LoadError>` as before.
+- **Breaking**: `Tensor::max_dim` and `min_dim` return `ValuesAndIndices` instead of a tuple.
+  Replace `.0` / `.1` by `.values` / `.indices`, and `let (v, i) = x.max_dim(..)` by
+  `let ValuesAndIndices { values, indices } = x.max_dim(..)` or
+  `let (v, i) = x.max_dim(..).into()`. The values, indices and gradients are unchanged.
+  `max_pool2d_with_indices` still returns a tuple, as in PyTorch.
 
 - A panic for an invalid argument (shape, dtype, device, dimension, index or option) now reports
   the location of the caller's code instead of a line inside homura: the public API carries

@@ -158,7 +158,7 @@
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
-//! | `model.state_dict()`, `model.load_state_dict(sd, strict)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd, strict)`](Module::load_state_dict), returning a `Result` |
+//! | `model.state_dict()`, `model.load_state_dict(sd)`, `model.load_state_dict(sd, strict=False)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd)`](Module::load_state_dict), [`model.load_state_dict_with(&sd, LoadOptions::default().strict(false))`](Module::load_state_dict_with), returning a `Result` |
 //! | `model.to(torch.float64)`, `model.to("meta")` | [`model.to(DType::F64)`](Module::to), `model.to(Device::Meta)` |
 //!
 //! [`Module`] describes how members are named, ordered and deduplicated.
@@ -252,7 +252,7 @@ pub use layers::{
 };
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;
-pub use state_dict::{LoadError, LoadReport, StateDict, StateDictIter};
+pub use state_dict::{LoadError, LoadOptions, LoadReport, StateDict, StateDictIter};
 pub use training::Training;
 
 /// What `#[derive(Module)]` expands to uses; not part of the API.

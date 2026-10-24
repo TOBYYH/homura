@@ -164,7 +164,7 @@ fn mlp_training_matches_pytorch() {
                 .iter()
                 .map(|k| (k.to_string(), data.input(&format!("init.{k}")).to(dtype)))
                 .collect();
-            model.load_state_dict(&init, true).unwrap();
+            model.load_state_dict(&init).unwrap();
             let params = model.named_parameters();
             let keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, KEYS, "PyTorch's parameter order");

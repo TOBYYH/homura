@@ -893,7 +893,7 @@ fn layers_match_pytorch() {
             })
             .collect();
         assert_eq!(state.len(), 11);
-        model.load_state_dict(&state, true).unwrap();
+        model.load_state_dict(&state).unwrap();
         let x = c.input("x");
         x.requires_grad_(true);
         let out = model.forward(&x);

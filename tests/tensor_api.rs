@@ -281,7 +281,7 @@ fn meta_device_tracks_shapes_and_dtypes() {
         (y.shape(), y.dtype(), y.device()),
         ([4, 5].into(), DType::F32, Device::Meta)
     );
-    let (v, i) = y.max_dim(1, true);
+    let (v, i) = y.max_dim(1, true).into();
     assert_eq!((v.shape(), i.dtype()), ([4, 1].into(), DType::I64));
     assert_eq!((&x * 2).greater(0).dtype(), DType::Bool);
     assert_eq!(homura::concat(&[&x, &x], 0).shape(), [8, 3]);

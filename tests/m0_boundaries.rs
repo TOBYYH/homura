@@ -149,7 +149,7 @@ fn empty_reduction_identities_and_validation() {
     panics(|| {
         x.sum_dim([1, -2], false);
     });
-    assert_eq!(x.max_dim(0, false).0.shape(), [0, 3]);
+    assert_eq!(x.max_dim(0, false).values.shape(), [0, 3]);
     assert_eq!(x.softmax(1).shape(), [2, 0, 3]);
     assert_eq!(x.log_softmax(1).shape(), [2, 0, 3]);
 }
@@ -159,7 +159,7 @@ fn scalar_reductions_views_and_softmax() {
     let t = homura::tensor(3.0);
     for dim in [0, -1] {
         assert_eq!(t.sum_dim(dim, true).shape(), []);
-        let (v, i) = t.max_dim(dim, true);
+        let (v, i) = t.max_dim(dim, true).into();
         assert_eq!(v.item::<f32>(), 3.0);
         assert_eq!(i.item::<i64>(), 0);
         assert_eq!(t.softmax(dim).item::<f32>(), 1.0);
@@ -182,7 +182,7 @@ fn noncontiguous_offset_kernels() {
     );
     assert_eq!(x.sum_dim([0, 2], false).to_vec::<i64>(), [33, 105]);
     assert_eq!(
-        x.max_dim(2, false).0.to_vec::<i64>(),
+        x.max_dim(2, false).values.to_vec::<i64>(),
         [2, 14, 6, 18, 10, 22]
     );
     assert_eq!(

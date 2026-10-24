@@ -12,8 +12,8 @@ A function must be annotated when it is
 - a method declared or provided by a `pub trait` (the attribute on the declaration applies to
   every implementation);
 - a method of an implementation of a standard operator trait (`Add`, `Neg`, `AddAssign`, `Index`,
-  ..., or a trait named by a macro metavariable such as `$Trait`), whose declarations in `std`
-  don't carry the attribute.
+  ..., or a trait named by a macro metavariable such as `$Trait`) or of `Sum` / `Product`, whose
+  declarations in `std` don't carry the attribute.
 
 Not checked: methods of inherent impls of crate-internal types (declared `pub(crate)` or without
 `pub`, so their `pub fn`s aren't reachable from outside); `src/backend/` (kernels, whose panics
@@ -57,7 +57,7 @@ SKIP_DIRS = ("src/backend/", "src/autograd/test_support/")
 STD_OPS = {
     "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Not",
     "AddAssign", "SubAssign", "MulAssign", "DivAssign", "RemAssign",
-    "Index", "IndexMut",
+    "Index", "IndexMut", "Sum", "Product",
 }
 
 FN_RE = re.compile(r"^\s*(?P<vis>pub(\([^)]*\))?\s+)?(const\s+|unsafe\s+|async\s+|extern\s+\"[^\"]*\"\s+)*fn\s+(?P<name>[\w$]+)")
@@ -277,6 +277,8 @@ SELF_TESTS = [
     ("impl std::ops::Add for X {\n    type Output = X;\n    fn add(self, o: X) -> X { o }\n}\n", ["add"]),
     ("impl<T: Into<Y>> AddAssign<T> for X {\n    #[track_caller]\n    fn add_assign(&mut self, o: T) {}\n}\n", []),
     ("impl Index<&str> for X {\n    type Output = u8;\n    fn index(&self, k: &str) -> &u8 { &0 }\n}\n", ["index"]),
+    ("impl<'a> Sum<&'a X> for X {\n    fn sum<I: Iterator<Item = &'a X>>(i: I) -> X { X }\n}\n"
+     "impl std::iter::Product for X {\n    #[track_caller]\n    fn product<I>(i: I) -> X { X }\n}\n", ["sum"]),
     ("macro_rules! m {\n    ($Trait:ident, $method:ident) => {\n        impl $Trait<&X> for &X {\n"
      "            fn $method(self, rhs: &X) -> X { rhs }\n        }\n    };\n}\n", ["$method"]),
     ("macro_rules! m {\n    ($name:ident) => {\n        impl $name {\n            pub fn setter(self) -> $name { self }\n"

@@ -603,7 +603,6 @@ mod tests {
                 x.index_put(
                     (crate::tensor([1i64]), .., crate::tensor([0i64])),
                     &x.index((0, 0, 0)),
-                    false,
                 ),
             ),
             ("index_select", x.index_select(1, &crate::tensor([0i64]))),

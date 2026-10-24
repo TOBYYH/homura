@@ -6,7 +6,8 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToIncl
 use super::Tensor;
 use crate::backend::cpu;
 use crate::ops::{META_VALUES, check_index_dtype, check_index_put_target};
-use crate::{DType, Device, Shape};
+use crate::shape::sealed::Sealed;
+use crate::{DType, Device, DimSize, Shape};
 
 /// Inserts a new dimension of size 1, like `None` in Python indexing.
 #[derive(Clone, Copy, Debug)]
@@ -40,8 +41,25 @@ pub enum TensorIndex {
     Tensor(Tensor),
 }
 
-/// Types usable as one item of an index expression: `i64`, ranges of `i64`, `(a..b).step_by(n)`,
-/// [`NewAxis`], [`Ellipsis`], `bool` and index tensors.
+/// Types usable as one item of an index expression: integers, ranges and `(a..b).step_by(n)` of
+/// one of the [`DimSize`] types (`i64`, `i32`, `usize`), [`NewAxis`], [`Ellipsis`], `bool` and
+/// index tensors.
+///
+/// An open stepped range `(a..).step_by(n)` takes `i64` only, since an open range of a narrower
+/// type overflows inside the standard library when it is advanced past its largest value; write
+/// `(a as i64..).step_by(n)`, or give the range an end:
+///
+/// ```
+/// let x = homura::arange(10);
+/// let start: usize = 1;
+/// assert_eq!(x.index((start as i64..).step_by(4)).to_vec::<i64>(), [1, 5, 9]);
+/// assert_eq!(x.index((start..10).step_by(4)).to_vec::<i64>(), [1, 5, 9]);
+/// ```
+///
+/// ```compile_fail,E0277
+/// let start: usize = 1;
+/// homura::arange(10).index((start..).step_by(4));
+/// ```
 pub trait IndexItem {
     /// Converts into a [`TensorIndex`].
     #[track_caller]
@@ -54,11 +72,17 @@ impl IndexItem for TensorIndex {
     }
 }
 
-impl IndexItem for i64 {
-    fn into_index(self) -> TensorIndex {
-        TensorIndex::Select(self)
-    }
+macro_rules! select {
+    ($($t:ty),*) => {$(
+        impl IndexItem for $t {
+            fn into_index(self) -> TensorIndex {
+                TensorIndex::Select(self.to_dim())
+            }
+        }
+    )*};
 }
+
+select!(i64, i32, usize);
 
 impl IndexItem for NewAxis {
     fn into_index(self) -> TensorIndex {
@@ -107,21 +131,21 @@ impl IndexItem for RangeFull {
     }
 }
 
-impl IndexItem for Range<i64> {
+impl<T: DimSize> IndexItem for Range<T> {
     fn into_index(self) -> TensorIndex {
-        slice(Some(self.start), Some(self.end))
+        slice(Some(self.start.to_dim()), Some(self.end.to_dim()))
     }
 }
 
-impl IndexItem for RangeFrom<i64> {
+impl<T: DimSize> IndexItem for RangeFrom<T> {
     fn into_index(self) -> TensorIndex {
-        slice(Some(self.start), None)
+        slice(Some(self.start.to_dim()), None)
     }
 }
 
-impl IndexItem for RangeTo<i64> {
+impl<T: DimSize> IndexItem for RangeTo<T> {
     fn into_index(self) -> TensorIndex {
-        slice(None, Some(self.end))
+        slice(None, Some(self.end.to_dim()))
     }
 }
 
@@ -131,20 +155,28 @@ fn inclusive_end(end: i64) -> Option<i64> {
     if end == -1 { None } else { end.checked_add(1) }
 }
 
-impl IndexItem for RangeInclusive<i64> {
+impl<T: DimSize> IndexItem for RangeInclusive<T> {
     fn into_index(self) -> TensorIndex {
-        slice(Some(*self.start()), inclusive_end(*self.end()))
+        let (start, end) = self.into_inner();
+        slice(Some(start.to_dim()), inclusive_end(end.to_dim()))
     }
 }
 
-impl IndexItem for RangeToInclusive<i64> {
+impl<T: DimSize> IndexItem for RangeToInclusive<T> {
     fn into_index(self) -> TensorIndex {
-        slice(None, inclusive_end(self.end))
+        slice(None, inclusive_end(self.end.to_dim()))
     }
 }
 
-/// Recovers `start:end:step` from a stepped range by looking at the positions it yields.
-fn stepped<I: Iterator<Item = i64> + Clone>(it: StepBy<I>) -> TensorIndex {
+/// Recovers `start:end:step` from a stepped range by looking at the positions it yields. A
+/// `bounded` range ends at its last position; an open one (`a..`) has no end.
+///
+/// # Panics
+///
+/// Panics if a position it relies on or the step is above `i64::MAX`, which only a `usize`
+/// range, or an `i64` range spanning more than `i64::MAX`, can yield.
+#[track_caller]
+fn stepped<T: DimSize, I: Iterator<Item = T> + Clone>(it: StepBy<I>, bounded: bool) -> TensorIndex {
     let mut probe = it.clone();
     let Some(first) = probe.next() else {
         return TensorIndex::Slice {
@@ -153,6 +185,7 @@ fn stepped<I: Iterator<Item = i64> + Clone>(it: StepBy<I>) -> TensorIndex {
             step: 1,
         };
     };
+    let first = first.to_dim();
     let Some(second) = probe.next() else {
         return TensorIndex::Slice {
             start: Some(first),
@@ -160,33 +193,86 @@ fn stepped<I: Iterator<Item = i64> + Clone>(it: StepBy<I>) -> TensorIndex {
             step: 1,
         };
     };
-    let step = second - first;
-    let end = match it.size_hint() {
-        (n, Some(m)) if n == m => inclusive_end(first + (n as i64 - 1) * step),
-        _ => None,
+    let step = i128::from(second.to_dim()) - i128::from(first);
+    let step = match i64::try_from(step) {
+        Ok(step) => step,
+        Err(_) => panic!("dimension or index {step} is too large"),
+    };
+    if !bounded {
+        return TensorIndex::Slice {
+            start: Some(first),
+            end: None,
+            step,
+        };
+    }
+    let last = match it.size_hint() {
+        (n, Some(m)) if n == m => {
+            // In `i128`, since the last position of a `usize` range may not fit in an `i64`.
+            let last = i128::from(first) + (n as i128 - 1) * i128::from(step);
+            match i64::try_from(last) {
+                Ok(last) => last,
+                Err(_) => panic!("dimension or index {last} is too large"),
+            }
+        }
+        _ => match skip_to_last(it) {
+            Some(last) => last.to_dim(),
+            None => unreachable!("a range that yields two positions has a last one"),
+        },
     };
     TensorIndex::Slice {
         start: Some(first),
-        end,
+        end: inclusive_end(last),
         step,
     }
 }
 
-impl IndexItem for StepBy<Range<i64>> {
-    fn into_index(self) -> TensorIndex {
-        stepped(self)
+/// The last position of a finite stepped range with more positions than a `usize` can count,
+/// such as `(0..=usize::MAX).step_by(1)`: its size hint gives a lower bound, and skipping that
+/// many positions with `nth` leaves a count that fits.
+///
+/// On 64-bit targets only an inclusive range over all the values of a 64-bit type gets here, and
+/// `nth` on it takes constant time. Ranges with an exact count don't use `nth`: the standard
+/// library steps through the positions of `StepBy<Range<usize>>` one by one in debug builds.
+fn skip_to_last<I: Iterator + Clone>(it: StepBy<I>) -> Option<I::Item> {
+    let mut probe = it;
+    let mut last = None;
+    loop {
+        let (n, upper) = probe.size_hint();
+        let Some(position) = probe.nth(n.saturating_sub(1)) else {
+            return last;
+        };
+        last = Some(position);
+        if upper == Some(n) {
+            return last;
+        }
     }
 }
 
-impl IndexItem for StepBy<RangeInclusive<i64>> {
+impl<T: DimSize> IndexItem for StepBy<Range<T>>
+where
+    Range<T>: Iterator<Item = T> + Clone,
+{
     fn into_index(self) -> TensorIndex {
-        stepped(self)
+        stepped(self, true)
     }
 }
 
+impl<T: DimSize> IndexItem for StepBy<RangeInclusive<T>>
+where
+    RangeInclusive<T>: Iterator<Item = T> + Clone,
+{
+    fn into_index(self) -> TensorIndex {
+        stepped(self, true)
+    }
+}
+
+/// Only for `i64`: an open range is read by advancing it, and advancing an open range of a
+/// narrower type past its largest value overflows inside the standard library (a panic in debug
+/// builds, wrapping in release builds) before homura sees the position. Unsuffixed literals in
+/// `(a..).step_by(n)` therefore infer as `i64`, as before 0.4.0.
 impl IndexItem for StepBy<RangeFrom<i64>> {
     fn into_index(self) -> TensorIndex {
-        stepped(self)
+        stepped(self, false)
     }
 }
 

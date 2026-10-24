@@ -6,7 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Shape, dimension and index arguments take `i32` and `usize` as well as `i64`, through the new
+  sealed `DimSize` trait: `IntoShapeSpec` (`view`, `reshape`, `expand`) and `Dims` (`permute`,
+  `sum_dim`, `squeeze_dim`, `flip`, …) accept `[T; N]`, `&[T; N]`, `&[T]` and `Vec<T>` of each,
+  `Dims` and `IndexItem` (`index`) accept single values of each, and `IndexItem` accepts every
+  range and `step_by` range of each, except open stepped ranges (`(a..).step_by(n)`), which stay
+  `i64` only: advancing an open range of a narrower type past its largest value overflows inside
+  the standard library. Sizes from `size()` or `shape()` need no `as i64`:
+  `x.view([batch * seq, hidden])`, `x.index((.., ..n))`. `IntoShapeSpec` also accepts tuples of
+  up to 8 sizes whose types may differ, as in `x.view((batch, seq, -1))`, and `()` for a
+  zero-dimensional shape. A `usize` above `i64::MAX` panics.
+
 ### Changed
+
+- **Breaking**: since shape, dimension and index arguments have several integer types to choose
+  from, an unsuffixed integer literal in them now has the type `i32`, Rust's fallback, instead of
+  `i64`, and a list without literals has no type to infer. Three kinds of code no longer compile:
+  - a literal beyond the `i32` range, such as `x.index(..5_000_000_000)` or
+    `x.expand([1 << 40, 4])`: add a suffix (`5_000_000_000i64`, `1i64 << 40`);
+  - a variable whose type was inferred as `i64` from such an argument and is then used in a way
+    that needs a known type, such as `let i = 3; x.index(i); i.pow(2)`: annotate it
+    (`let i: i64 = 3`);
+  - an empty list: `view([])`, `reshape(&[])`, `expand(Vec::new())`, `sum_dim([], false)`,
+    `permute([])`: write `view(())` or `view(Shape::scalar())` for a zero-dimensional shape and
+    `[] as [i64; 0]` for an empty list of dimensions. `zeros([])` and the other functions that
+    take an `IntoShape` are not affected.
 
 - A panic for an invalid argument (shape, dtype, device, dimension, index or option) now reports
   the location of the caller's code instead of a line inside homura: the public API carries

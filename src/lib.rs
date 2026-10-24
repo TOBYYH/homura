@@ -63,7 +63,7 @@ pub use ops::{
     GeluApproximate, Number, Operand, concat, manual_seed, rand, rand_like, rand_with, randint,
     randint_with, randn, randn_like, randn_with, stack, where_,
 };
-pub use shape::{Dims, IntoShape, IntoShapeSpec, Shape, Strides};
+pub use shape::{DimSize, Dims, IntoShape, IntoShapeSpec, Shape, Strides};
 pub use tensor::{
     Ellipsis, IndexItem, IndexSpec, NestedData, NewAxis, Tensor, TensorIndex, TensorOptions,
     arange, arange_step, arange_step_with, arange_with, eye, eye_with, full, full_like, full_with,

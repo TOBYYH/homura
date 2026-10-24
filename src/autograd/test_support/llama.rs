@@ -97,9 +97,7 @@ impl Layer {
         let (q, kv) = (HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM);
         // A copy, so that the weight isn't a view of the flat tensor.
         let matrix = |rows: usize, cols: usize, seed: f64| {
-            filled([rows, cols], seed)
-                .view([rows as i64, cols as i64])
-                .deep_clone()
+            filled([rows, cols], seed).view([rows, cols]).deep_clone()
         };
         Layer {
             input_norm: norm(0.5),
@@ -137,34 +135,32 @@ impl Layer {
     }
 
     pub fn forward(&self, x: &Tensor) -> Forward {
-        let (batch, seq) = (x.size(0) as i64, x.size(1) as i64);
-        let (heads, kv_heads, head_dim) = (HEADS as i64, KV_HEADS as i64, HEAD_DIM as i64);
+        let (batch, seq) = (x.size(0), x.size(1));
 
         let h = rms_norm(x, &self.input_norm);
         let q = linear(&h, &self.q_proj)
-            .view([batch, seq, heads, head_dim])
+            .view([batch, seq, HEADS, HEAD_DIM])
             .transpose(1, 2);
         let k = linear(&h, &self.k_proj)
-            .view([batch, seq, kv_heads, head_dim])
+            .view([batch, seq, KV_HEADS, HEAD_DIM])
             .transpose(1, 2);
         let v = linear(&h, &self.v_proj)
-            .view([batch, seq, kv_heads, head_dim])
+            .view([batch, seq, KV_HEADS, HEAD_DIM])
             .transpose(1, 2);
 
-        let (cos, sin) = rope(seq as usize, x.device());
+        let (cos, sin) = rope(seq, x.device());
         let q = &q * &cos + rotate_half(&q) * &sin;
         let k = &k * &cos + rotate_half(&k) * &sin;
         let k = repeat_kv(&k, HEADS / KV_HEADS);
         let v = repeat_kv(&v, HEADS / KV_HEADS);
 
         let scores = q.matmul(&k.transpose(2, 3)) / (HEAD_DIM as f64).sqrt();
-        let causal =
-            homura::ones_with([seq as usize, seq as usize], (DType::Bool, x.device())).triu(1);
+        let causal = homura::ones_with([seq, seq], (DType::Bool, x.device())).triu(1);
         let probs = scores.masked_fill(&causal, f64::NEG_INFINITY).softmax(-1);
         let attn = probs
             .matmul(&v)
             .transpose(1, 2)
-            .reshape([batch, seq, heads * head_dim]);
+            .reshape([batch, seq, HEADS * HEAD_DIM]);
         let h = x + linear(&attn, &self.o_proj);
 
         let h2 = rms_norm(&h, &self.post_norm);
@@ -195,7 +191,7 @@ fn rope(seq: usize, device: Device) -> (Tensor, Tensor) {
 }
 
 fn rotate_half(x: &Tensor) -> Tensor {
-    let half = (HEAD_DIM / 2) as i64;
+    let half = HEAD_DIM / 2;
     let x1 = x.index((homura::Ellipsis, ..half));
     let x2 = x.index((homura::Ellipsis, half..));
     homura::concat(&[-&x2, x1], -1)
@@ -204,8 +200,8 @@ fn rotate_half(x: &Tensor) -> Tensor {
 /// `[batch, kv_heads, seq, d]` → `[batch, kv_heads * n_rep, seq, d]`.
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
     let s = x.shape();
-    let (b, kv, seq, d) = (s[0] as i64, s[1] as i64, s[2] as i64, s[3] as i64);
+    let (b, kv, seq, d) = (s[0], s[1], s[2], s[3]);
     x.unsqueeze(2)
-        .expand([b, kv, n_rep as i64, seq, d])
-        .reshape([b, kv * n_rep as i64, seq, d])
+        .expand([b, kv, n_rep, seq, d])
+        .reshape([b, kv * n_rep, seq, d])
 }

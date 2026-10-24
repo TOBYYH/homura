@@ -235,8 +235,8 @@ def scan(path, text, internal=frozenset(), used=None):
             if pending == "skip":
                 skip_next_block = False
             pending = None
-        elif pending is not None and s.endswith(";"):
-            pending = None  # `mod x;` or a one-line item
+        elif pending is not None and (s.endswith(";") or s.endswith("{}")):
+            pending = None  # `mod x;` or a one-line item such as `pub trait Marker: Sealed {}`
         depth += delta
         while stack and depth < stack[-1][1]:
             stack.pop()
@@ -298,6 +298,9 @@ SELF_TESTS = [
     ("// #[track_caller]\npub fn commented() {}\n", ["commented"]),
     ("/// This function carries #[track_caller].\npub fn doc_text() {}\n", ["doc_text"]),
     ("/// ```\n/// #[track_caller]\n/// fn f() {}\n/// ```\npub fn doc_code() {}\n", ["doc_code"]),
+    # A trait with an empty body on one line doesn't make the next impl a trait body.
+    ("pub trait Marker: Sealed {}\nimpl Sealed for X {\n    fn f(self) {}\n}\n"
+     "impl Marker for X {}\npub fn after() {}\n", ["after"]),
     ("#[must_use] // #[track_caller]\npub fn trailing_text() -> u8 { 0 }\n", ["trailing_text"]),
     ("//! #[track_caller]\n#![allow(dead_code)]\npub fn inner_doc() {}\n", ["inner_doc"]),
     ("/// Mentions #[track_caller].\n#[track_caller]\n// A comment.\n#[must_use]\n"

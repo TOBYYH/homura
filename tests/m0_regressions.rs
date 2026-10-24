@@ -283,7 +283,7 @@ fn cpu_views_reject_overflowing_layouts() {
         x.as_strided([3], [2], usize::MAX - 1);
     });
     rejects(|| {
-        x.expand([1 << 40, 1 << 40, 4]);
+        x.expand([1i64 << 40, 1 << 40, 4]);
     });
     // A one-element view with a huge stride is valid, but nothing can step past its end.
     let y = x.as_strided([1], [usize::MAX], 3);

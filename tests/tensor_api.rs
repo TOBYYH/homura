@@ -370,3 +370,255 @@ fn grad_mode_and_threads() {
     let sums: Vec<f32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(sums, [0.0, 100.0, 200.0, 300.0]);
 }
+
+/// What an operation with a shape, dimension or index argument gave, compared across the integer
+/// types of the argument.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    shape: Vec<usize>,
+    stride: String,
+    offset: usize,
+    values: Vec<f32>,
+    grad_fn: Option<&'static str>,
+    shares_storage: bool,
+}
+
+/// Runs `op` on a fresh `[2, 3, 4]` tensor in a graph and records what it gave.
+fn outcome(op: impl Fn(&Tensor) -> Tensor) -> Outcome {
+    let leaf = homura::arange(24).to(DType::F32);
+    leaf.requires_grad_(true);
+    let x = leaf.mul(1.0).view([2, 3, 4]);
+    let y = op(&x);
+    let values = vals(&y);
+    x.detach().add_(100.0);
+    Outcome {
+        shape: y.shape().to_vec(),
+        stride: format!("{:?}", y.stride()),
+        offset: y.storage_offset(),
+        grad_fn: y.grad_fn().map(|g| g.name()),
+        shares_storage: vals(&y) != values,
+        values,
+    }
+}
+
+macro_rules! shape_cases {
+    ($t:ty) => {{
+        let (rows, cols, one): ($t, $t, $t) = (6, 4, 1);
+        let sizes = [rows, cols];
+        vec![
+            outcome(|x| x.view(sizes)),
+            outcome(|x| x.view(&sizes)),
+            outcome(|x| x.view(&sizes[..])),
+            outcome(|x| x.view(sizes.to_vec())),
+            outcome(|x| x.reshape(sizes)),
+            outcome(|x| x.transpose(0, 2).reshape(sizes)),
+            outcome(|x| x.index((.., .., ..one)).expand([2, 3, 5] as [$t; 3])),
+            outcome(|x| x.view((rows, cols))),
+        ]
+    }};
+}
+
+#[test]
+fn shape_arguments_take_i64_i32_and_usize() {
+    let expected = shape_cases!(i64);
+    assert_eq!(shape_cases!(i32), expected);
+    assert_eq!(shape_cases!(usize), expected);
+    assert!(expected[4].shares_storage && !expected[5].shares_storage);
+    // `-1` with signed types, and literals, which infer as `i32`.
+    let inferred = outcome(|x| x.view([-1, 4]));
+    assert_eq!(inferred, expected[0]);
+    assert_eq!(outcome(|x| x.view([-1i64, 4])), inferred);
+    assert_eq!(outcome(|x| x.reshape(vec![6, -1])), expected[4]);
+    let column = |x: &Tensor| x.index((.., .., ..1));
+    assert_eq!(outcome(|x| column(x).expand([-1, -1, 5])), expected[6]);
+    // Tuples mix types; `()` is the zero-dimensional shape.
+    let (batch, seq) = (2usize, 3usize);
+    let full = outcome(|x| x.view([2, 3, 4]));
+    assert_eq!(outcome(|x| x.view((batch, seq, -1))), full);
+    assert_eq!(outcome(|x| x.view((batch, 3i32, 4i64))), full);
+    assert_eq!(outcome(|x| x.view((24usize,))), outcome(|x| x.view([24])));
+    assert_eq!(
+        outcome(|x| x.view((1, 1, 1, 1, 1, batch, seq, -1))),
+        outcome(|x| x.view([1, 1, 1, 1, 1, 2, 3, 4]))
+    );
+    let scalar = outcome(|x| x.sum().view(()));
+    assert_eq!(scalar.shape, []);
+    assert_eq!(outcome(|x| x.sum().view(homura::Shape::scalar())), scalar);
+    assert_eq!(outcome(|x| x.sum().view([] as [i64; 0])), scalar);
+}
+
+macro_rules! dims_cases {
+    ($t:ty) => {{
+        let (a, b, c): ($t, $t, $t) = (2, 0, 1);
+        vec![
+            outcome(|x| x.permute([a, b, c])),
+            outcome(|x| x.permute(&[a, b, c])),
+            outcome(|x| x.permute(&[a, b, c][..])),
+            outcome(|x| x.permute(vec![a, b, c])),
+            outcome(|x| x.sum_dim(c, true)),
+            outcome(|x| x.sum_dim([b, a], false)),
+            outcome(|x| x.mean_dim(a, false)),
+            outcome(|x| x.flip([c])),
+            outcome(|x| x.index((.., ..1)).squeeze_dim(c)),
+            outcome(|x| x.index((.., ..1)).squeeze_dim([c])),
+        ]
+    }};
+}
+
+#[test]
+fn dimension_arguments_take_i64_i32_and_usize() {
+    let expected = dims_cases!(i64);
+    assert_eq!(dims_cases!(i32), expected);
+    assert_eq!(dims_cases!(usize), expected);
+    // A single dimension and a list of one record different nodes, for every type.
+    assert_eq!(expected[8].grad_fn, Some("SqueezeBackward1"));
+    assert_eq!(expected[9].grad_fn, Some("SqueezeBackward2"));
+    // Negative dimensions and literals.
+    assert_eq!(outcome(|x| x.permute([-1, 0, 1])), expected[0]);
+    assert_eq!(outcome(|x| x.permute([-1i64, 0, 1])), expected[0]);
+    assert_eq!(outcome(|x| x.sum_dim(-2, true)), expected[4]);
+    assert_eq!(outcome(|x| x.sum_dim(1, true)), expected[4]);
+}
+
+macro_rules! index_cases {
+    ($t:ty) => {{
+        let (zero, one, two, three): ($t, $t, $t, $t) = (0, 1, 2, 3);
+        vec![
+            outcome(|x| x.index(one)),
+            outcome(|x| x.index((.., one))),
+            outcome(|x| x.index((.., .., one..three))),
+            outcome(|x| x.index((.., .., one..))),
+            outcome(|x| x.index((.., .., ..three))),
+            outcome(|x| x.index((.., .., one..=two))),
+            outcome(|x| x.index((.., .., ..=two))),
+            outcome(|x| x.index((.., .., (zero..three).step_by(2)))),
+            outcome(|x| x.index((.., .., (zero..=three).step_by(2)))),
+            outcome(|x| x.index((one.., .., (one..=three).step_by(2)))),
+            outcome(|x| x.index((.., .., (one..two).step_by(3)))),
+        ]
+    }};
+}
+
+#[test]
+fn index_items_take_i64_i32_and_usize() {
+    let expected = index_cases!(i64);
+    assert_eq!(index_cases!(i32), expected);
+    assert_eq!(index_cases!(usize), expected);
+    assert_eq!(expected[2].grad_fn, Some("SliceBackward0"));
+    // Negative positions and literals.
+    assert_eq!(outcome(|x| x.index((.., -2))), expected[1]);
+    let (start, end) = (1, -1);
+    assert_eq!(outcome(|x| x.index((.., .., start..end))), expected[2]);
+    assert_eq!(outcome(|x| x.index((.., .., -3..=-2))), expected[5]);
+    assert_eq!(
+        outcome(|x| x.index((.., .., (-4..-1).step_by(2)))),
+        expected[7]
+    );
+    assert_eq!(outcome(|x| x.index(1)), expected[0]);
+}
+
+/// The message of the panic in `f`.
+fn panic_message(f: impl FnOnce()) -> String {
+    let payload =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("didn't panic");
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload.downcast::<&str>().map(|m| m.to_string()).unwrap(),
+    }
+}
+
+#[test]
+fn usize_above_i64_max_panics() {
+    let big = i64::MAX as usize + 1;
+    let x = homura::zeros([2, 3]);
+    let message = format!("dimension or index {big} is too large");
+    let check = |name: &str, f: &dyn Fn()| assert_eq!(panic_message(f), message, "{name}");
+    check("view", &|| drop(x.view([big])));
+    check("view(&[..])", &|| drop(x.view(&[big][..])));
+    check("view(vec)", &|| drop(x.view(vec![1, big])));
+    check("view(tuple)", &|| drop(x.view((1i64, big))));
+    check("expand", &|| drop(x.expand([big, 3])));
+    check("permute", &|| drop(x.permute([big, 0])));
+    check("sum_dim", &|| drop(x.sum_dim(big, false)));
+    check("index", &|| drop(x.index(big)));
+    check("index(range)", &|| drop(x.index(0..big)));
+    check("index(range from)", &|| drop(x.index(big..)));
+    check("index(..=)", &|| drop(x.index(..=big)));
+    check("index(step_by)", &|| drop(x.index((big..=big).step_by(2))));
+    check("index(step_by ..)", &|| {
+        drop(x.index((big..big + 4).step_by(2)))
+    });
+    // The last position of a stepped `usize` range may be what doesn't fit.
+    assert_eq!(
+        panic_message(|| drop(x.index((0..usize::MAX).step_by(2)))),
+        format!("dimension or index {} is too large", usize::MAX - 1)
+    );
+    // An inclusive end of `i64::MAX` fits and reaches past every dimension.
+    assert_eq!(x.index(..=i64::MAX as usize).shape(), [2, 3]);
+}
+
+#[test]
+fn stepped_ranges_at_the_limits_of_their_type() {
+    use homura::IndexItem;
+    let x = homura::arange(4);
+    let get = |t: Tensor| t.to_vec::<i64>();
+    let none = Vec::<i64>::new();
+    // Open stepped ranges take `i64` only, so unsuffixed literals infer as `i64`, as in 0.3.0:
+    // advancing an open `i32` range past `i32::MAX` would overflow inside the standard library
+    // (review round 85, R109).
+    assert_eq!(get(x.index((0..).step_by(1usize << 32))), [0]);
+    assert_eq!(get(x.index((0i64..).step_by(1usize << 32))), [0]);
+    assert_eq!(get(x.index((2_147_483_646..).step_by(1))), none);
+    assert_eq!(get(x.index((2_147_483_646i64..).step_by(1))), none);
+    assert_eq!(get(x.index((1..).step_by(2))), [1, 3]);
+    // Finite ranges of narrow types stop at their end without overflowing.
+    assert_eq!(get(x.index((i32::MAX - 1..i32::MAX).step_by(1))), none);
+    assert_eq!(get(x.index((i32::MAX - 1..=i32::MAX).step_by(1))), none);
+    assert_eq!(
+        get(x.index((i32::MAX - 1..=i32::MAX).step_by(1usize << 32))),
+        none
+    );
+    assert_eq!(get(x.index((0i32..4).step_by(1usize << 32))), [0]);
+    assert_eq!(get(x.index((1usize..=3).step_by(2))), [1, 3]);
+    // The last position of a finite range is checked even when the number of positions doesn't
+    // fit in a `usize` (R110), and so is the step.
+    let too_large = |v: u128| format!("dimension or index {v} is too large");
+    let max = usize::MAX as u128;
+    let message = |f: &dyn Fn() -> Tensor| panic_message(|| drop(f()));
+    assert_eq!(
+        message(&|| x.index((0..=usize::MAX).step_by(1))),
+        too_large(max)
+    );
+    assert_eq!(
+        message(&|| x.index((0..=usize::MAX).step_by(2))),
+        too_large(max - 1)
+    );
+    assert_eq!(
+        message(&|| x.index((0..usize::MAX).step_by(1))),
+        too_large(max - 1)
+    );
+    assert_eq!(
+        message(&|| x.index((usize::MAX..=usize::MAX).step_by(1))),
+        too_large(max)
+    );
+    assert_eq!(message(&|| x.index(usize::MAX..)), too_large(max));
+    assert_eq!(message(&|| x.index(usize::MAX)), too_large(max));
+    let all = (i64::MIN..=i64::MAX).step_by(usize::MAX);
+    assert_eq!(message(&|| x.index(all.clone())), too_large(max));
+    // Ends that fit reach past every dimension.
+    let end = i64::MAX as usize;
+    assert_eq!(get(x.index((0..=end).step_by(1))), [0, 1, 2, 3]);
+    assert_eq!(get(x.index((0..=end).step_by(2))), [0, 2]);
+    assert_eq!(get(x.index((i64::MIN..=i64::MAX).step_by(1))), [0, 1, 2, 3]);
+    assert_eq!(
+        format!("{:?}", (0..=end).step_by(1).into_index()),
+        "Slice { start: Some(0), end: None, step: 1 }"
+    );
+    assert_eq!(
+        format!("{:?}", (0..=end).step_by(2).into_index()),
+        format!(
+            "Slice {{ start: Some(0), end: Some({}), step: 2 }}",
+            i64::MAX
+        )
+    );
+}

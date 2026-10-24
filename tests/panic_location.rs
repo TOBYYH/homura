@@ -154,6 +154,37 @@ fn views_indexing_and_reductions() {
 }
 
 #[test]
+// `&[big, 1]` is the form under test.
+#[allow(clippy::needless_borrows_for_generic_args)]
+fn integer_arguments_too_large() {
+    let (a, big) = (t23(), i64::MAX as usize + 1);
+    at!(a.view([big]));
+    at!(a.view(&[big, 1]));
+    at!(a.view(&[big][..]));
+    at!(a.reshape(vec![big]));
+    at!(a.view((1, big)));
+    at!(a.expand([big, 3]));
+    at!(a.permute([big, 0]));
+    at!(a.sum_dim(big, false));
+    at!(a.squeeze_dim(vec![big]));
+    at!(a.index(big));
+    at!(a.index((.., 0..big)));
+    at!(a.index(big..));
+    at!(a.index(..big));
+    at!(a.index(..=big));
+    at!(a.index(big..=big));
+    at!(a.index((big..=big).step_by(2)));
+    at!(a.index((big..big + 4).step_by(2)));
+    at!(a.index((0..usize::MAX).step_by(2)));
+    at!(a.index((0..=usize::MAX).step_by(1)));
+    at!(a.index((0..=usize::MAX).step_by(2)));
+    at!(a.index((usize::MAX..=usize::MAX).step_by(1)));
+    at!(a.index(usize::MAX..));
+    at!(a.index((i64::MIN..=i64::MAX).step_by(usize::MAX)));
+    finish();
+}
+
+#[test]
 fn creation_and_random() {
     at!(homura::full_with([2], 1e40, DType::F32));
     at!(homura::zeros([2]).fill_(1e40));

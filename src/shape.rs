@@ -281,37 +281,180 @@ impl IntoShape for () {
     }
 }
 
+pub(crate) mod sealed {
+    /// The conversion behind [`DimSize`](super::DimSize). It isn't documented and no type
+    /// outside homura can implement it, though generic code with a `DimSize` bound can call it.
+    pub trait Sealed: Copy {
+        /// Converts to `i64`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the value is above `i64::MAX`.
+        #[track_caller]
+        fn to_dim(self) -> i64;
+    }
+}
+
+use sealed::Sealed;
+
+/// The integer types of sizes in a shape argument, dimension indices and index items: `i64`,
+/// `i32` and `usize`. This trait is sealed.
+///
+/// `usize` values (from [`Tensor::size`](crate::Tensor::size), [`Shape`] or a length) can be
+/// used directly, and so can `i64` ones, which may be negative. `i32` is there for literals:
+/// with several integer types to choose from, Rust gives an unsuffixed literal the type `i32`,
+/// so `view([2, -1])` and `sum_dim(1, true)` still compile. Mixing types in one argument takes a
+/// tuple, such as `view((batch, seq, -1))` with `batch` and `seq` of type `usize`.
+///
+/// A `usize` above `i64::MAX` panics with "dimension or index … is too large".
+///
+/// ```
+/// use homura::Shape;
+/// let x = homura::zeros([2, 3, 4]);
+/// let n: usize = x.size(-1);
+/// let d: i64 = -1;
+/// assert_eq!(x.view([6, -1]).shape(), [6, 4]);
+/// assert_eq!(x.view([6, n]).shape(), [6, 4]);
+/// assert_eq!(x.view([d, 4]).shape(), [6, 4]);
+/// assert_eq!(x.view((x.size(0), 3i32, d)).shape(), [2, 3, 4]);
+/// assert_eq!(x.sum_dim(x.num_dims() - 1, true).shape(), [2, 3, 1]);
+/// assert_eq!(x.index((.., .., 1..n)).shape(), [2, 3, 3]);
+/// let s = x.sum();
+/// assert_eq!(s.view(()).shape(), []);
+/// assert_eq!(s.view(Shape::scalar()).shape(), []);
+/// assert_eq!(s.sum_dim([] as [i64; 0], false).shape(), []);
+/// assert_eq!(homura::zeros([]).shape(), []);
+/// ```
+///
+/// # Empty lists
+///
+/// An empty list holds no literal to infer the integer type from, so `view([])`, `view(&[])`,
+/// `view(Vec::new())` and `sum_dim([], false)` don't compile (since 0.4.0). Write `view(())` or
+/// `view(Shape::scalar())` for a zero-dimensional shape and `[] as [i64; 0]` for no dimensions.
+/// [`zeros([])`](crate::zeros) and the other functions that take an [`IntoShape`] are not
+/// affected.
+///
+/// ```compile_fail,E0282
+/// homura::zeros([1]).sum().view([]);
+/// ```
+///
+/// ```compile_fail,E0282
+/// homura::zeros([1]).sum().view(&[]);
+/// ```
+///
+/// ```compile_fail,E0282
+/// homura::zeros([1]).sum().view(Vec::new());
+/// ```
+///
+/// ```compile_fail,E0282
+/// homura::zeros([1]).sum_dim([], false);
+/// ```
+pub trait DimSize: Sealed {}
+
+impl Sealed for i64 {
+    fn to_dim(self) -> i64 {
+        self
+    }
+}
+
+impl Sealed for i32 {
+    fn to_dim(self) -> i64 {
+        self.into()
+    }
+}
+
+impl Sealed for usize {
+    fn to_dim(self) -> i64 {
+        match i64::try_from(self) {
+            Ok(v) => v,
+            Err(_) => panic!("dimension or index {self} is too large"),
+        }
+    }
+}
+
+impl DimSize for i64 {}
+impl DimSize for i32 {}
+impl DimSize for usize {}
+
+/// Converts a list of [`DimSize`] values to `i64`.
+#[track_caller]
+fn to_dims<T: DimSize>(values: &[T]) -> Vec<i64> {
+    let mut dims = Vec::with_capacity(values.len());
+    for &v in values {
+        dims.push(v.to_dim());
+    }
+    dims
+}
+
 /// A shape argument that may contain `-1` for one dimension, as taken by `view`, `reshape` and
-/// `expand`: `[i64; N]`, `&[i64]`, `Vec<i64>` or a [`Shape`].
+/// `expand`: `[T; N]`, `&[T; N]`, `&[T]` or `Vec<T>` with `T` one of the [`DimSize`] types
+/// (`i64`, `i32`, `usize`), a tuple of up to 8 sizes whose types may differ, `()` (zero
+/// dimensions) or a [`Shape`].
+///
+/// ```
+/// let x = homura::zeros([2, 3, 4]);
+/// let (batch, seq) = (x.size(0), x.size(1));
+/// assert_eq!(x.view([batch * seq, 4]).shape(), [6, 4]);
+/// assert_eq!(x.view((batch, -1)).shape(), [2, 12]);
+/// assert_eq!(x.view([-1, 4]).shape(), [6, 4]);
+/// assert_eq!(x.sum().view(()).shape(), []);
+/// ```
 pub trait IntoShapeSpec {
     /// Converts into a list of sizes, where `-1` has an operation-specific meaning.
     #[track_caller]
     fn into_shape_spec(self) -> Vec<i64>;
 }
 
-impl<const N: usize> IntoShapeSpec for [i64; N] {
+impl<T: DimSize, const N: usize> IntoShapeSpec for [T; N] {
     fn into_shape_spec(self) -> Vec<i64> {
-        self.to_vec()
+        to_dims(&self)
     }
 }
 
-impl<const N: usize> IntoShapeSpec for &[i64; N] {
+impl<T: DimSize, const N: usize> IntoShapeSpec for &[T; N] {
     fn into_shape_spec(self) -> Vec<i64> {
-        self.to_vec()
+        to_dims(self)
     }
 }
 
-impl IntoShapeSpec for &[i64] {
+impl<T: DimSize> IntoShapeSpec for &[T] {
     fn into_shape_spec(self) -> Vec<i64> {
-        self.to_vec()
+        to_dims(self)
     }
 }
 
-impl IntoShapeSpec for Vec<i64> {
+impl<T: DimSize> IntoShapeSpec for Vec<T> {
     fn into_shape_spec(self) -> Vec<i64> {
-        self
+        to_dims(&self)
     }
 }
+
+impl IntoShapeSpec for () {
+    fn into_shape_spec(self) -> Vec<i64> {
+        Vec::new()
+    }
+}
+
+macro_rules! tuple_shape_spec {
+    ($($name:ident),+) => {
+        impl<$($name: DimSize),+> IntoShapeSpec for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn into_shape_spec(self) -> Vec<i64> {
+                let ($($name,)+) = self;
+                vec![$($name.to_dim()),+]
+            }
+        }
+    };
+}
+
+tuple_shape_spec!(A);
+tuple_shape_spec!(A, B);
+tuple_shape_spec!(A, B, C);
+tuple_shape_spec!(A, B, C, D);
+tuple_shape_spec!(A, B, C, D, E);
+tuple_shape_spec!(A, B, C, D, E, F);
+tuple_shape_spec!(A, B, C, D, E, F, G);
+tuple_shape_spec!(A, B, C, D, E, F, G, H);
 
 impl IntoShapeSpec for Shape {
     fn into_shape_spec(self) -> Vec<i64> {
@@ -325,8 +468,10 @@ impl IntoShapeSpec for &Shape {
     }
 }
 
-/// One or more dimension indices (negative values count from the end): `i64`, `[i64; N]`,
-/// `&[i64]` or `Vec<i64>`.
+/// One or more dimension indices (negative values count from the end): a single [`DimSize`]
+/// value (`i64`, `i32` or `usize`), or `[T; N]`, `&[T; N]`, `&[T]` or `Vec<T>` of one of them.
+///
+/// An empty list has no literal to infer its type from; write `[] as [i64; 0]`.
 pub trait Dims {
     /// Converts into a list of dimension indices.
     #[track_caller]
@@ -341,37 +486,43 @@ pub trait Dims {
     }
 }
 
-impl Dims for i64 {
-    fn into_dims(self) -> Vec<i64> {
-        vec![self]
-    }
+macro_rules! single_dim {
+    ($($t:ty),*) => {$(
+        impl Dims for $t {
+            fn into_dims(self) -> Vec<i64> {
+                vec![self.to_dim()]
+            }
 
-    fn is_single(&self) -> bool {
-        true
+            fn is_single(&self) -> bool {
+                true
+            }
+        }
+    )*};
+}
+
+single_dim!(i64, i32, usize);
+
+impl<T: DimSize, const N: usize> Dims for [T; N] {
+    fn into_dims(self) -> Vec<i64> {
+        to_dims(&self)
     }
 }
 
-impl<const N: usize> Dims for [i64; N] {
+impl<T: DimSize, const N: usize> Dims for &[T; N] {
     fn into_dims(self) -> Vec<i64> {
-        self.to_vec()
+        to_dims(self)
     }
 }
 
-impl<const N: usize> Dims for &[i64; N] {
+impl<T: DimSize> Dims for &[T] {
     fn into_dims(self) -> Vec<i64> {
-        self.to_vec()
+        to_dims(self)
     }
 }
 
-impl Dims for &[i64] {
+impl<T: DimSize> Dims for Vec<T> {
     fn into_dims(self) -> Vec<i64> {
-        self.to_vec()
-    }
-}
-
-impl Dims for Vec<i64> {
-    fn into_dims(self) -> Vec<i64> {
-        self
+        to_dims(&self)
     }
 }
 

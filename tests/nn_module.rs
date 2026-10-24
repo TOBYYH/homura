@@ -866,20 +866,27 @@ fn old_graphs_fail_after_to() {
 }
 
 #[test]
-fn converting_back_or_not_at_all_keeps_some_old_graphs() {
-    // Back to the recorded dtype: a graph that didn't save the parameter runs again, writing a
-    // gradient that matches it; one that did still fails, as for a modification in place.
+fn converting_back_still_refuses_old_graphs() {
+    // Back to the recorded dtype: the data was still replaced, so neither a graph that only
+    // reaches the parameter's accumulator nor one that saved it runs (PyTorch runs both).
     let w = param(&[1.0, 2.0]);
     let unsaved = (&*w + 1.0).sum();
     let saved = (&*w * &*w).sum();
     convert(&w, DType::F64);
     convert(&w, DType::F32);
-    unsaved.backward();
-    assert_eq!(w.grad().unwrap().to_vec::<f32>(), [1.0, 1.0]);
-    assert!(
-        panic_message(|| saved.backward())
-            .starts_with("one of the variables needed for gradient computation has been modified")
+    assert_eq!(
+        panic_message(|| unsaved.backward()),
+        "the data of a leaf was replaced after the graph was recorded; run the forward pass again"
     );
+    assert!(w.grad().is_none());
+    assert_eq!(
+        panic_message(|| saved.backward()),
+        "the data of a leaf saved for the backward pass was replaced after it was saved (it was \
+         f32 on cpu, it is f32 on cpu); run the forward pass again"
+    );
+    // A new graph runs.
+    (&*w + 1.0).sum().backward();
+    assert_eq!(w.grad().unwrap().to_vec::<f32>(), [1.0, 1.0]);
 
     // Nothing to convert: the old graph is untouched.
     let w = param(&[1.0, 2.0]);
@@ -899,9 +906,9 @@ fn views_and_detached_aliases_keep_the_old_data() {
     };
     let alias = w.detach();
     convert(&w, DType::F64);
-    let stale = "a view whose base had its data replaced (by Module::to) after the view was \
-                 created can't be used for gradient computation: it still refers to the old \
-                 data; create the view again";
+    let stale = "a view whose base had its data replaced (by Module::to or by loading with \
+                 assign) after the view was created can't be used for gradient computation: it \
+                 still refers to the old data; create the view again";
     assert_eq!(panic_message(|| drop(&view * 2.0)), stale);
     assert_eq!(panic_message(|| drop(&no_grad_view * 2.0)), stale);
     assert_eq!(panic_message(|| drop(view.grad_fn())), stale);

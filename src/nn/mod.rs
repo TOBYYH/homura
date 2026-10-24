@@ -188,6 +188,7 @@
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
 //! | `model.state_dict()`, `model.load_state_dict(sd)`, `model.load_state_dict(sd, strict=False)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd)`](Module::load_state_dict), [`model.load_state_dict_with(&sd, LoadOptions::default().strict(false))`](Module::load_state_dict_with), returning a `Result` |
+//! | `with torch.device("meta"): model = Net()`, `model.load_state_dict(sd, assign=True)` | [`let model = homura::with_device(Device::Meta, Net::new)`](crate::with_device), [`model.load_state_dict_with(&sd, LoadOptions::default().assign(true))`](LoadOptions::assign) |
 //! | `model.to(torch.float64)`, `model.to("meta")` | [`model.to(DType::F64)`](Module::to), `model.to(Device::Meta)` |
 //! | `print(model)`, `def extra_repr(self)` | [`println!("{}", model.display())`](Module::display), `#[module(extra_repr = Self::describe)]` |
 //! | `sum(p.numel() for p in model.parameters())` | [`model.num_parameters()`](Module::num_parameters) |
@@ -212,10 +213,16 @@
 //!   in their inputs: a panic for other reasons (out of memory) or another thread changing the
 //!   module at the same time can still leave it partly changed.
 //! - After [`Module::to`], graphs recorded before can't be run any more for the converted
-//!   tensors; PyTorch runs them, and can write gradients of the old dtype into the converted
-//!   parameters. The `.grad` of a converted tensor is replaced by a converted copy, where
+//!   tensors, also after converting back; PyTorch runs them, and can write gradients of the old
+//!   dtype into the converted parameters. The `.grad` of a converted tensor is replaced by a converted copy, where
 //!   PyTorch converts the gradient tensor itself; one that has a history must be cleared before
 //!   converting.
+//! - Loading with [`assign`](LoadOptions::assign) keeps the parameters and buffers and gives them
+//!   the data of the entries, where PyTorch replaces them with new ones (a buffer with the entry
+//!   itself). Handles taken before, such as an optimizer's, see the new data, a shared parameter
+//!   stays shared, and graphs and views of the old data are refused, which in PyTorch keep the
+//!   old parameter. A parameter keeps whether it requires grad (as in PyTorch) and loses its
+//!   `.grad`.
 //! - Initializations, layer constructors and dropout draw from homura's random number
 //!   generator, whose numbers differ from PyTorch's for the same seed; load a state dict to start
 //!   from PyTorch's values.

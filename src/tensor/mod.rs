@@ -1,5 +1,6 @@
 //! The [`Tensor`] type.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::autograd::{AutogradMeta, ViewInfo};
@@ -56,6 +57,10 @@ struct TensorImpl {
     /// Set when the tensor is created as a view of another one; never changes afterwards, so it
     /// is read without a lock.
     view: Option<ViewInfo>,
+    /// The number of times the data was replaced (`set_data`, `assign_data`), changed while the
+    /// data lock is held for writing. Graphs and views recorded before a replacement compare it
+    /// with the value they recorded and refuse the new data.
+    data_gen: AtomicU64,
 }
 
 /// A weak handle to a tensor: it doesn't keep the tensor alive. Saved tensors use it to describe
@@ -353,7 +358,28 @@ impl Tensor {
             data: RwLock::new(data),
             autograd: Mutex::new(autograd),
             view,
+            data_gen: AtomicU64::new(0),
         }))
+    }
+
+    /// How many times the data of this tensor was replaced (see `TensorImpl::data_gen`).
+    pub(crate) fn data_gen(&self) -> u64 {
+        self.0.data_gen.load(Ordering::Acquire)
+    }
+
+    /// Replaces the data under the data lock and counts the replacement, returning the old data
+    /// (dropped by the caller, after the lock is released).
+    pub(crate) fn replace_data(&self, data: TensorData, continue_version: bool) -> TensorData {
+        let mut guard = self.0.data.write().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard.layout.shape, data.layout.shape,
+            "internal error: replacing the data of a tensor with another shape"
+        );
+        if continue_version {
+            data.storage.continue_version(guard.storage.version());
+        }
+        self.0.data_gen.fetch_add(1, Ordering::Release);
+        std::mem::replace(&mut *guard, data)
     }
 
     /// The autograd state, locked. See `TensorImpl::autograd` for the locking rules.

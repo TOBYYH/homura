@@ -1007,9 +1007,9 @@ fn batch_norm_rejects_stale_views_before_writing() {
         || {
             batch_norm(&x, Some(&rm), Some(&rv), Some(&weight), None, training(0.5));
         },
-        "a view whose base had its data replaced (by Module::to) after the view was created \
-         can't be used for gradient computation: it still refers to the old data; create the \
-         view again",
+        "a view whose base had its data replaced (by Module::to or by loading with assign) after \
+         the view was created can't be used for gradient computation: it still refers to the \
+         old data; create the view again",
     );
     assert_eq!(vals(&rm), [0.0, 0.0]);
     assert_eq!(vals(&rv), [1.0, 1.0]);

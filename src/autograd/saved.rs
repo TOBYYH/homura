@@ -27,11 +27,14 @@ enum Packed {
     /// be set so that a higher-order graph reaches it, and such a graph must reach the leaf's own
     /// accumulator. A leaf owns no node, but its `.grad` can own a graph (under
     /// `backward(create_graph = true)`, one that saves the leaf again: a reference cycle that only
-    /// clearing the `.grad` breaks, as in PyTorch). Its dtype and device when saved tell a later
-    /// replacement of its data (`Tensor::set_data`) apart from an in-place modification.
+    /// clearing the `.grad` breaks, as in PyTorch). Its data generation when saved tells a later
+    /// replacement of its data (`Tensor::set_data`, `Tensor::assign_data`) apart from an in-place
+    /// modification, also when the new storage happens to have the saved version; the dtype and
+    /// device describe a replacement in the message.
     Leaf {
         tensor: Tensor,
         version: u64,
+        data_gen: u64,
         dtype: DType,
         device: Device,
     },
@@ -64,6 +67,7 @@ impl SavedTensor {
             None => Packed::Leaf {
                 tensor: t.clone(),
                 version,
+                data_gen: t.data_gen(),
                 dtype: t.dtype(),
                 device: t.device(),
             },
@@ -102,8 +106,8 @@ impl SavedTensor {
     ///
     /// Panics with PyTorch's messages if the tensor was released, detached in place after it
     /// was saved (checked even if the original was dropped since), or modified in place after
-    /// it was saved; also if it is a leaf whose data was replaced since, which changes its
-    /// version too (see `Tensor::set_data`).
+    /// it was saved; also if it is a leaf whose data was replaced since (see `Tensor::set_data`
+    /// and `Tensor::assign_data`).
     pub(super) fn unpack(&self, owner: &NodeRef) -> Tensor {
         // Copy handles out under the lock; build the tensor after releasing it.
         let packed = self.slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -118,11 +122,12 @@ impl SavedTensor {
             Some(Packed::Leaf {
                 tensor,
                 version,
+                data_gen,
                 dtype,
                 device,
             }) => {
                 let data = tensor.data();
-                if (data.dtype, data.device()) != (dtype, device) {
+                if tensor.data_gen() != data_gen {
                     panic!(
                         "the data of a leaf saved for the backward pass was replaced after it was \
                          saved (it was {dtype} on {device}, it is {} on {}); run the forward pass \

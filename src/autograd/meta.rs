@@ -55,6 +55,10 @@ pub(crate) struct ViewInfo {
     /// The `history_gen` of the root base that this view's history belongs to. Views of views
     /// inherit it from their parent, so views created from a stale view are stale too.
     pub base_history_gen: u64,
+    /// The data generation of the root base when the first view in the chain was created
+    /// (inherited like `base_history_gen`): once the base's data is replaced, also by data in the
+    /// same storage, the view no longer shows the base and is stale.
+    pub base_data_gen: u64,
 }
 
 /// A view of `parent` with `layout`, recording its root base. The view operation records the
@@ -71,10 +75,12 @@ pub(crate) fn view_of(parent: &Tensor, layout: Layout) -> Tensor {
         Some(v) => ViewInfo {
             base: v.base.clone(),
             base_history_gen: v.base_history_gen,
+            base_data_gen: v.base_data_gen,
         },
         None => ViewInfo {
             base: parent.clone(),
             base_history_gen: history_gen(parent),
+            base_data_gen: parent.data_gen(),
         },
     };
     let data = TensorData {
@@ -176,6 +182,16 @@ pub(crate) fn replace_leaf_data(t: &Tensor, data: TensorData, grad: Option<Tenso
         if grad.is_some() {
             set_grad(t, grad);
         }
+    });
+}
+
+/// Replaces the data of the leaf `t` with `data`, which may share its storage with other tensors
+/// (see `Tensor::assign_data`), and clears its `.grad`, for loading by assignment. Holds the
+/// `.grad` lock throughout, like [`replace_leaf_data`].
+pub(crate) fn assign_leaf_data(t: &Tensor, data: TensorData) {
+    with_grad_lock(t, || {
+        t.assign_data(data);
+        set_grad(t, None);
     });
 }
 

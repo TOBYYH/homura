@@ -65,9 +65,21 @@ All notable changes to this project are documented in this file. The format is b
   The new provided methods of `Module` (`display`, `extra_repr`, `type_name`,
   `num_parameters`) can make a call of a method of the same name from another trait in scope
   ambiguous; inherent methods of the same name keep precedence.
+- Loading by assignment, PyTorch's `load_state_dict(sd, assign=True)`:
+  `LoadOptions::default().assign(true)` (read with `is_assign()`) gives the parameters and
+  buffers the dtype, device, layout and storage of the entries instead of copying, so a model
+  built on the meta device (`with_device(Device::Meta, ..)`) loads without allocating twice.
+  Unlike PyTorch, the parameters and buffers stay the same objects: optimizers and shared
+  names see the new data, a parameter keeps whether it requires grad and loses its `.grad`, and
+  graphs and views of the old data panic instead of using it. Targets that are views or have a
+  history, and integer entries for parameters that require grad, are load errors.
 
 ### Changed
 
+- Graphs recorded before `Module::to` stay refused after converting back to the original dtype
+  and device: a backward pass that reaches a converted parameter's old accumulator panics, as
+  one that unpacked it already did. It used to run a graph that didn't save the parameter.
+  The messages also cover loading by assignment.
 - **Breaking**: the methods of `optim::Optimizer` that use the optimizer's options type moved to
   the new trait `optim::TypedOptimizer: Optimizer`, which has the associated type `Options`:
   `defaults`, `param_groups`, `options_mut` and `add_param_group`. Code that calls them needs

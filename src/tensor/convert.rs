@@ -68,30 +68,41 @@ impl Tensor {
     /// new data; its `requires_grad` and `.grad` stay. Views and `detach` aliases created before
     /// keep the old storage.
     ///
-    /// Graphs recorded before can't use the new data by accident: the storage of `data` must be
-    /// new (no other tensor uses it), and its version starts one past the old storage's, so a
-    /// graph that saved this tensor fails its version check; the cached accumulator is dropped,
-    /// and the old one, which an old graph still holds, refuses gradients whose metadata no
-    /// longer match (see `AccumulateGrad`); views of the old storage become stale.
+    /// Graphs recorded before can't use the new data by accident: the replacement increments
+    /// the tensor's data generation, which a graph that saved this tensor, the accumulator an
+    /// old graph holds (the cached one is dropped) and views created before compare with the
+    /// value they recorded (see `AccumulateGrad`, `SavedTensor` and the staleness of views). The
+    /// storage of `data` must be new (no other tensor uses it); its version also starts one past
+    /// the old storage's.
     ///
     /// # Panics
     ///
     /// Panics (an internal error) if the tensor has a history or is a view, or if the shapes
     /// differ: callers check these first.
     pub(crate) fn set_data(&self, data: TensorData) {
+        self.replace_leaf_data(data, true);
+    }
+
+    /// Replaces the storage, layout and dtype of this tensor with `data`, which has the same
+    /// shape and may share its storage with other tensors, for loading by assignment
+    /// (`load_state_dict(assign=True)`). Like [`set_data`](Tensor::set_data), except that the
+    /// version of the storage of `data` is left alone: the storage belongs to the source too, and
+    /// changing its version would fail or revive the version checks of the source's graphs. Old
+    /// graphs and views of this tensor are refused by the data generation alone.
+    ///
+    /// # Panics
+    ///
+    /// Like [`set_data`](Tensor::set_data).
+    pub(crate) fn assign_data(&self, data: TensorData) {
+        self.replace_leaf_data(data, false);
+    }
+
+    fn replace_leaf_data(&self, data: TensorData, continue_version: bool) {
         assert!(
             self.view_info().is_none() && self.is_leaf(),
-            "internal error: set_data on a view or a tensor with a history"
+            "internal error: replacing the data of a view or a tensor with a history"
         );
-        let old = {
-            let mut guard = self.0.data.write().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(
-                guard.layout.shape, data.layout.shape,
-                "internal error: set_data with another shape"
-            );
-            data.storage.continue_version(guard.storage.version());
-            std::mem::replace(&mut *guard, data)
-        };
+        let old = self.replace_data(data, continue_version);
         drop(old);
         crate::autograd::forget_accumulator(self);
     }

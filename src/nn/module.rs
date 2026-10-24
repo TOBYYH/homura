@@ -346,9 +346,14 @@ pub trait Module: Member {
     }
 
     /// [`load_state_dict`](Module::load_state_dict) with options
-    /// (`load_state_dict(state_dict, strict=False)`): with
+    /// (`load_state_dict(state_dict, strict=False, assign=True)`): with
     /// [`strict(false)`](LoadOptions::strict), missing and unexpected keys are listed in the
-    /// returned report instead of being errors.
+    /// returned report instead of being errors; with [`assign(true)`](LoadOptions::assign), the
+    /// parameters and buffers take the data of the entries (their dtype, device, layout and
+    /// storage) instead of copying it, which loads a model built on the meta device. A target
+    /// that is a view or has a history can't be assigned, nor an entry that isn't floating point
+    /// to a parameter that requires grad; these are errors too, found before anything is
+    /// written.
     ///
     /// ```
     /// use homura::nn::{LoadOptions, Module, Parameter};
@@ -389,8 +394,8 @@ pub trait Module: Member {
     /// Graphs recorded before the conversion can't be run any more for the converted tensors
     /// (their backward passes panic instead of writing gradients of the old dtype or device), and
     /// views created before it keep the old data and can't be used for gradient computation;
-    /// `detach` aliases keep the old data too. Converting back to the original dtype and device
-    /// lets an old graph that didn't save the tensor run again. PyTorch lets old graphs run.
+    /// `detach` aliases keep the old data too. This holds also after converting back to the
+    /// original dtype and device: the data was replaced. PyTorch lets old graphs run.
     ///
     /// Every tensor is checked before anything is converted: when `to` panics for the reasons
     /// below, the module is unchanged.
@@ -632,7 +637,7 @@ fn load<M: Member + ?Sized>(
     state_dict: &StateDict,
     options: LoadOptions,
 ) -> Result<LoadReport, LoadError> {
-    let strict = options.is_strict();
+    let (strict, assign) = (options.is_strict(), options.is_assign());
     let targets = entries(module);
     let keys: HashSet<&str> = targets.iter().map(|(k, _)| k.as_str()).collect();
     let missing_keys: Vec<String> = targets
@@ -646,23 +651,33 @@ fn load<M: Member + ?Sized>(
         .map(String::from)
         .collect();
     let mut errors = vec![];
+    // With assignment, the data each target gets: taken now, so that writing one target can't
+    // change what a later one reads when they alias.
+    let mut assigned = vec![];
     for (key, target) in &targets {
         let Some(source) = state_dict.get(key) else {
             continue;
         };
         let (dst, src) = (target.data(), source.data());
         let (shape, source_shape) = (&dst.layout.shape, &src.layout.shape);
+        let error = if assign {
+            assign_error(target, &src)
+        } else {
+            crate::ops::copy_error(&dst, &src)
+        };
         if shape != source_shape {
             errors.push(format!(
                 "size mismatch for {key}: copying a param with shape {source_shape:?} from \
                  checkpoint, the shape in current model is {shape:?}."
             ));
-        } else if let Some(e) = crate::ops::copy_error(&dst, &src) {
+        } else if let Some(e) = error {
             errors.push(format!(
                 "While copying the parameter named \"{key}\", whose dimensions in the model are \
                  {shape:?} and whose dimensions in the checkpoint are {source_shape:?}, an \
                  exception occurred: {e}"
             ));
+        } else if assign {
+            assigned.push((*target, src));
         }
     }
     if !errors.is_empty() || strict && !(missing_keys.is_empty() && unexpected_keys.is_empty()) {
@@ -677,16 +692,38 @@ fn load<M: Member + ?Sized>(
             errors,
         });
     }
-    let _guard = crate::no_grad();
-    for (key, target) in &targets {
-        if let Some(source) = state_dict.get(key) {
-            target.copy_(source);
+    if assign {
+        for (target, data) in assigned {
+            crate::autograd::assign_leaf_data(target, data);
+        }
+    } else {
+        let _guard = crate::no_grad();
+        for (key, target) in &targets {
+            if let Some(source) = state_dict.get(key) {
+                target.copy_(source);
+            }
         }
     }
     Ok(LoadReport {
         missing_keys,
         unexpected_keys,
     })
+}
+
+/// Why the data `data` can't replace that of `target` by assignment, or `None` if it can: only a
+/// leaf that isn't a view has data of its own, and a tensor that requires grad must be floating
+/// point (PyTorch's message).
+fn assign_error(target: &Tensor, data: &TensorData) -> Option<String> {
+    if target.view_info().is_some() || !target.is_leaf() {
+        Some(
+            "it is a view or has a history, so its data can't be replaced; load it without assign"
+                .into(),
+        )
+    } else if target.requires_grad() && !data.dtype.is_floating_point() {
+        Some("Only Tensors of floating point and complex dtype can require gradients".into())
+    } else {
+        None
+    }
 }
 
 #[track_caller]

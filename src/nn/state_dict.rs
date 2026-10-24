@@ -228,12 +228,16 @@ impl fmt::Debug for StateDict {
 #[non_exhaustive]
 pub struct LoadOptions {
     strict: bool,
+    assign: bool,
 }
 
 impl Default for LoadOptions {
-    /// Strict, like [`Module::load_state_dict`](super::Module::load_state_dict).
+    /// Strict and copying, like [`Module::load_state_dict`](super::Module::load_state_dict).
     fn default() -> Self {
-        LoadOptions { strict: true }
+        LoadOptions {
+            strict: true,
+            assign: false,
+        }
     }
 }
 
@@ -242,14 +246,51 @@ impl LoadOptions {
     /// [`LoadReport`] lists them.
     #[must_use]
     #[track_caller]
-    pub fn strict(self, strict: bool) -> Self {
-        LoadOptions { strict }
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// The value set by [`strict`](LoadOptions::strict).
     #[track_caller]
     pub fn is_strict(&self) -> bool {
         self.strict
+    }
+
+    /// Whether the parameters and buffers take the data of the entries instead of copying it
+    /// (`assign`, false by default). With assignment, a parameter gets the dtype, device and
+    /// layout of its entry and shares its storage, without a copy: the way to load into a model
+    /// built on the meta device (see [`with_device`](crate::with_device)).
+    ///
+    /// Unlike PyTorch, which replaces them with new parameters and buffers, homura keeps them:
+    /// handles taken before (an optimizer's, a shared parameter's other names) see the new data,
+    /// and a parameter keeps whether it requires grad. Its `.grad` is cleared. Graphs and views
+    /// created from the old data can't be used any more (their backward passes and operations
+    /// panic). An optimizer's state for the parameters stays as it was: after a change of dtype
+    /// or device, load the optimizer's state too or create it again.
+    ///
+    /// ```
+    /// use homura::nn::{LoadOptions, Linear, Module};
+    /// use homura::{DType, Device};
+    ///
+    /// let trained = Linear::new(4, 2);
+    /// trained.to(DType::F64);
+    /// let model = homura::with_device(Device::Meta, || Linear::new(4, 2));
+    /// let options = LoadOptions::default().assign(true);
+    /// model.load_state_dict_with(&trained.state_dict(), options).unwrap();
+    /// assert_eq!((model.weight.dtype(), model.weight.device()), (DType::F64, Device::Cpu));
+    /// ```
+    #[must_use]
+    #[track_caller]
+    pub fn assign(mut self, assign: bool) -> Self {
+        self.assign = assign;
+        self
+    }
+
+    /// The value set by [`assign`](LoadOptions::assign).
+    #[track_caller]
+    pub fn is_assign(&self) -> bool {
+        self.assign
     }
 }
 
@@ -273,8 +314,10 @@ pub struct LoadError {
     pub missing_keys: Vec<String>,
     /// Keys of the state dict that the module doesn't have; only filled by a strict load.
     pub unexpected_keys: Vec<String>,
-    /// One message per entry that can't be copied into the module: a shape mismatch, a device
-    /// that can't be copied from or a target that can't be written, in the module's order.
+    /// One message per entry that can't be loaded into the module: a shape mismatch, a device
+    /// that can't be copied from or a target that can't be written; with assignment, a target
+    /// that is a view or has a history, or a parameter that requires grad and an entry that isn't
+    /// floating point. In the module's order.
     pub errors: Vec<String>,
 }
 

@@ -106,9 +106,10 @@
 //! using its history (as an input to a recorded operation, a root or requested input of a
 //! backward pass, the parent of a new view, or through [`Tensor::grad_fn`]) panics, while
 //! no-grad operations on its data work. PyTorch replays such views on the new history; create
-//! the view again after the write instead. A view whose base
-//! [`nn::Module::to`](crate::nn::Module::to) has converted since is stale in the same way: it
-//! still refers to the old data.
+//! the view again after the write instead. A view whose base had its data replaced since, by
+//! [`nn::Module::to`](crate::nn::Module::to) or by loading with
+//! [`assign`](crate::nn::LoadOptions::assign), is stale in the same way: it refers to the old
+//! data.
 //!
 //! # Views
 //!
@@ -123,7 +124,7 @@
 //! | Created in grad mode from a tensor that requires grad | `true` | `false` | its own node, such as `ViewBackward0` | go to its base |
 //! | Created in no-grad mode, or before its base required grad | as its base | `true` | `None` | are dropped |
 //! | Such a view after `requires_grad_(true)` | `true` | `true` | `None` | accumulate into its own `.grad` |
-//! | Stale: its base's history was rewritten in place, or its base was converted by `Module::to`, after it was created | unchanged | unchanged | panics | panic, like every use of its history |
+//! | Stale: its base's history was rewritten in place, or its base's data was replaced (`Module::to`, loading with `assign`), after it was created | unchanged | unchanged | panics | panic, like every use of its history |
 //!
 //! In grad mode, any view rejects in-place operations that would be recorded, see
 //! [In-place operations](#in-place-operations); in no-grad mode they are allowed.
@@ -344,7 +345,8 @@ mod saved;
 pub use function::{BackwardContext, ForwardContext, Function};
 pub use gradcheck::{GradcheckError, GradcheckOptions, gradcheck, gradgradcheck};
 pub(crate) use meta::{
-    AutogradMeta, ViewInfo, forget_accumulator, replace_leaf_data, repr_suffix, view_of,
+    AutogradMeta, ViewInfo, assign_leaf_data, forget_accumulator, replace_leaf_data, repr_suffix,
+    view_of,
 };
 pub use node::GradFn;
 pub(crate) use record::{check_in_place, check_recordable, original_value, record_in_place};

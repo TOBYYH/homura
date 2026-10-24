@@ -1,7 +1,6 @@
 //! Connecting tensors to the backward graph.
 
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::accumulate::grad_accumulator;
@@ -247,8 +246,8 @@ pub(crate) fn gradient_edge(t: &Tensor) -> Option<Edge> {
 
 /// Panics if `t` is a view whose history is stale: its base had its history rewritten by an
 /// in-place operation in grad mode after the view was created (replaying the view on the new
-/// history is not supported yet), or its base's data was replaced by `Module::to`, so that the
-/// view no longer shares it.
+/// history is not supported yet), or its base's data was replaced (by `Module::to` or by
+/// loading with assignment), so that the view no longer shows it.
 #[track_caller]
 pub(crate) fn check_not_stale(t: &Tensor) {
     match staleness(t) {
@@ -259,9 +258,9 @@ pub(crate) fn check_not_stale(t: &Tensor) {
              after the in-place operation"
         ),
         Some(Stale::Data) => panic!(
-            "a view whose base had its data replaced (by Module::to) after the view was created \
-             can't be used for gradient computation: it still refers to the old data; create \
-             the view again"
+            "a view whose base had its data replaced (by Module::to or by loading with assign) \
+             after the view was created can't be used for gradient computation: it still refers \
+             to the old data; create the view again"
         ),
     }
 }
@@ -281,9 +280,9 @@ fn staleness(t: &Tensor) -> Option<Stale> {
     if meta::history_gen(&view.base) != view.base_history_gen {
         return Some(Stale::History);
     }
-    // Views share their root base's storage until `set_data` replaces the base's.
-    let shared = Arc::ptr_eq(&t.data().storage, &view.base.data().storage);
-    (!shared).then_some(Stale::Data)
+    // Views show their root base's data until it is replaced (`set_data`, `assign_data`), even
+    // by data in the same storage.
+    (view.base.data_gen() != view.base_data_gen).then_some(Stale::Data)
 }
 
 /// Makes `t` output `output_nr` of `node`, which has just been recorded.

@@ -23,6 +23,9 @@ use crate::Tensor;
 /// of this kind are outside the guarantee.
 pub(crate) struct AccumulateGrad {
     leaf: Tensor,
+    /// The leaf's data generation when this accumulator was created: a replacement of the data
+    /// since then (`Module::to`, loading by assignment) makes it refuse gradients.
+    data_gen: u64,
 }
 
 impl Node for AccumulateGrad {
@@ -33,11 +36,12 @@ impl Node for AccumulateGrad {
     /// Checks the leaf's current state, not the state it had when the graph was recorded: a leaf
     /// that has since stopped requiring grad keeps its `.grad` unchanged, and one that an
     /// in-place operation has given a history is rejected, as in PyTorch. So is a leaf whose
-    /// data `Module::to` has replaced with another dtype or device since this accumulator was
-    /// created (`Tensor::set_data`), which PyTorch accepts: the gradient would no longer match
-    /// the leaf. A replacement that went back to the recorded dtype and device is accepted.
-    /// A `.grad` whose metadata no longer match the leaf's is rejected too, so that a backward
-    /// pass never writes a gradient that doesn't match its leaf.
+    /// data was replaced since this accumulator was created (`Module::to`, loading by
+    /// assignment: `Tensor::set_data`, `Tensor::assign_data`), also with the same dtype and
+    /// device, which PyTorch accepts for `to` (and avoids for assignment by creating a new
+    /// parameter): the graph was computed from the old data, and the gradient may not match the
+    /// leaf any more. A `.grad` whose metadata no longer match the leaf's is rejected too, so
+    /// that a backward pass never writes a gradient that doesn't match its leaf.
     ///
     /// # Panics
     ///
@@ -62,6 +66,12 @@ impl Node for AccumulateGrad {
                     current.dtype,
                     current.shape,
                     current.device
+                );
+            }
+            if self.leaf.data_gen() != self.data_gen {
+                panic!(
+                    "the data of a leaf was replaced after the graph was recorded; run the \
+                     forward pass again"
                 );
             }
             if !meta::requires_grad(&self.leaf) {
@@ -122,7 +132,9 @@ pub(crate) fn store_retained(t: &Tensor, grad: &Tensor) {
 /// any graph refers to it, so every edge to `t` (including those of saved copies of `t`) leads
 /// to the same `.grad`.
 pub(crate) fn grad_accumulator(t: &Tensor) -> NodeRef {
-    // Reads the tensor's data lock; done before taking its autograd lock.
+    // Reads the tensor's data lock; done before taking its autograd lock. A replacement in
+    // between makes the accumulator record the older generation and refuse the new data.
+    let data_gen = t.data_gen();
     let input_meta = InputMeta::of(t);
     let mut guard = t.autograd_meta();
     let meta = guard.get_or_insert_with(AutogradMeta::default);
@@ -133,8 +145,13 @@ pub(crate) fn grad_accumulator(t: &Tensor) -> NodeRef {
     {
         return node;
     }
-    let node =
-        NodeBuilder::new(vec![]).build_accumulator(AccumulateGrad { leaf: t.clone() }, input_meta);
+    let node = NodeBuilder::new(vec![]).build_accumulator(
+        AccumulateGrad {
+            leaf: t.clone(),
+            data_gen,
+        },
+        input_meta,
+    );
     meta.grad_accumulator = Some(node.downgrade());
     node
 }

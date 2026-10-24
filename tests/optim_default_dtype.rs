@@ -2,7 +2,7 @@
 //! has its own binary.
 
 use homura::nn::Parameter;
-use homura::optim::{Adam, Optimizer};
+use homura::optim::{Adam, Optimizer, TypedOptimizer};
 use homura::{DType, Device};
 
 #[test]

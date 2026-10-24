@@ -13,7 +13,7 @@ use std::io::Write;
 use common::{Case, Golden, assert_close_tol};
 use homura::nn::functional::{CrossEntropyOptions, cross_entropy};
 use homura::nn::{Linear, Module, Parameter, Relu, StateDict};
-use homura::optim::{AdamOptions, AdamW, Optimizer, ParamGroup, Sgd};
+use homura::optim::{AdamOptions, AdamW, Optimizer, ParamGroup, Sgd, TypedOptimizer};
 use homura::{DType, Tensor};
 
 const STEPS: usize = 10;
@@ -41,70 +41,58 @@ impl Mlp {
     }
 }
 
-enum Opt {
-    Sgd(Sgd),
-    AdamW(AdamW),
+/// The optimizer of a case, driven through `dyn Optimizer`, with its state read through the
+/// concrete type.
+trait CaseOptimizer: Optimizer {
+    /// The state tensors of `p`, by PyTorch's names.
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)>;
 }
 
-impl Opt {
-    /// The optimizer of a case, with its options from the file.
-    fn new(kind: &str, case: &Case, model: &Mlp) -> Opt {
-        let opt = |name: &str| case.input(&format!("opt.{name}")).item::<f64>();
-        match kind {
-            "sgd" => Opt::Sgd(
-                Sgd::new(model.parameters(), opt("lr"))
-                    .momentum(opt("momentum"))
-                    .weight_decay(opt("weight_decay")),
-            ),
-            "adamw" => {
-                let weights = vec![model.fc1.weight.clone(), model.fc2.weight.clone()];
-                let bias = |l: &Linear| l.bias.clone().unwrap();
-                let biases = vec![bias(&model.fc1), bias(&model.fc2)];
-                let mut o = AdamW::new(weights, opt("lr")).weight_decay(opt("weight_decay"));
-                let options = AdamOptions {
-                    weight_decay: opt("bias_weight_decay"),
-                    ..*o.defaults()
-                };
-                o.add_param_group(ParamGroup::new(biases, options));
-                Opt::AdamW(o)
-            }
-            _ => unreachable!("{kind}"),
-        }
-    }
-
-    fn zero_grad(&mut self) {
-        match self {
-            Opt::Sgd(o) => o.zero_grad(),
-            Opt::AdamW(o) => o.zero_grad(),
-        }
-    }
-
-    fn step(&mut self) {
-        match self {
-            Opt::Sgd(o) => o.step(),
-            Opt::AdamW(o) => o.step(),
-        }
-    }
-
-    /// The state tensors of `p`, by PyTorch's names.
+impl CaseOptimizer for Sgd {
     fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
-        match self {
-            Opt::Sgd(o) => o
-                .state(p)
-                .map(|s| vec![("momentum_buffer", s.momentum_buffer().clone())])
-                .unwrap_or_default(),
-            Opt::AdamW(o) => o
-                .state(p)
-                .map(|s| {
-                    assert!(s.max_exp_avg_sq().is_none());
-                    vec![
-                        ("step", s.step().clone()),
-                        ("exp_avg", s.exp_avg().clone()),
-                        ("exp_avg_sq", s.exp_avg_sq().clone()),
-                    ]
-                })
-                .unwrap_or_default(),
+        Sgd::state(self, p)
+            .map(|s| vec![("momentum_buffer", s.momentum_buffer().clone())])
+            .unwrap_or_default()
+    }
+}
+
+impl CaseOptimizer for AdamW {
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
+        AdamW::state(self, p)
+            .map(|s| {
+                assert!(s.max_exp_avg_sq().is_none());
+                vec![
+                    ("step", s.step().clone()),
+                    ("exp_avg", s.exp_avg().clone()),
+                    ("exp_avg_sq", s.exp_avg_sq().clone()),
+                ]
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The optimizer of a case, with its options from the file.
+fn optimizer(kind: &str, case: &Case, model: &Mlp) -> Box<dyn CaseOptimizer> {
+    let opt = |name: &str| case.input(&format!("opt.{name}")).item::<f64>();
+    match kind {
+        "sgd" => Box::new(
+            Sgd::new(model.parameters(), opt("lr"))
+                .momentum(opt("momentum"))
+                .weight_decay(opt("weight_decay")),
+        ),
+        "adamw" => {
+            let weights = vec![model.fc1.weight.clone(), model.fc2.weight.clone()];
+            let bias = |l: &Linear| l.bias.clone().unwrap();
+            let biases = vec![bias(&model.fc1), bias(&model.fc2)];
+            let mut o = AdamW::new(weights, opt("lr")).weight_decay(opt("weight_decay"));
+            let options = AdamOptions {
+                weight_decay: opt("bias_weight_decay"),
+                ..*o.defaults()
+            };
+            o.add_param_group(ParamGroup::new(biases, options));
+            Box::new(o)
         }
+        _ => unreachable!("{kind}"),
     }
 }
 
@@ -181,7 +169,7 @@ fn mlp_training_matches_pytorch() {
             let keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, KEYS, "PyTorch's parameter order");
 
-            let mut opt = Opt::new(kind, &c, &model);
+            let mut opt = optimizer(kind, &c, &model);
             for t in 0..STEPS {
                 opt.zero_grad();
                 assert!(params.iter().all(|(_, p)| p.grad().is_none()));

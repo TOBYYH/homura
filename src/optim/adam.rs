@@ -1,8 +1,8 @@
 //! [`Adam`] and [`AdamW`].
 
 use super::{
-    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, addcdiv, addcmul, check_coefficients,
-    check_state_tensor, computation, lerp, scaled_add,
+    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, TypedOptimizer, addcdiv, addcmul,
+    check_coefficients, check_state_tensor, computation, lerp, scaled_add,
 };
 use crate::nn::Parameter;
 use crate::{DType, Device, Tensor};
@@ -201,6 +201,14 @@ impl GroupOptions for AdamOptions {
     fn check(&self) {
         check(self);
     }
+
+    fn lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
 }
 
 /// The checks of PyTorch's `Adam()`; NaN fails them, as there.
@@ -224,7 +232,8 @@ fn check(o: &AdamOptions) {
     }
 }
 
-/// The chained option methods, `state` and the [`Optimizer`] implementation of Adam and AdamW.
+/// The chained option methods, `state` and the [`Optimizer`] and [`TypedOptimizer`]
+/// implementations of Adam and AdamW.
 macro_rules! adam_methods {
     ($name:ident) => {
         impl $name {
@@ -289,8 +298,6 @@ macro_rules! adam_methods {
         }
 
         impl Optimizer for $name {
-            type Options = AdamOptions;
-
             fn step(&mut self) {
                 self.0.step();
             }
@@ -298,6 +305,26 @@ macro_rules! adam_methods {
             fn zero_grad(&mut self) {
                 self.0.groups.zero_grad();
             }
+
+            fn num_param_groups(&self) -> usize {
+                self.0.groups.groups.len()
+            }
+
+            fn params(&self, group: usize) -> &[Parameter] {
+                self.0.groups.group(group).params()
+            }
+
+            fn lr(&self, group: usize) -> f64 {
+                self.0.groups.lr(group)
+            }
+
+            fn set_lr(&mut self, group: usize, lr: f64) {
+                self.0.groups.set_lr(group, lr);
+            }
+        }
+
+        impl TypedOptimizer for $name {
+            type Options = AdamOptions;
 
             fn defaults(&self) -> &AdamOptions {
                 &self.0.groups.defaults

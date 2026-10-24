@@ -20,7 +20,7 @@ use homura::nn::{
     AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Flatten, Linear, MaxPool2d, Module, Parameter, Relu,
     Sequential, StateDict,
 };
-use homura::optim::{AdamOptions, AdamW, Optimizer, ParamGroup, Sgd};
+use homura::optim::{AdamOptions, AdamW, Optimizer, ParamGroup, Sgd, TypedOptimizer};
 use homura::{DType, Tensor};
 
 const STEPS: usize = 10;
@@ -63,78 +63,66 @@ fn forward(model: &Sequential, x: &Tensor) -> (Tensor, Tensor, Tensor) {
     (h, pre.unwrap(), indices.unwrap())
 }
 
-enum Opt {
-    Sgd(Sgd),
-    AdamW(AdamW),
+/// The optimizer of a case, driven through `dyn Optimizer`, with its state read through the
+/// concrete type.
+trait CaseOptimizer: Optimizer {
+    /// The state tensors of `p`, by PyTorch's names.
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)>;
 }
 
-impl Opt {
-    /// The optimizer of a case, with its options from the file.
-    fn new(kind: &str, case: &Case, params: &[(String, Parameter)]) -> Opt {
-        let opt = |name: &str| case.input(&format!("opt.{name}")).item::<f64>();
-        let all = || params.iter().map(|(_, p)| p.clone());
-        match kind {
-            "sgd" => Opt::Sgd(
-                Sgd::new(all(), opt("lr"))
-                    .momentum(opt("momentum"))
-                    .weight_decay(opt("weight_decay")),
-            ),
-            "adamw" => {
-                let (weights, others): (Vec<_>, Vec<_>) = params
-                    .iter()
-                    .partition(|(k, _)| WEIGHTS.contains(&k.as_str()));
-                let parameters = |group: Vec<&(String, Parameter)>| {
-                    group
-                        .into_iter()
-                        .map(|(_, p)| p.clone())
-                        .collect::<Vec<_>>()
-                };
-                let mut o =
-                    AdamW::new(parameters(weights), opt("lr")).weight_decay(opt("weight_decay"));
-                let options = AdamOptions {
-                    weight_decay: opt("other_weight_decay"),
-                    ..*o.defaults()
-                };
-                o.add_param_group(ParamGroup::new(parameters(others), options));
-                Opt::AdamW(o)
-            }
-            _ => unreachable!("{kind}"),
-        }
-    }
-
-    fn zero_grad(&mut self) {
-        match self {
-            Opt::Sgd(o) => o.zero_grad(),
-            Opt::AdamW(o) => o.zero_grad(),
-        }
-    }
-
-    fn step(&mut self) {
-        match self {
-            Opt::Sgd(o) => o.step(),
-            Opt::AdamW(o) => o.step(),
-        }
-    }
-
-    /// The state tensors of `p`, by PyTorch's names.
+impl CaseOptimizer for Sgd {
     fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
-        match self {
-            Opt::Sgd(o) => o
-                .state(p)
-                .map(|s| vec![("momentum_buffer", s.momentum_buffer().clone())])
-                .unwrap_or_default(),
-            Opt::AdamW(o) => o
-                .state(p)
-                .map(|s| {
-                    assert!(s.max_exp_avg_sq().is_none());
-                    vec![
-                        ("step", s.step().clone()),
-                        ("exp_avg", s.exp_avg().clone()),
-                        ("exp_avg_sq", s.exp_avg_sq().clone()),
-                    ]
-                })
-                .unwrap_or_default(),
+        Sgd::state(self, p)
+            .map(|s| vec![("momentum_buffer", s.momentum_buffer().clone())])
+            .unwrap_or_default()
+    }
+}
+
+impl CaseOptimizer for AdamW {
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
+        AdamW::state(self, p)
+            .map(|s| {
+                assert!(s.max_exp_avg_sq().is_none());
+                vec![
+                    ("step", s.step().clone()),
+                    ("exp_avg", s.exp_avg().clone()),
+                    ("exp_avg_sq", s.exp_avg_sq().clone()),
+                ]
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The optimizer of a case, with its options from the file.
+fn optimizer(kind: &str, case: &Case, params: &[(String, Parameter)]) -> Box<dyn CaseOptimizer> {
+    let opt = |name: &str| case.input(&format!("opt.{name}")).item::<f64>();
+    let all = || params.iter().map(|(_, p)| p.clone());
+    match kind {
+        "sgd" => Box::new(
+            Sgd::new(all(), opt("lr"))
+                .momentum(opt("momentum"))
+                .weight_decay(opt("weight_decay")),
+        ),
+        "adamw" => {
+            let (weights, others): (Vec<_>, Vec<_>) = params
+                .iter()
+                .partition(|(k, _)| WEIGHTS.contains(&k.as_str()));
+            let parameters = |group: Vec<&(String, Parameter)>| {
+                group
+                    .into_iter()
+                    .map(|(_, p)| p.clone())
+                    .collect::<Vec<_>>()
+            };
+            let mut o =
+                AdamW::new(parameters(weights), opt("lr")).weight_decay(opt("weight_decay"));
+            let options = AdamOptions {
+                weight_decay: opt("other_weight_decay"),
+                ..*o.defaults()
+            };
+            o.add_param_group(ParamGroup::new(parameters(others), options));
+            Box::new(o)
         }
+        _ => unreachable!("{kind}"),
     }
 }
 
@@ -246,7 +234,7 @@ fn cnn_training_matches_pytorch() {
             let buffers: Vec<String> = model.named_buffers().into_iter().map(|(k, _)| k).collect();
             assert_eq!(buffers, BUFFERS);
 
-            let mut opt = Opt::new(kind, &c, &params);
+            let mut opt = optimizer(kind, &c, &params);
             for t in 0..STEPS {
                 opt.zero_grad();
                 assert!(params.iter().all(|(_, p)| p.grad().is_none()));

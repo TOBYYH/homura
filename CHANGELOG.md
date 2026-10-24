@@ -18,9 +18,21 @@ All notable changes to this project are documented in this file. The format is b
   `x.view([batch * seq, hidden])`, `x.index((.., ..n))`. `IntoShapeSpec` also accepts tuples of
   up to 8 sizes whose types may differ, as in `x.view((batch, seq, -1))`, and `()` for a
   zero-dimensional shape. A `usize` above `i64::MAX` panics.
+- `optim::Optimizer` is object safe: a training loop, and later learning rate schedules and
+  gradient clipping, can drive any optimizer through `&mut dyn Optimizer` or `Box<dyn Optimizer>`,
+  also several of different types in one `Vec`. It has new methods for the groups:
+  `num_param_groups`, `params(group)`, `lr(group)` and `set_lr(group, lr)`, which changes the
+  learning rate of that group only, after checking the group's options with it like
+  `add_param_group` (the group is unchanged if they are invalid). `Box<O>` and `&mut O` implement
+  `Optimizer` and `TypedOptimizer` for an `O` that does, trait objects included.
 
 ### Changed
 
+- **Breaking**: the methods of `optim::Optimizer` that use the optimizer's options type moved to
+  the new trait `optim::TypedOptimizer: Optimizer`, which has the associated type `Options`:
+  `defaults`, `param_groups`, `options_mut` and `add_param_group`. Code that calls them needs
+  `use homura::optim::TypedOptimizer`, and `dyn Optimizer<Options = SgdOptions>` becomes
+  `dyn TypedOptimizer<Options = SgdOptions>`, which converts to `dyn Optimizer`.
 - **Breaking**: since shape, dimension and index arguments have several integer types to choose
   from, an unsuffixed integer literal in them now has the type `i32`, Rust's fallback, instead of
   `i64`, and a list without literals has no type to infer. Three kinds of code no longer compile:

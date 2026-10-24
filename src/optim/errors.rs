@@ -7,7 +7,7 @@
 ///
 /// ```
 /// use homura::nn::Parameter;
-/// use homura::optim::{Optimizer, ParamGroup, Sgd, SgdOptions};
+/// use homura::optim::{ParamGroup, Sgd, SgdOptions, TypedOptimizer};
 ///
 /// let (a, b) = (Parameter::new(homura::ones([2])), Parameter::new(homura::ones([2])));
 /// let mut opt = Sgd::new([a], 0.1);
@@ -22,7 +22,7 @@
 ///
 /// ```compile_fail,E0599
 /// # use homura::nn::Parameter;
-/// # use homura::optim::{Optimizer, Sgd};
+/// # use homura::optim::{Sgd, TypedOptimizer};
 /// let mut opt = Sgd::new([Parameter::new(homura::ones([2]))], 0.1);
 /// opt.param_groups_mut().swap(0, 0);
 /// ```
@@ -31,7 +31,7 @@
 ///
 /// ```compile_fail,E0596
 /// # use homura::nn::Parameter;
-/// # use homura::optim::{Optimizer, ParamGroup, Sgd};
+/// # use homura::optim::{ParamGroup, Sgd, TypedOptimizer};
 /// let mut opt = Sgd::new([Parameter::new(homura::ones([2]))], 0.1);
 /// opt.add_param_group(ParamGroup::new([], *opt.defaults()));
 /// opt.param_groups().swap(0, 1);
@@ -41,7 +41,7 @@
 ///
 /// ```compile_fail,E0594
 /// # use homura::nn::Parameter;
-/// # use homura::optim::{Optimizer, ParamGroup, Sgd};
+/// # use homura::optim::{ParamGroup, Sgd, TypedOptimizer};
 /// let mut opt = Sgd::new([Parameter::new(homura::ones([2]))], 0.1);
 /// let other = ParamGroup::new([Parameter::new(homura::ones([2]))], *opt.defaults());
 /// opt.param_groups()[0] = other;
@@ -51,7 +51,7 @@
 ///
 /// ```compile_fail,E0594
 /// # use homura::nn::Parameter;
-/// # use homura::optim::{Optimizer, Sgd};
+/// # use homura::optim::{Sgd, TypedOptimizer};
 /// let mut opt = Sgd::new([Parameter::new(homura::ones([2]))], 0.1);
 /// opt.param_groups()[0].options.lr = 0.01;
 /// ```

@@ -11,6 +11,7 @@ use common::{Case, Golden};
 use homura::nn::{Module, Parameter};
 use homura::optim::{
     Adam, AdamOptions, AdamState, AdamW, Optimizer, ParamGroup, Sgd, SgdOptions, SgdState,
+    TypedOptimizer,
 };
 use homura::{DType, Device, Tensor};
 
@@ -54,60 +55,57 @@ fn assert_same(actual: &Tensor, expected: &Tensor, what: &str) {
     }
 }
 
-/// The optimizers of the golden file, built from a case's options.
-enum Any {
-    Sgd(Sgd),
-    Adam(Adam),
-    AdamW(AdamW),
+/// The optimizers of the golden file, built from a case's options and driven through
+/// `dyn Optimizer`; their state is read through the concrete type.
+trait CaseOptimizer: Optimizer {
+    /// The state tensors of `p`, by PyTorch's names.
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)>;
 }
 
-impl Any {
-    fn step(&mut self) {
-        match self {
-            Any::Sgd(o) => o.step(),
-            Any::Adam(o) => o.step(),
-            Any::AdamW(o) => o.step(),
+/// The state tensors of an Adam or AdamW parameter.
+fn adam_tensors(s: Option<&AdamState>) -> Vec<(&'static str, Tensor)> {
+    s.map(|s| {
+        let mut out = vec![
+            ("step", s.step().clone()),
+            ("exp_avg", s.exp_avg().clone()),
+            ("exp_avg_sq", s.exp_avg_sq().clone()),
+        ];
+        if let Some(m) = s.max_exp_avg_sq() {
+            out.push(("max_exp_avg_sq", m.clone()));
         }
-    }
+        out
+    })
+    .unwrap_or_default()
+}
 
-    fn halve_first_lr(&mut self) {
-        match self {
-            Any::Sgd(o) => o.options_mut(0).lr *= 0.5,
-            Any::Adam(o) => o.options_mut(0).lr *= 0.5,
-            Any::AdamW(o) => o.options_mut(0).lr *= 0.5,
-        }
-    }
-
-    /// The state tensors of `p`, by PyTorch's names.
+impl CaseOptimizer for Sgd {
     fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
-        let adam = |s: Option<&AdamState>| {
-            s.map(|s| {
-                let mut out = vec![
-                    ("step", s.step().clone()),
-                    ("exp_avg", s.exp_avg().clone()),
-                    ("exp_avg_sq", s.exp_avg_sq().clone()),
-                ];
-                if let Some(m) = s.max_exp_avg_sq() {
-                    out.push(("max_exp_avg_sq", m.clone()));
-                }
-                out
-            })
+        Sgd::state(self, p)
+            .map(|s: &SgdState| vec![("momentum_buffer", s.momentum_buffer().clone())])
             .unwrap_or_default()
-        };
-        match self {
-            Any::Sgd(o) => o
-                .state(p)
-                .map(|s: &SgdState| vec![("momentum_buffer", s.momentum_buffer().clone())])
-                .unwrap_or_default(),
-            Any::Adam(o) => adam(o.state(p)),
-            Any::AdamW(o) => adam(o.state(p)),
-        }
+    }
+}
+
+impl CaseOptimizer for Adam {
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
+        adam_tensors(Adam::state(self, p))
+    }
+}
+
+impl CaseOptimizer for AdamW {
+    fn state(&self, p: &Parameter) -> Vec<(&'static str, Tensor)> {
+        adam_tensors(AdamW::state(self, p))
     }
 }
 
 /// The optimizer of a case, with the group `first` and, if given, a group `second` with twice
 /// the learning rate.
-fn build(kind: &str, case: &Case, first: Vec<Parameter>, second: Option<Parameter>) -> Any {
+fn build(
+    kind: &str,
+    case: &Case,
+    first: Vec<Parameter>,
+    second: Option<Parameter>,
+) -> Box<dyn CaseOptimizer> {
     let opt = |name: &str| case.input(&format!("opt.{name}")).item::<f64>();
     let flag = |name: &str| opt(name) != 0.0;
     match kind {
@@ -125,7 +123,7 @@ fn build(kind: &str, case: &Case, first: Vec<Parameter>, second: Option<Paramete
             if second.is_some() {
                 o.add_param_group(ParamGroup::new(second, options));
             }
-            Any::Sgd(o)
+            Box::new(o)
         }
         "adam" | "adamw" => {
             let betas = (opt("beta1"), opt("beta2"));
@@ -149,9 +147,9 @@ fn build(kind: &str, case: &Case, first: Vec<Parameter>, second: Option<Paramete
                 }};
             }
             if kind == "adam" {
-                Any::Adam(adam!(Adam))
+                Box::new(adam!(Adam))
             } else {
-                Any::AdamW(adam!(AdamW))
+                Box::new(adam!(AdamW))
             }
         }
         _ => unreachable!("{kind}"),
@@ -175,7 +173,8 @@ fn multi_step_golden() {
         let mut opt = build(kind, &case, first, Some(params[1].clone()));
         for t in 0..STEPS {
             if t == 2 {
-                opt.halve_first_lr();
+                // PyTorch's `param_groups[0]["lr"] *= 0.5`.
+                opt.set_lr(0, opt.lr(0) * 0.5);
             }
             for (p, n) in params.iter().zip(PARAMS) {
                 let key = format!("grad{t}.{n}");
@@ -507,6 +506,276 @@ fn options_mut_keeps_the_state_with_its_parameter() {
         },
         "parameter group index 2 is out of range for 2 groups",
     );
+}
+
+/// The gradient of step `t` for `p`, which depends on its current values, so that two runs agree
+/// after the last step only if every step agreed.
+fn trajectory_grad(p: &Parameter, t: usize) {
+    p.set_grad(Some(p.detach().pow(2.0).sub(t as f64).mul(0.5)));
+}
+
+/// The bits of the values of each of `params` and of their state in `opt`.
+fn bits(opt: &dyn CaseOptimizer, params: &[Parameter]) -> Vec<Vec<u64>> {
+    let mut out = vec![];
+    for p in params {
+        out.push(values(p).iter().map(|v| v.to_bits()).collect());
+        for (_, s) in opt.state(p) {
+            out.push(values(&s).iter().map(|v| v.to_bits()).collect());
+        }
+    }
+    out
+}
+
+/// D19 of M3: one loop drives optimizers of different types through `Box<dyn Optimizer>`, with
+/// the results of calling the concrete types. The gradients depend on the parameters, so the
+/// momentum and Adam states are compared through them.
+#[test]
+fn boxed_optimizers_step_like_the_concrete_types() {
+    let init: [&[f64]; 3] = [&[0.5, -1.0, 2.0], &[1.5, 0.25], &[-0.75]];
+    let make = || {
+        let ps: Vec<Parameter> = init.iter().map(|v| param(v)).collect();
+        let sgd = Sgd::new([ps[0].clone()], 0.1).momentum(0.9).nesterov(true);
+        let mut adamw = AdamW::new([ps[1].clone()], 0.05).weight_decay(0.1);
+        let options = AdamOptions {
+            lr: 0.2,
+            ..*adamw.defaults()
+        };
+        adamw.add_param_group(ParamGroup::new([ps[2].clone()], options));
+        (ps, sgd, adamw)
+    };
+    let (direct, mut sgd, mut adamw) = make();
+    for t in 0..4 {
+        sgd.zero_grad();
+        adamw.zero_grad();
+        direct.iter().for_each(|p| trajectory_grad(p, t));
+        sgd.step();
+        adamw.step();
+    }
+    let (boxed, sgd2, adamw2) = make();
+    let mut opts: Vec<Box<dyn Optimizer>> = vec![Box::new(sgd2), Box::new(adamw2)];
+    for t in 0..4 {
+        opts.iter_mut().for_each(|o| o.zero_grad());
+        boxed.iter().for_each(|p| trajectory_grad(p, t));
+        opts.iter_mut().for_each(|o| o.step());
+    }
+    for (i, (d, b)) in direct.iter().zip(&boxed).enumerate() {
+        assert_same(b, d, &format!("parameter {i}"));
+        assert_ne!(values(d), init[i], "parameter {i} moved");
+    }
+}
+
+/// `set_lr` is `options_mut(group).lr = lr`: with learning rates that change at every step in
+/// two groups, the parameters and the state are the same bit for bit, for every optimizer.
+#[test]
+fn set_lr_is_setting_the_lr_option() {
+    fn check<O: TypedOptimizer + CaseOptimizer>(
+        make: impl Fn(Vec<Parameter>) -> O,
+        lr_option: impl Fn(&mut O::Options) -> &mut f64,
+    ) {
+        let lrs = [[0.1, 0.3], [0.05, 0.0], [0.2, 0.15], [0.01, 0.4]];
+        let init: [&[f64]; 3] = [&[0.5, -1.0], &[2.0], &[1.5, 0.25, -0.75]];
+        let run = |through_set_lr: bool| {
+            let ps: Vec<Parameter> = init.iter().map(|v| param(v)).collect();
+            let mut opt = make(ps.clone());
+            for (t, lr) in lrs.iter().enumerate() {
+                for (g, &lr) in lr.iter().enumerate() {
+                    if through_set_lr {
+                        // Through the object-safe trait, as a schedule would.
+                        let dyn_opt: &mut dyn Optimizer = &mut opt;
+                        dyn_opt.set_lr(g, lr);
+                    } else {
+                        *lr_option(opt.options_mut(g)) = lr;
+                    }
+                }
+                assert_eq!([opt.lr(0), opt.lr(1)], *lr);
+                ps.iter().for_each(|p| trajectory_grad(p, t));
+                opt.step();
+            }
+            bits(&opt, &ps)
+        };
+        assert_eq!(run(true), run(false));
+    }
+    // The first two parameters in the first group, the third in a second one.
+    fn groups<O: TypedOptimizer>(mut opt: O, ps: &[Parameter]) -> O
+    where
+        O::Options: Copy,
+    {
+        let options = *opt.defaults();
+        opt.add_param_group(ParamGroup::new([ps[2].clone()], options));
+        opt
+    }
+    check(
+        |ps| {
+            groups(
+                Sgd::new(ps[..2].to_vec(), 0.1).momentum(0.9).dampening(0.1),
+                &ps,
+            )
+        },
+        |o: &mut SgdOptions| &mut o.lr,
+    );
+    check(
+        |ps| {
+            groups(
+                Adam::new(ps[..2].to_vec(), 0.1)
+                    .amsgrad(true)
+                    .weight_decay(0.1),
+                &ps,
+            )
+        },
+        |o: &mut AdamOptions| &mut o.lr,
+    );
+    check(
+        |ps| groups(AdamW::new(ps[..2].to_vec(), 0.1).maximize(true), &ps),
+        |o: &mut AdamOptions| &mut o.lr,
+    );
+}
+
+/// `set_lr` changes the learning rate of its group only. It checks the options of the group with
+/// the new learning rate like `add_param_group`, with each optimizer's rules for NaN, and keeps
+/// the group as it was if they are invalid.
+#[test]
+fn set_lr_changes_its_group_only() {
+    let mut opt = Sgd::new([param(&[1.0])], 0.1).momentum(0.9);
+    let second = SgdOptions {
+        lr: 0.2,
+        ..*opt.defaults()
+    };
+    opt.add_param_group(ParamGroup::new([param(&[2.0])], second));
+    let (defaults, first) = (*opt.defaults(), opt.param_groups()[0].options);
+    opt.set_lr(1, 0.05);
+    assert_eq!(opt.lr(1), 0.05);
+    assert_eq!(
+        opt.param_groups()[1].options,
+        SgdOptions { lr: 0.05, ..second }
+    );
+    assert_eq!(*opt.defaults(), defaults);
+    assert_eq!(opt.param_groups()[0].options, first);
+    expect_panic(|| opt.set_lr(1, -1.0), "Invalid learning rate: -1");
+    assert_eq!(opt.lr(1), 0.05);
+    // NaN and infinity pass SGD's checks, as in PyTorch.
+    opt.set_lr(0, f64::NAN);
+    assert!(opt.lr(0).is_nan());
+    opt.set_lr(0, f64::INFINITY);
+    assert_eq!(opt.lr(0), f64::INFINITY);
+    // The other options of the group are checked too.
+    opt.options_mut(1).nesterov = true;
+    opt.options_mut(1).dampening = 0.5;
+    let before = opt.param_groups()[1].options;
+    expect_panic(
+        || opt.set_lr(1, 0.01),
+        "Nesterov momentum requires a momentum and zero dampening",
+    );
+    assert_eq!(opt.param_groups()[1].options, before);
+    assert_eq!(*opt.defaults(), defaults);
+
+    for mut adam in [
+        Box::new(Adam::new([param(&[1.0])], 0.1)) as Box<dyn TypedOptimizer<Options = AdamOptions>>,
+        Box::new(AdamW::new([param(&[1.0])], 0.1)),
+    ] {
+        let before = adam.param_groups()[0].options;
+        expect_panic(|| adam.set_lr(0, f64::NAN), "Invalid learning rate: NaN");
+        expect_panic(|| adam.set_lr(0, -0.5), "Invalid learning rate: -0.5");
+        assert_eq!(adam.param_groups()[0].options, before);
+        adam.set_lr(0, f64::INFINITY);
+        assert_eq!(adam.lr(0), f64::INFINITY);
+        adam.options_mut(0).eps = -1.0;
+        expect_panic(|| adam.set_lr(0, 0.5), "Invalid epsilon value: -1");
+        assert_eq!(adam.lr(0), f64::INFINITY);
+    }
+}
+
+/// The parameters and learning rates of the groups through `Optimizer`, and the errors for a
+/// group that doesn't exist.
+#[test]
+fn group_parameters_and_learning_rates() {
+    let (a, b, c) = (param(&[1.0]), param(&[2.0]), param(&[3.0]));
+    let mut opt = AdamW::new([b.clone(), a.clone()], 0.1);
+    let options = AdamOptions {
+        lr: 0.3,
+        ..*opt.defaults()
+    };
+    opt.add_param_group(ParamGroup::new([c.clone()], options));
+    let opt: &mut dyn Optimizer = &mut opt;
+    assert_eq!(opt.num_param_groups(), 2);
+    let firsts = opt.params(0);
+    assert!(firsts.len() == 2 && firsts[0].is_same(&b) && firsts[1].is_same(&a));
+    assert!(opt.params(1).len() == 1 && opt.params(1)[0].is_same(&c));
+    assert_eq!([opt.lr(0), opt.lr(1)], [0.1, 0.3]);
+    let message = "parameter group index 2 is out of range for 2 groups";
+    expect_panic(
+        || {
+            opt.params(2);
+        },
+        message,
+    );
+    expect_panic(
+        || {
+            opt.lr(2);
+        },
+        message,
+    );
+    expect_panic(|| opt.set_lr(2, 0.1), message);
+    expect_panic(
+        || {
+            Sgd::new([param(&[1.0])], 0.1).lr(usize::MAX);
+        },
+        &format!(
+            "parameter group index {} is out of range for 1 groups",
+            usize::MAX
+        ),
+    );
+    assert_eq!([opt.lr(0), opt.lr(1)], [0.1, 0.3]);
+}
+
+/// Generic code over `Optimizer` and `TypedOptimizer` takes an optimizer, a `Box` of it or a
+/// `&mut` borrow, of a concrete type or a trait object, also one that borrows a local optimizer
+/// (not `'static`).
+#[test]
+fn optimizers_through_box_and_mut_references() {
+    fn run<O: Optimizer>(mut opt: O, p: &Parameter) -> f64 {
+        assert_eq!(opt.num_param_groups(), 1);
+        assert!(opt.params(0)[0].is_same(p));
+        grad(p, &[1.0]);
+        let before = values(p);
+        opt.step();
+        assert_ne!(values(p), before);
+        opt.zero_grad();
+        assert!(p.grad().is_none());
+        opt.set_lr(0, opt.lr(0) * 2.0);
+        opt.lr(0)
+    }
+    let p = param(&[1.0]);
+    let mut sgd = Sgd::new([p.clone()], 0.125);
+    assert_eq!(run(&mut sgd, &p), 0.25);
+    let borrowed: Box<dyn Optimizer + '_> = Box::new(&mut sgd);
+    assert_eq!(run(borrowed, &p), 0.5);
+    let local: &mut dyn Optimizer = &mut sgd;
+    assert_eq!(run(&mut *local, &p), 1.0);
+    assert_eq!(run(local, &p), 2.0);
+    let mut boxed: Box<dyn Optimizer> = Box::new(sgd);
+    assert_eq!(run(&mut boxed, &p), 4.0);
+    assert_eq!(run(boxed, &p), 8.0);
+
+    fn typed<O: TypedOptimizer<Options = SgdOptions>>(mut opt: O) {
+        let n = opt.param_groups().len();
+        opt.options_mut(0).momentum += 0.25;
+        let options = *opt.defaults();
+        opt.add_param_group(ParamGroup::new([param(&[0.0])], options));
+        assert_eq!(opt.param_groups().len(), n + 1);
+        assert_eq!(opt.num_param_groups(), n + 1);
+    }
+    let mut sgd = Sgd::new([param(&[1.0])], 0.1);
+    typed(&mut sgd);
+    typed(Box::new(&mut sgd));
+    let local: &mut dyn TypedOptimizer<Options = SgdOptions> = &mut sgd;
+    typed(&mut *local);
+    // Upcast to the object-safe trait.
+    let upcast: &mut dyn Optimizer = local;
+    assert_eq!(upcast.num_param_groups(), 4);
+    let boxed: Box<dyn TypedOptimizer<Options = SgdOptions>> = Box::new(sgd);
+    let mut boxed = boxed;
+    typed(&mut boxed);
+    typed(boxed);
 }
 
 #[test]

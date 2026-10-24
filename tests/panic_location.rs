@@ -16,7 +16,7 @@ use homura::nn::functional::{
     self as F, BatchNormOptions, Conv2dOptions, Conv2dPadding, CrossEntropyOptions, Reduction,
 };
 use homura::nn::{self, Forward, Member, Module, Parameter, StateDict, Visitor};
-use homura::optim::{Adam, Optimizer, ParamGroup, Sgd, SgdOptions};
+use homura::optim::{Adam, Optimizer, ParamGroup, Sgd, SgdOptions, TypedOptimizer};
 use homura::{DType, Device, Tensor};
 
 thread_local! {
@@ -286,19 +286,51 @@ fn optimizers() {
         q.set_grad(Some(homura::ones_like(q)));
     }
     at!(sgd.step());
+    at!(sgd.params(1));
+    at!(sgd.lr(1));
+    at!(sgd.set_lr(1, 0.1));
+    // Valid with the new learning rate but not with the momentum.
+    sgd.options_mut(0).momentum = -1.0;
+    at!(sgd.set_lr(0, 0.1));
     let mut sgd = Sgd::new(p.clone(), 0.1);
     sgd.options_mut(0).nesterov = true;
-    let dyn_opt: &mut dyn Optimizer<Options = SgdOptions> = &mut sgd;
-    at!(dyn_opt.step());
+    let typed: &mut dyn TypedOptimizer<Options = SgdOptions> = &mut sgd;
     let invalid = SgdOptions {
         lr: -1.0,
-        ..*dyn_opt.defaults()
+        ..*typed.defaults()
     };
-    at!(dyn_opt.add_param_group(ParamGroup::new(p.clone(), invalid)));
-    at!(dyn_opt.options_mut(3));
-    let mut boxed: Box<dyn Optimizer<Options = SgdOptions>> = Box::new(Sgd::new(params(), 0.1));
+    at!(typed.add_param_group(ParamGroup::new(p.clone(), invalid)));
+    at!(typed.options_mut(3));
+    at!(typed.step());
+    let dyn_opt: &mut dyn Optimizer = typed;
+    at!(dyn_opt.step());
+    at!(dyn_opt.params(2));
+    at!(dyn_opt.lr(2));
+    at!(dyn_opt.set_lr(2, 0.1));
+    at!(dyn_opt.set_lr(0, 0.1));
+    let mut boxed: Box<dyn TypedOptimizer<Options = SgdOptions>> =
+        Box::new(Sgd::new(params(), 0.1));
+    at!(boxed.options_mut(1));
     boxed.options_mut(0).momentum = -2.0;
     at!(boxed.step());
+    let mut boxed: Box<dyn Optimizer> = Box::new(Adam::new(params(), 0.1));
+    at!(boxed.set_lr(0, f64::NAN));
+    at!(boxed.lr(1));
+    // Generic code over the traits, through the forwarding implementations of `&mut` and `Box`;
+    // the functions pass the location on.
+    #[track_caller]
+    fn set_invalid_lr(mut opt: impl Optimizer) {
+        opt.set_lr(0, -1.0);
+    }
+    #[track_caller]
+    fn add(mut opt: impl TypedOptimizer<Options = SgdOptions>, group: ParamGroup<SgdOptions>) {
+        opt.add_param_group(group);
+    }
+    at!(set_invalid_lr(&mut boxed));
+    at!(set_invalid_lr(boxed));
+    let mut sgd = Sgd::new(params(), 0.1);
+    at!(add(&mut sgd, ParamGroup::new(params(), invalid)));
+    at!(add(Box::new(&mut sgd), ParamGroup::new(params(), invalid)));
     // A finite coefficient that overflows the parameter's dtype: a per-parameter check.
     let half = vec![Parameter::new(homura::ones_with([2], DType::F16))];
     half[0].set_grad(Some(homura::ones_with([2], DType::F16)));

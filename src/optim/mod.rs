@@ -5,8 +5,13 @@
 //! parameters in place from their gradients, under [`no_grad`](crate::no_grad);
 //! [`zero_grad`](Optimizer::zero_grad) clears the gradients, setting them to `None` like
 //! PyTorch's default. Options that are not arguments of `new` are set by chained methods
-//! (`.momentum(0.9)`), and later through [`options_mut`](Optimizer::options_mut). The
+//! (`.momentum(0.9)`), and later through [`options_mut`](TypedOptimizer::options_mut). The
 //! parameters of a group can't be changed once it is added.
+//!
+//! The methods that every optimizer has, `step`, `zero_grad` and the parameters and learning
+//! rate of each group, are in the object-safe [`Optimizer`] trait, so that one training loop can
+//! drive any optimizer through a `&mut dyn Optimizer`. The methods that use the optimizer's
+//! options type, [`SgdOptions`] or [`AdamOptions`], are in [`TypedOptimizer`].
 //!
 //! ```
 //! use homura::nn::{Linear, Module};
@@ -21,7 +26,7 @@
 //!     loss.backward();
 //!     opt.step();
 //! }
-//! opt.options_mut(0).lr = 0.01;
+//! opt.set_lr(0, 0.01);
 //! ```
 //!
 //! The updates follow PyTorch's single-tensor implementations (the ones it runs on the CPU),
@@ -52,8 +57,8 @@
 //!
 //! - A parameter listed twice in one group is an error; PyTorch warns and updates it twice.
 //! - The parameter groups can't be changed or reordered once added, only their options
-//!   ([`options_mut`](Optimizer::options_mut)): the state of a parameter is kept by its position
-//!   in the groups, where PyTorch keys it by the parameter.
+//!   ([`options_mut`](TypedOptimizer::options_mut), [`set_lr`](Optimizer::set_lr)): the state of
+//!   a parameter is kept by its position in the groups, where PyTorch keys it by the parameter.
 //! - [`step`](Optimizer::step) checks the options of every group, that the parameters with a
 //!   gradient are still leaves, and the shapes, dtypes and devices of their state before it
 //!   updates anything, and panics if one is invalid. PyTorch checks the options and leaves only
@@ -76,13 +81,31 @@ use crate::backend::cpu::{self, Fused};
 use crate::nn::Parameter;
 use crate::{DType, Device, Scalar, Tensor};
 
-/// What PyTorch's `torch.optim.Optimizer` provides: updating parameters from their gradients.
+/// What PyTorch's `torch.optim.Optimizer` provides for any optimizer: updating parameters from
+/// their gradients, and the parameters and learning rate of each group.
 ///
-/// The options of a group are the optimizer's typed options struct, such as [`SgdOptions`].
+/// The trait is object safe: training loops, learning rate schedules and gradient clipping can
+/// take a `&mut dyn Optimizer` or hold a `Box<dyn Optimizer>`, whatever the optimizer. The options
+/// of the groups, which are a type of each optimizer, are in [`TypedOptimizer`].
+///
+/// ```
+/// use homura::nn::{Linear, Module};
+/// use homura::optim::{AdamW, Optimizer, Sgd};
+///
+/// let model = Linear::new(4, 2);
+/// let mut opts: Vec<Box<dyn Optimizer>> = vec![
+///     Box::new(Sgd::new([model.weight.clone()], 0.1)),
+///     Box::new(AdamW::new(model.bias.clone(), 0.01)),
+/// ];
+/// let loss = model.forward(&homura::ones([8, 4])).pow(2.0).mean();
+/// loss.backward();
+/// for opt in &mut opts {
+///     opt.step();
+///     opt.set_lr(0, opt.lr(0) * 0.5);
+/// }
+/// assert_eq!(opts[1].lr(0), 0.005);
+/// ```
 pub trait Optimizer {
-    /// The options of a parameter group.
-    type Options;
-
     /// Updates the parameters from their gradients (`step()`), in place and under
     /// [`no_grad`](crate::no_grad).
     ///
@@ -102,6 +125,56 @@ pub trait Optimizer {
     #[track_caller]
     fn zero_grad(&mut self);
 
+    /// The number of parameter groups (`len(param_groups)`).
+    #[track_caller]
+    fn num_param_groups(&self) -> usize;
+
+    /// The parameters of the parameter group `group` (`param_groups[group]["params"]`), in the
+    /// order they were given.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no group `group`.
+    #[track_caller]
+    fn params(&self, group: usize) -> &[Parameter];
+
+    /// The learning rate of the parameter group `group` (`param_groups[group]["lr"]`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no group `group`.
+    #[track_caller]
+    fn lr(&self, group: usize) -> f64;
+
+    /// Sets the learning rate of the parameter group `group` (`param_groups[group]["lr"] = lr`),
+    /// leaving the defaults and the other groups as they are.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no group `group`, or if the options of the group with the new learning
+    /// rate are invalid, with the checks of
+    /// [`add_param_group`](TypedOptimizer::add_param_group); the group is unchanged then.
+    #[track_caller]
+    fn set_lr(&mut self, group: usize, lr: f64);
+}
+
+/// The options of an optimizer's parameter groups: its typed options struct, such as
+/// [`SgdOptions`], for the defaults, each group and the groups added later.
+///
+/// ```
+/// use homura::nn::Parameter;
+/// use homura::optim::{ParamGroup, Sgd, SgdOptions, TypedOptimizer};
+///
+/// let (a, b) = (Parameter::new(homura::ones([2])), Parameter::new(homura::ones([2])));
+/// let mut opt = Sgd::new([a], 0.1).momentum(0.9);
+/// opt.add_param_group(ParamGroup::new([b], SgdOptions { lr: 0.01, ..*opt.defaults() }));
+/// opt.options_mut(1).momentum = 0.5;
+/// assert_eq!(opt.param_groups()[1].options.momentum, 0.5);
+/// ```
+pub trait TypedOptimizer: Optimizer {
+    /// The options of a parameter group.
+    type Options;
+
     /// The options that [`ParamGroup`]s are based on: the arguments of `new` and the chained
     /// methods (`defaults`). Groups added later can start from them,
     /// `SgdOptions { lr: 0.01, ..*opt.defaults() }`.
@@ -114,7 +187,8 @@ pub trait Optimizer {
 
     /// The options of the parameter group `index`, to change them
     /// (`param_groups[index][..] = ..`). The parameters of a group can't be changed: PyTorch
-    /// keys the state by parameter, homura by position in the groups.
+    /// keys the state by parameter, homura by position in the groups. The options are checked
+    /// by the next [`step`](Optimizer::step).
     ///
     /// # Panics
     ///
@@ -131,6 +205,98 @@ pub trait Optimizer {
     /// parameter appears twice in the group.
     #[track_caller]
     fn add_param_group(&mut self, group: ParamGroup<Self::Options>);
+}
+
+impl<O: Optimizer + ?Sized> Optimizer for Box<O> {
+    fn step(&mut self) {
+        (**self).step();
+    }
+
+    fn zero_grad(&mut self) {
+        (**self).zero_grad();
+    }
+
+    fn num_param_groups(&self) -> usize {
+        (**self).num_param_groups()
+    }
+
+    fn params(&self, group: usize) -> &[Parameter] {
+        (**self).params(group)
+    }
+
+    fn lr(&self, group: usize) -> f64 {
+        (**self).lr(group)
+    }
+
+    fn set_lr(&mut self, group: usize, lr: f64) {
+        (**self).set_lr(group, lr);
+    }
+}
+
+impl<O: Optimizer + ?Sized> Optimizer for &mut O {
+    fn step(&mut self) {
+        (**self).step();
+    }
+
+    fn zero_grad(&mut self) {
+        (**self).zero_grad();
+    }
+
+    fn num_param_groups(&self) -> usize {
+        (**self).num_param_groups()
+    }
+
+    fn params(&self, group: usize) -> &[Parameter] {
+        (**self).params(group)
+    }
+
+    fn lr(&self, group: usize) -> f64 {
+        (**self).lr(group)
+    }
+
+    fn set_lr(&mut self, group: usize, lr: f64) {
+        (**self).set_lr(group, lr);
+    }
+}
+
+impl<O: TypedOptimizer + ?Sized> TypedOptimizer for Box<O> {
+    type Options = O::Options;
+
+    fn defaults(&self) -> &O::Options {
+        (**self).defaults()
+    }
+
+    fn param_groups(&self) -> &[ParamGroup<O::Options>] {
+        (**self).param_groups()
+    }
+
+    fn options_mut(&mut self, index: usize) -> &mut O::Options {
+        (**self).options_mut(index)
+    }
+
+    fn add_param_group(&mut self, group: ParamGroup<O::Options>) {
+        (**self).add_param_group(group);
+    }
+}
+
+impl<O: TypedOptimizer + ?Sized> TypedOptimizer for &mut O {
+    type Options = O::Options;
+
+    fn defaults(&self) -> &O::Options {
+        (**self).defaults()
+    }
+
+    fn param_groups(&self) -> &[ParamGroup<O::Options>] {
+        (**self).param_groups()
+    }
+
+    fn options_mut(&mut self, index: usize) -> &mut O::Options {
+        (**self).options_mut(index)
+    }
+
+    fn add_param_group(&mut self, group: ParamGroup<O::Options>) {
+        (**self).add_param_group(group);
+    }
 }
 
 /// Parameters that an optimizer updates with the same options (PyTorch's param group).
@@ -168,9 +334,15 @@ trait GroupOptions: Copy {
         self.check();
     }
 
-    /// All checks of a group's options, made when it is added and in `step`.
+    /// All checks of a group's options, made when it is added, by `set_lr` and in `step`.
     #[track_caller]
     fn check(&self);
+
+    /// The learning rate, `lr`.
+    fn lr(&self) -> f64;
+
+    /// Sets the learning rate, without checking it.
+    fn set_lr(&mut self, lr: f64);
 }
 
 /// The checks of a step for one parameter with a gradient, made before anything is updated.
@@ -243,13 +415,36 @@ impl<O: GroupOptions, S> Groups<O, S> {
         }
     }
 
+    /// The group `index`.
+    #[track_caller]
+    fn group(&self, index: usize) -> &ParamGroup<O> {
+        match self.groups.get(index) {
+            Some(g) => g,
+            None => out_of_range(index, self.groups.len()),
+        }
+    }
+
     #[track_caller]
     fn options_mut(&mut self, index: usize) -> &mut O {
         let len = self.groups.len();
         match self.groups.get_mut(index) {
             Some(g) => &mut g.options,
-            None => panic!("parameter group index {index} is out of range for {len} groups"),
+            None => out_of_range(index, len),
         }
+    }
+
+    #[track_caller]
+    fn lr(&self, index: usize) -> f64 {
+        self.group(index).options.lr()
+    }
+
+    /// Sets the learning rate of the group `index` if its options with it pass the checks.
+    #[track_caller]
+    fn set_lr(&mut self, index: usize, lr: f64) {
+        let mut options = self.group(index).options;
+        options.set_lr(lr);
+        options.check();
+        self.groups[index].options = options;
     }
 
     fn state(&self, param: &Parameter) -> Option<&S> {
@@ -362,6 +557,11 @@ fn check_coefficients(p: &Tensor, coefficients: impl IntoIterator<Item = (f64, D
             check_coefficient(value, dtype);
         }
     }
+}
+
+#[track_caller]
+fn out_of_range(index: usize, len: usize) -> ! {
+    panic!("parameter group index {index} is out of range for {len} groups");
 }
 
 #[track_caller]

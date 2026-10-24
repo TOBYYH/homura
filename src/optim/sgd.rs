@@ -1,7 +1,7 @@
 //! [`Sgd`]: stochastic gradient descent.
 
 use super::{
-    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, check_coefficients,
+    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, TypedOptimizer, check_coefficients,
     check_state_tensor, scaled_add,
 };
 use crate::Tensor;
@@ -147,8 +147,6 @@ impl Sgd {
 }
 
 impl Optimizer for Sgd {
-    type Options = SgdOptions;
-
     fn step(&mut self) {
         let params = self.groups.prepare(&SgdCheck);
         let _no_grad = crate::no_grad();
@@ -194,6 +192,26 @@ impl Optimizer for Sgd {
         self.groups.zero_grad();
     }
 
+    fn num_param_groups(&self) -> usize {
+        self.groups.groups.len()
+    }
+
+    fn params(&self, group: usize) -> &[Parameter] {
+        self.groups.group(group).params()
+    }
+
+    fn lr(&self, group: usize) -> f64 {
+        self.groups.lr(group)
+    }
+
+    fn set_lr(&mut self, group: usize, lr: f64) {
+        self.groups.set_lr(group, lr);
+    }
+}
+
+impl TypedOptimizer for Sgd {
+    type Options = SgdOptions;
+
     fn defaults(&self) -> &SgdOptions {
         &self.groups.defaults
     }
@@ -230,6 +248,14 @@ impl GroupOptions for SgdOptions {
         if self.nesterov && (self.momentum <= 0.0 || self.dampening != 0.0) {
             panic!("Nesterov momentum requires a momentum and zero dampening");
         }
+    }
+
+    fn lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
     }
 }
 

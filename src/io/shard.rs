@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
+use super::file::{Access, load_shard};
 use super::json::{self, Json};
 use super::safetensors::{self, data_size, snapshot};
 use crate::nn::StateDict;
@@ -278,7 +279,11 @@ fn bad(msg: &str) -> Error {
 
 /// Loads the shards that the index at `path` (open as `file`) lists, in `weight_map` order. Shard
 /// names are relative to the index's directory; each shard is opened and read once.
-pub(super) fn read_index(path: &Path, mut file: File) -> Result<StateDict> {
+///
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`](super::load_mmap).
+pub(super) unsafe fn read_index(path: &Path, mut file: File, access: Access) -> Result<StateDict> {
     if file.metadata()?.len() > MAX_INDEX_LEN {
         return Err(bad("the file is too large"));
     }
@@ -314,7 +319,8 @@ pub(super) fn read_index(path: &Path, mut file: File) -> Result<StateDict> {
     let dir = path.parent().unwrap_or(Path::new(""));
     let mut loaded: HashMap<String, Tensor> = HashMap::new();
     for (file, keys) in shards {
-        let mut tensors: HashMap<String, Tensor> = super::file::load_shard(&dir.join(file))?
+        // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
+        let mut tensors: HashMap<String, Tensor> = unsafe { load_shard(&dir.join(file), access) }?
             .into_iter()
             .collect();
         for key in keys {

@@ -107,6 +107,13 @@ All notable changes to this project are documented in this file. The format is b
 - safetensors files are read from the file straight into each tensor's storage instead of being
   read into memory as a whole first, so loading needs about the size of the tensors, not twice
   that. Saving writes one tensor at a time.
+- `unsafe fn io::load_mmap(path)`, like `torch.load(path, mmap=True)`: loads a safetensors file or
+  a sharded checkpoint's index as `load` does, but the tensors use a private copy-on-write
+  mapping of the files instead of copies (new dependency `memmap2`). Writes to the tensors stay
+  in the process; a file is unmapped when the last tensor using it is dropped. It is `unsafe`
+  because the files must not change while any tensor using them is alive; `load` and the other
+  safe functions never map files. Tensors whose data isn't aligned to their element size in the
+  file are copied, and BOOL data is checked as for `load`.
 
 ### Changed
 

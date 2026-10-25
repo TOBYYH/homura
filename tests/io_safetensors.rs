@@ -1,8 +1,9 @@
-//! safetensors files and the file entry points (M3 step 2a): reading files that Python's
+//! safetensors files and the file entry points (M3 step 2): reading files that Python's
 //! `safetensors` wrote (`tests/golden/m3_safetensors/` from `tools/golden/gen_m3_safetensors.py`),
-//! streamed reads against in-memory ones, malformed files, `__metadata__`, `homura::load` /
-//! `homura::save` and sharded checkpoints. `homura_files_for_python` writes files that
-//! `tools/golden/check_m3_safetensors.py` reads with Python.
+//! streamed and mapped reads against in-memory ones, malformed files, `__metadata__`,
+//! `homura::load` / `homura::save`, `io::load_mmap` and sharded checkpoints.
+//! `homura_files_for_python` writes files that `tools/golden/check_m3_safetensors.py` reads with
+//! Python.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use homura::io::{self, ShardOptions};
 use homura::nn::{self, Module, StateDict};
+use homura::optim::{Optimizer, Sgd};
 use homura::{DType, Device, Error, Tensor};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/m3_safetensors");
@@ -95,6 +97,22 @@ fn file(header: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `io::load_mmap` for files that no test modifies while they are mapped.
+fn load_mmap(path: impl AsRef<Path>) -> homura::Result<StateDict> {
+    // SAFETY: each test writes its files before loading them and replaces a file only after the
+    // tensors mapping it are dropped, or not at all.
+    unsafe { io::load_mmap(path) }
+}
+
+/// Asserts that two state dicts have the same keys, dtypes, shapes and data bytes.
+#[track_caller]
+fn assert_bitwise_same(a: &StateDict, b: &StateDict) {
+    assert_eq!(
+        homura::save_safetensors_to_bytes(a).unwrap(),
+        homura::save_safetensors_to_bytes(b).unwrap()
+    );
+}
+
 fn is_format_error<T>(r: homura::Result<T>, needle: &str) -> bool {
     matches!(r, Err(Error::Format(msg)) if msg.contains(needle))
 }
@@ -106,6 +124,10 @@ fn python_files_load_with_every_dtype() {
     let streamed = homura::load_safetensors(&path).unwrap();
     let in_memory = homura::load_safetensors_from_bytes(&fs::read(&path).unwrap()).unwrap();
     let state_dict = homura::load(&path).unwrap();
+    let mapped = load_mmap(&path).unwrap();
+    assert_bitwise_same(&mapped, &state_dict);
+    assert_same_dict(&mapped, &state_dict);
+    assert!(mapped.versions().is_none());
     assert_eq!(streamed.len(), expected.len());
     // All three keep the header order, which Python's writer sorts by dtype.
     let names: Vec<&str> = streamed.iter().map(|(k, _)| k.as_str()).collect();
@@ -123,12 +145,14 @@ fn python_files_load_with_every_dtype() {
         assert!(a.is_contiguous());
     }
     // Loaded BOOL data works in kernels: 2 of the 6 positions are true.
-    assert_eq!(
-        state_dict.get("bool").unwrap().sum().item::<i64>(),
-        2,
-        "{:?}",
-        state_dict.get("bool")
-    );
+    for loaded in [&state_dict, &mapped] {
+        assert_eq!(
+            loaded.get("bool").unwrap().sum().item::<i64>(),
+            2,
+            "{:?}",
+            loaded.get("bool")
+        );
+    }
     let metadata = io::safetensors_metadata(&path).unwrap();
     assert_eq!(
         metadata.keys().collect::<Vec<_>>(),
@@ -153,6 +177,10 @@ fn header_order_differs_from_data_order() {
             .unwrap()
             .into_iter()
             .collect(),
+        load_mmap(dir.join("x.safetensors"))
+            .unwrap()
+            .into_iter()
+            .collect(),
     ] {
         let names: Vec<&str> = loaded.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, ["b", "c", "a"]);
@@ -172,6 +200,8 @@ fn unaligned_headers_load() {
     assert_same(state_dict.get("x").unwrap(), &values(&[2], DType::F32));
     assert_same(state_dict.get("y").unwrap(), &values(&[3], DType::I16));
     assert!(io::safetensors_metadata(&path).unwrap().is_empty());
+    // The data isn't aligned either, so mapping copies some tensors; the values are the same.
+    assert_bitwise_same(&load_mmap(&path).unwrap(), &state_dict);
 }
 
 #[test]
@@ -193,6 +223,15 @@ fn python_sharded_checkpoints_load_in_weight_map_order() {
     );
     assert_same(state_dict.get("b.count").unwrap(), &values(&[], DType::I64));
     assert!(state_dict.versions().is_none());
+    let mapped = load_mmap(format!("{GOLDEN}/sharded/model.safetensors.index.json")).unwrap();
+    assert_bitwise_same(&mapped, &state_dict);
+    assert_same_dict(&mapped, &state_dict);
+}
+
+fn longer_by_one(bytes: &[u8]) -> Vec<u8> {
+    let mut longer = bytes.to_vec();
+    longer.push(0);
+    longer
 }
 
 #[test]
@@ -215,10 +254,15 @@ fn truncated_and_corrupt_files_are_errors() {
             homura::load_safetensors(&path),
             Err(Error::Format(_))
         ));
+        assert!(matches!(load_mmap(&path), Err(Error::Format(_))));
     }
+    fs::write(&path, longer_by_one(&bytes)).unwrap();
+    assert!(is_format_error(
+        load_mmap(&path),
+        "data section doesn't match"
+    ));
     // A trailing byte, offsets past the data, and headers longer than the file or the limit.
-    let mut longer = bytes.clone();
-    longer.push(0);
+    let longer = longer_by_one(&bytes);
     assert!(is_format_error(
         homura::load_safetensors_from_bytes(&longer),
         "data section doesn't match"
@@ -238,6 +282,7 @@ fn truncated_and_corrupt_files_are_errors() {
         for r in [
             homura::load_safetensors_from_bytes(&raw),
             homura::load_safetensors(&path),
+            load_mmap(&path).map(|sd| sd.into_iter().collect()),
         ] {
             assert!(matches!(r, Err(Error::Format(_))), "{header_len}");
         }
@@ -260,6 +305,8 @@ fn non_canonical_bool_bytes_are_errors() {
         ));
         assert!(is_format_error(homura::load_safetensors(&path), message));
         assert!(is_format_error(homura::load(&path), message));
+        // The mapped data is checked too, before a tensor uses it.
+        assert!(is_format_error(load_mmap(&path), message));
         // Also when the file is a shard.
         let index = r#"{"weight_map": {"ok": "bool.safetensors", "x": "bool.safetensors"}}"#;
         fs::write(dir.join("index.json"), index).unwrap();
@@ -267,10 +314,18 @@ fn non_canonical_bool_bytes_are_errors() {
             homura::load(dir.join("index.json")),
             message
         ));
+        assert!(is_format_error(load_mmap(dir.join("index.json")), message));
     }
     let raw = file(header, &[1, 0, 0, 1]);
     let loaded = homura::load_safetensors_from_bytes(&raw).unwrap();
     assert_eq!(loaded[1].1.to_vec::<bool>(), [false, true]);
+    fs::write(dir.join("bool.safetensors"), &raw).unwrap();
+    let mapped = load_mmap(dir.join("bool.safetensors")).unwrap();
+    assert_eq!(mapped.get("x").unwrap().to_vec::<bool>(), [false, true]);
+    assert_eq!(
+        mapped.get("x").unwrap().logical_not().to_vec::<bool>(),
+        [true, false]
+    );
 }
 
 #[test]
@@ -408,6 +463,11 @@ fn load_tells_formats_by_content() {
         homura::load(dir.join("model.safetensors")),
         "can't be loaded yet"
     ));
+    assert!(is_format_error(
+        load_mmap(dir.join("model.safetensors")),
+        "can't be loaded yet"
+    ));
+    assert_same_dict(&load_mmap(dir.join("weights.bin")).unwrap(), &state_dict);
     // A header length whose first byte is `{`: still safetensors, since its upper bytes are 0.
     let header = format!("{{{}}}", " ".repeat(b'{' as usize - 2));
     let mut raw = (header.len() as u64).to_le_bytes().to_vec();
@@ -432,11 +492,83 @@ fn load_tells_formats_by_content() {
             is_format_error(homura::load(dir.join("x")), needle),
             "{content:?}"
         );
+        assert!(
+            is_format_error(load_mmap(dir.join("x")), needle),
+            "{content:?}"
+        );
     }
     assert!(matches!(
         homura::load(dir.join("missing")),
         Err(Error::Io(_))
     ));
+    assert!(matches!(load_mmap(dir.join("missing")), Err(Error::Io(_))));
+}
+
+#[test]
+fn mapped_tensors_are_copy_on_write() {
+    let dir = scratch("mmap_cow");
+    let path = dir.join("model.safetensors");
+    let original: StateDict = [
+        ("w", values(&[2, 3], DType::F32)),
+        ("n", values(&[4], DType::I64)),
+        ("m", values(&[3], DType::Bool)),
+    ]
+    .into_iter()
+    .collect();
+    homura::save(&original, &path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let mapped = load_mmap(&path).unwrap();
+    let other = load_mmap(&path).unwrap();
+    mapped.get("w").unwrap().mul_(2.0);
+    mapped.get("n").unwrap().fill_(7);
+    mapped.get("m").unwrap().fill_(true);
+    assert_same(
+        mapped.get("w").unwrap(),
+        &values(&[2, 3], DType::F32).mul(2.0),
+    );
+    assert_eq!(mapped.get("n").unwrap().to_vec::<i64>(), [7; 4]);
+    assert_eq!(mapped.get("m").unwrap().to_vec::<bool>(), [true; 3]);
+    // The writes reach neither the file nor another mapping of it.
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_bitwise_same(&other, &original);
+    assert_bitwise_same(&homura::load(&path).unwrap(), &original);
+}
+
+#[test]
+fn mapped_tensors_outlive_their_state_dict() {
+    let dir = scratch("mmap_lifetime");
+    let path = dir.join("linear.safetensors");
+    let source = nn::Linear::new(3, 2);
+    homura::save(&source.state_dict(), &path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let mapped = load_mmap(&path).unwrap();
+    let weight = mapped.get("weight").unwrap().clone();
+    let transposed = weight.transpose(0, 1);
+    // Loading with assign makes the parameters use the mapped data; copying doesn't.
+    let model = nn::Linear::new(3, 2);
+    let copied = nn::Linear::new(3, 2);
+    model
+        .load_state_dict_with(&mapped, nn::LoadOptions::default().assign(true))
+        .unwrap();
+    copied.load_state_dict(&mapped).unwrap();
+    drop(mapped);
+    assert_same(&transposed, &source.weight.transpose(0, 1));
+    let x = homura::randn([4, 3]);
+    assert_same(&model.forward(&x), &source.forward(&x));
+    // A training step writes the parameters in place: the handles that share the mapped storage
+    // see it, the file and the copies don't.
+    let mut opt = Sgd::new(model.parameters(), 0.5);
+    model.forward(&x).sum().backward();
+    opt.step();
+    assert!(!model.weight.equal(&*source.weight).all().item::<bool>());
+    assert_same(&weight, &model.weight);
+    assert_same(&transposed, &model.weight.transpose(0, 1));
+    assert_same(&copied.weight, &source.weight);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop((weight, transposed));
+    // The parameters keep the mapping alive on their own.
+    assert_eq!(model.forward(&x).shape(), [4, 2]);
+    assert_bitwise_same(&homura::load(&path).unwrap(), &source.state_dict());
 }
 
 /// A state dict with tensors of 64 (`a`), 16 (`b`), 400 (`c`), 8 (`d`) and 0 (`e`) bytes.

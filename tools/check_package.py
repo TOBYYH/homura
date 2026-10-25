@@ -117,6 +117,11 @@ fn main() {
     let loaded = hm::load("shards/model.safetensors.index.json").unwrap();
     assert_eq!(loaded.keys().collect::<Vec<_>>(), keys);
     net.load_state_dict(&loaded).unwrap();
+    // SAFETY: nothing modifies the shards while the program runs.
+    let mapped = unsafe { hm::io::load_mmap("shards/model.safetensors.index.json") }.unwrap();
+    assert_eq!(mapped.keys().collect::<Vec<_>>(), keys);
+    net.load_state_dict_with(&mapped, hm::nn::LoadOptions::default().assign(true)).unwrap();
+    drop(mapped);
     net.eval();
     assert_eq!(net.forward(&hm::randn([1, 3, 4, 4])).shape(), [1, 2]);
     println!("external crate: ok");

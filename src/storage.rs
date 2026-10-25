@@ -1,7 +1,9 @@
 //! Untyped tensor memory shared by all views of a tensor.
 
 use std::alloc::{self, Layout};
+use std::fs::File;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Device;
@@ -21,6 +23,12 @@ pub(crate) struct Storage {
 #[derive(Debug)]
 enum Buffer {
     Cpu(CpuBuffer),
+    /// `nbytes` bytes of a file mapping from `offset`, on the CPU.
+    Mapped {
+        map: Arc<FileMap>,
+        offset: usize,
+        nbytes: usize,
+    },
     /// The meta device has no data, only a size.
     Meta {
         nbytes: usize,
@@ -63,6 +71,35 @@ impl Drop for CpuBuffer {
     }
 }
 
+/// A private copy-on-write mapping of a whole file, shared by the storages of the tensors loaded
+/// from it and unmapped when the last of them is dropped. Writes through it stay in this process
+/// and never reach the file.
+///
+/// It is kept as an `MmapRaw`, which only hands out raw pointers: like `CpuBuffer`, the bytes are
+/// read and written through pointers inside the CPU backend's execution lock or with exclusive
+/// access (`Storage::cpu_bytes_mut`), never through a shared Rust reference to the whole mapping.
+#[derive(Debug)]
+pub(crate) struct FileMap(memmap2::MmapRaw);
+
+impl FileMap {
+    /// Maps all of `file` privately.
+    ///
+    /// # Safety
+    ///
+    /// The file must not be truncated or modified, by this or any other process, while the
+    /// mapping is alive, that is while any storage made from it is.
+    pub unsafe fn new(file: &File) -> std::io::Result<Arc<FileMap>> {
+        // SAFETY: the caller keeps the file unchanged while the mapping lives.
+        let map = unsafe { memmap2::MmapOptions::new().map_copy(file)? };
+        Ok(Arc::new(FileMap(map.into())))
+    }
+
+    /// The size of the mapping: the size of the file when it was mapped.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl Storage {
     /// Allocates `nbytes` of zeroed memory on `device`.
     ///
@@ -83,6 +120,40 @@ impl Storage {
         }
     }
 
+    /// CPU storage for the `nbytes` bytes of `map` from `offset`, without copying them.
+    ///
+    /// # Safety
+    ///
+    /// No other storage may cover any of these bytes of `map`: a storage has exclusive access to
+    /// its bytes (see [`Storage::cpu_bytes_mut`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes are not all inside the mapping.
+    pub unsafe fn mapped(map: Arc<FileMap>, offset: usize, nbytes: usize) -> Storage {
+        assert!(
+            offset
+                .checked_add(nbytes)
+                .is_some_and(|end| end <= map.len()),
+            "storage outside the file mapping"
+        );
+        Storage {
+            buffer: Buffer::Mapped {
+                map,
+                offset,
+                nbytes,
+            },
+            device: Device::Cpu,
+            version: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the data is in a file mapping rather than allocated memory.
+    #[cfg(test)]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.buffer, Buffer::Mapped { .. })
+    }
+
     pub fn device(&self) -> Device {
         self.device
     }
@@ -90,7 +161,7 @@ impl Storage {
     pub fn nbytes(&self) -> usize {
         match &self.buffer {
             Buffer::Cpu(b) => b.nbytes,
-            Buffer::Meta { nbytes } => *nbytes,
+            Buffer::Mapped { nbytes, .. } | Buffer::Meta { nbytes } => *nbytes,
         }
     }
 
@@ -102,6 +173,8 @@ impl Storage {
     pub fn cpu_ptr(&self) -> *mut u8 {
         match &self.buffer {
             Buffer::Cpu(b) => b.ptr.as_ptr(),
+            // SAFETY: `mapped` checked that `offset` is inside the mapping.
+            Buffer::Mapped { map, offset, .. } => unsafe { map.0.as_mut_ptr().add(*offset) },
             Buffer::Meta { .. } => panic!("meta tensors have no data"),
         }
     }
@@ -117,12 +190,11 @@ impl Storage {
     ///
     /// Panics if the storage is not on the CPU.
     pub fn cpu_bytes_mut(&mut self) -> &mut [u8] {
-        match &mut self.buffer {
-            // SAFETY: the buffer owns `nbytes` initialized (zeroed) bytes at `ptr`, and `&mut self`
-            // rules out any other access while the slice lives.
-            Buffer::Cpu(b) => unsafe { std::slice::from_raw_parts_mut(b.ptr.as_ptr(), b.nbytes) },
-            Buffer::Meta { .. } => panic!("meta tensors have no data"),
-        }
+        let ptr = self.cpu_ptr();
+        // SAFETY: an allocated buffer owns `nbytes` initialized (zeroed) bytes at `ptr`; a mapped
+        // one has `nbytes` bytes of the file there, inside the mapping and covered by no other
+        // storage (see `mapped`). `&mut self` rules out any other access while the slice lives.
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.nbytes()) }
     }
 
     pub fn version(&self) -> u64 {

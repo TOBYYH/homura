@@ -31,3 +31,4 @@ workspace = true
 [dependencies]
 half = "2.7"
 homura-derive = { version = "=0.3.0", path = "homura-derive" }
+memmap2 = "0.9.11"

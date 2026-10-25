@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::json::{self, Json};
 use crate::backend::cpu;
 use crate::nn::StateDict;
-use crate::storage::Storage;
+use crate::storage::{FileMap, Storage};
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Error, Result, Shape, Tensor};
 
@@ -66,6 +66,8 @@ struct Header {
     entries: Vec<Entry>,
     /// Where the data section starts in the file.
     data_start: u64,
+    /// The size of the file, where the data section ends.
+    len: u64,
 }
 
 fn bad(msg: &str) -> Error {
@@ -176,7 +178,28 @@ fn read_header<R: Read + Seek>(r: &mut R) -> Result<Header> {
         metadata,
         entries,
         data_start,
+        len,
     })
+}
+
+/// Checks the BOOL invariant (see `Storage::cpu_bytes_mut`) before a tensor gets the data.
+fn check_bool(e: &Entry, bytes: &[u8]) -> Result<()> {
+    if e.dtype == DType::Bool && bytes.iter().any(|&b| b > 1) {
+        return Err(bad(&format!(
+            "{}: BOOL data must consist of the bytes 0 and 1",
+            e.name
+        )));
+    }
+    Ok(())
+}
+
+fn tensor(e: Entry, storage: Storage) -> (String, Tensor) {
+    let t = Tensor::from_data(TensorData {
+        storage: Arc::new(storage),
+        layout: Layout::contiguous(e.shape),
+        dtype: e.dtype,
+    });
+    (e.name, t)
 }
 
 /// Reads the tensors of the safetensors data in `r` onto the CPU, in header order.
@@ -197,19 +220,57 @@ pub(super) fn read<R: Read + Seek>(r: &mut R) -> Result<Vec<(String, Tensor)>> {
         let bytes = storage.cpu_bytes_mut();
         r.read_exact(bytes)?;
         pos = Some(header.data_start + e.end as u64);
-        if e.dtype == DType::Bool && bytes.iter().any(|&b| b > 1) {
-            return Err(bad(&format!(
-                "{}: BOOL data must consist of the bytes 0 and 1",
-                e.name
-            )));
-        }
+        check_bool(&e, bytes)?;
         to_from_le(bytes, e.dtype.size_in_bytes());
-        let t = Tensor::from_data(TensorData {
-            storage: Arc::new(storage),
-            layout: Layout::contiguous(e.shape),
-            dtype: e.dtype,
-        });
-        out.push((e.name, t));
+        out.push(tensor(e, storage));
+    }
+    Ok(out)
+}
+
+/// Like [`read`], but the tensors use the pages of a private copy-on-write mapping of `file`
+/// instead of copies, where they can: tensors whose data starts at a multiple of their element
+/// size, all of them for one-byte dtypes. Other tensors, multi-byte tensors on big-endian hosts
+/// (the file is little-endian) and empty tensors get their own memory, copied from the mapping.
+/// BOOL data is checked on the mapping, touching only its pages, before the tensor is created.
+///
+/// # Safety
+///
+/// As for [`load_mmap`](super::load_mmap): `file` must not be truncated or modified while any
+/// tensor that maps it is alive.
+pub(super) unsafe fn read_mmap(file: &mut File) -> Result<Vec<(String, Tensor)>> {
+    let header = read_header(file)?;
+    // SAFETY: the caller keeps the file unchanged while the mapping lives.
+    let map = unsafe { FileMap::new(file)? };
+    if map.len() as u64 != header.len {
+        return Err(Error::Io(std::io::Error::other(
+            "the file changed while it was being loaded",
+        )));
+    }
+    // The file fits the address space now that it is mapped, so its offsets fit `usize`.
+    let data_start = header.data_start as usize;
+    let mut out = Vec::with_capacity(header.entries.len());
+    for e in header.entries {
+        let offset = data_start + e.begin;
+        let nbytes = e.end - e.begin;
+        let size = e.dtype.size_in_bytes();
+        if nbytes == 0 {
+            out.push(tensor(e, Storage::new(0, Device::Cpu)));
+            continue;
+        }
+        // SAFETY: the header check makes the entries' byte ranges disjoint, and each one gets
+        // a single storage.
+        let mut mapped = unsafe { Storage::mapped(map.clone(), offset, nbytes) };
+        check_bool(&e, mapped.cpu_bytes_mut())?;
+        let storage = if size > 1 && (cfg!(target_endian = "big") || !offset.is_multiple_of(size)) {
+            let mut copy = Storage::new(nbytes, Device::Cpu);
+            let bytes = copy.cpu_bytes_mut();
+            bytes.copy_from_slice(mapped.cpu_bytes_mut());
+            to_from_le(bytes, size);
+            copy
+        } else {
+            mapped
+        };
+        out.push(tensor(e, storage));
     }
     Ok(out)
 }
@@ -401,4 +462,58 @@ pub fn save_safetensors_with_metadata(
 ) -> Result<()> {
     let tensors = snapshot(state_dict)?;
     write(&mut File::create(path)?, &tensors, Some(metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_is_used_where_the_data_is_aligned() {
+        // The data section starts 8-byte aligned; "z" starts at 14, which isn't a multiple of 8.
+        let header = concat!(
+            r#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"#,
+            r#""y":{"dtype":"I16","shape":[3],"data_offsets":[8,14]},"#,
+            r#""z":{"dtype":"F64","shape":[1],"data_offsets":[14,22]},"#,
+            r#""b":{"dtype":"BOOL","shape":[2],"data_offsets":[22,24]},"#,
+            r#""e":{"dtype":"F32","shape":[0],"data_offsets":[24,24]}}"#,
+        );
+        let mut raw = header.to_string();
+        while !raw.len().is_multiple_of(8) {
+            raw.push(' ');
+        }
+        let mut bytes = (raw.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(raw.as_bytes());
+        for x in [1.5f32, -2.0] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        for y in [7i16, -300, 4] {
+            bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0.25f64.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0]);
+        let path = std::env::temp_dir().join(format!("homura-mmap-{}", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        // SAFETY: only this test uses the file, and it is removed after the tensors are dropped.
+        let loaded = unsafe { read_mmap(&mut File::open(&path).unwrap()) }.unwrap();
+        let little = cfg!(target_endian = "little");
+        let expected = [
+            ("x", little),
+            ("y", little),
+            ("z", false),
+            ("b", true),
+            ("e", false),
+        ];
+        for ((name, t), (expected_name, mapped)) in loaded.iter().zip(expected) {
+            assert_eq!(name, expected_name);
+            assert_eq!(t.data().storage.is_mapped(), mapped, "{name}");
+        }
+        assert_eq!(loaded[0].1.to_vec::<f32>(), [1.5, -2.0]);
+        assert_eq!(loaded[1].1.to_vec::<i16>(), [7, -300, 4]);
+        assert_eq!(loaded[2].1.to_vec::<f64>(), [0.25]);
+        assert_eq!(loaded[3].1.to_vec::<bool>(), [true, false]);
+        assert_eq!(loaded[4].1.shape(), [0]);
+        drop(loaded);
+        std::fs::remove_file(&path).unwrap();
+    }
 }

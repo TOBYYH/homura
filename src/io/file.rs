@@ -1,4 +1,5 @@
-//! [`load`] and [`save`]: state dicts in files whose format is told from their content or name.
+//! [`load`], [`load_mmap`] and [`save`]: state dicts in files whose format is told from their
+//! content or name.
 
 use std::fs::File;
 use std::io::Read;
@@ -33,6 +34,15 @@ fn detect(file: &mut File) -> Result<Format> {
     })
 }
 
+/// How the tensor data gets from a file into the tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Access {
+    /// Read into memory of their own.
+    Read,
+    /// Mapped, as [`load_mmap`] describes.
+    Map,
+}
+
 fn pt_not_supported(path: &Path) -> Error {
     Error::Format(format!(
         "{} is a PyTorch .pt file, which can't be loaded yet",
@@ -41,15 +51,47 @@ fn pt_not_supported(path: &Path) -> Error {
 }
 
 /// Loads the tensors of one shard of a sharded checkpoint.
-pub(super) fn load_shard(path: &Path) -> Result<Vec<(String, Tensor)>> {
+///
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`].
+pub(super) unsafe fn load_shard(path: &Path, access: Access) -> Result<Vec<(String, Tensor)>> {
     let mut file = File::open(path)?;
     match detect(&mut file)? {
-        Format::Safetensors => safetensors::read(&mut file),
+        // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
+        Format::Safetensors => unsafe { read_safetensors(&mut file, access) },
         Format::Zip => Err(pt_not_supported(path)),
         Format::Index => Err(Error::Format(format!(
             "{} is an index, not a shard",
             path.display()
         ))),
+    }
+}
+
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`].
+unsafe fn read_safetensors(file: &mut File, access: Access) -> Result<Vec<(String, Tensor)>> {
+    match access {
+        Access::Read => safetensors::read(file),
+        // SAFETY: the caller upholds the contract of `load_mmap`.
+        Access::Map => unsafe { safetensors::read_mmap(file) },
+    }
+}
+
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`].
+unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
+    let mut file = File::open(path)?;
+    match detect(&mut file)? {
+        // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
+        Format::Safetensors => Ok(unsafe { read_safetensors(&mut file, access) }?
+            .into_iter()
+            .collect()),
+        Format::Zip => Err(pt_not_supported(path)),
+        // SAFETY: as above.
+        Format::Index => unsafe { shard::read_index(path, file, access) },
     }
 }
 
@@ -80,13 +122,55 @@ pub(super) fn load_shard(path: &Path) -> Result<Vec<(String, Tensor)>> {
 /// ```
 #[track_caller]
 pub fn load(path: impl AsRef<Path>) -> Result<StateDict> {
-    let path = path.as_ref();
-    let mut file = File::open(path)?;
-    match detect(&mut file)? {
-        Format::Safetensors => Ok(safetensors::read(&mut file)?.into_iter().collect()),
-        Format::Zip => Err(pt_not_supported(path)),
-        Format::Index => shard::read_index(path, file),
-    }
+    // SAFETY: reading has no preconditions; only `Access::Map` has.
+    unsafe { load_with(path.as_ref(), Access::Read) }
+}
+
+/// Loads a state dict like [`load`], but maps the files into memory instead of reading them:
+/// tensors use the pages of the file, which are read from disk when the data is first used,
+/// and loading needs almost no memory of its own. Like PyTorch's `torch.load(path, mmap=True)`.
+///
+/// The mapping is private and copy-on-write: tensors can be written in place, and the writes
+/// stay in this process and never reach the file. A file is unmapped when the last tensor that
+/// uses it is dropped, which can be long after the state dict is.
+///
+/// Which tensors use the mapping is not part of the contract. Currently, a tensor whose data
+/// doesn't start at a multiple of its element size in the file (safetensors doesn't align data,
+/// although Python's `safetensors` and homura write 8-byte aligned files), a multi-byte tensor
+/// on a big-endian host and an empty tensor get memory of their own and a copy of the data.
+/// BOOL data is checked as [`load`] does, which reads only the pages of BOOL tensors.
+///
+/// PyTorch's `.pt` format can't be loaded yet, mapped or not.
+///
+/// # Safety
+///
+/// Every file that is mapped (the safetensors file, or each shard that an index lists) must not
+/// be truncated or modified, by this or any other process, while any tensor whose data it holds
+/// is alive. That is not only the returned state dict but every tensor sharing its storage:
+/// views and other handles to its tensors, parameters that loading with
+/// [`LoadOptions::assign`](crate::nn::LoadOptions::assign) made use them, and optimizers holding
+/// those parameters. Tensors that hold a copy of the data, such as parameters loaded without
+/// assign, don't depend on the file. Modifying a mapped file is undefined behaviour, as for
+/// [`memmap2::Mmap::map`](https://docs.rs/memmap2/0.9/memmap2/struct.Mmap.html#method.map);
+/// truncating it can crash the process.
+///
+/// # Errors
+///
+/// As for [`load`].
+///
+/// ```no_run
+/// use homura::nn::{LoadOptions, Module};
+///
+/// let model = homura::nn::Linear::new(4, 2);
+/// // SAFETY: nothing modifies model.safetensors while the program runs.
+/// let state_dict = unsafe { homura::io::load_mmap("model.safetensors")? };
+/// model.load_state_dict_with(&state_dict, LoadOptions::default().assign(true))?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[track_caller]
+pub unsafe fn load_mmap(path: impl AsRef<Path>) -> Result<StateDict> {
+    // SAFETY: the caller upholds the contract above.
+    unsafe { load_with(path.as_ref(), Access::Map) }
 }
 
 /// Saves a state dict to a file, in the format its extension names.
@@ -134,5 +218,46 @@ pub fn save(state_dict: &StateDict, path: impl AsRef<Path>) -> Result<()> {
             "can't tell the format to save {} in from its extension: use .safetensors",
             path.display()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{ShardOptions, save_sharded};
+
+    #[test]
+    fn only_load_mmap_maps_files() {
+        let dir = std::env::temp_dir().join(format!("homura-load-mmap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_dict: StateDict = [
+            ("a", crate::ones([4])),
+            ("b", crate::zeros_with([3], crate::DType::I64)),
+            ("c", crate::ones([0])),
+        ]
+        .into_iter()
+        .collect();
+        save_sharded(
+            &state_dict,
+            &dir,
+            ShardOptions::default().max_shard_size(16),
+        )
+        .unwrap();
+        crate::save(&state_dict, dir.join("single.safetensors")).unwrap();
+        let mapped = |sd: &StateDict| -> Vec<bool> {
+            sd.iter()
+                .map(|(_, t)| t.data().storage.is_mapped())
+                .collect()
+        };
+        for path in ["model.safetensors.index.json", "single.safetensors"] {
+            let path = dir.join(path);
+            assert_eq!(mapped(&load(&path).unwrap()), [false; 3]);
+            // SAFETY: only this test uses the files, and they are removed after the tensors are
+            // dropped.
+            let sd = unsafe { load_mmap(&path) }.unwrap();
+            let little = cfg!(target_endian = "little");
+            assert_eq!(mapped(&sd), [little, little, false], "{}", path.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

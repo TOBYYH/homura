@@ -462,16 +462,16 @@ fn load_tells_formats_by_content() {
     let bytes = homura::save_safetensors_to_bytes([("w", state_dict.get("w").unwrap())]).unwrap();
     fs::write(dir.join("weights.bin"), &bytes).unwrap();
     assert_same_dict(&homura::load(dir.join("weights.bin")).unwrap(), &state_dict);
-    // A zip archive is PyTorch's format, whose tensors can't be loaded yet.
+    // A zip archive is PyTorch's format, whatever the name.
     fs::copy(PT_STATE_DICT, dir.join("model.safetensors")).unwrap();
-    assert!(is_format_error(
-        homura::load(dir.join("model.safetensors")),
-        "can't be loaded yet"
-    ));
-    assert!(is_format_error(
-        load_mmap(dir.join("model.safetensors")),
-        "can't be loaded yet"
-    ));
+    let pt = homura::load(PT_STATE_DICT).unwrap();
+    for loaded in [
+        homura::load(dir.join("model.safetensors")).unwrap(),
+        load_mmap(dir.join("model.safetensors")).unwrap(),
+    ] {
+        assert_eq!(loaded.len(), 9);
+        assert_same_dict(&loaded, &pt);
+    }
     assert_same_dict(&load_mmap(dir.join("weights.bin")).unwrap(), &state_dict);
     // A header length whose first byte is `{`: still safetensors, since its upper bytes are 0.
     let header = format!("{{{}}}", " ".repeat(b'{' as usize - 2));
@@ -916,9 +916,10 @@ fn sharded_index_errors() {
         "is an index, not a shard",
     );
     fs::copy(PT_STATE_DICT, dir.join("zip.bin")).unwrap();
+    // A .pt shard is read, but doesn't have the keys listed for it.
     check(
         &original.replace(&shard(2), "zip.bin"),
-        "can't be loaded yet",
+        "\"zip.bin\" has no tensor",
     );
     // A missing shard is an IO error.
     fs::write(&index, original.replace(&shard(2), "gone.safetensors")).unwrap();

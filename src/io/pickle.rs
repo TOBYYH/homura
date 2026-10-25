@@ -122,7 +122,7 @@ pub(super) enum Node {
 }
 
 impl Node {
-    fn type_name(&self) -> &'static str {
+    pub(super) fn type_name(&self) -> &'static str {
         match self {
             Node::None => "None",
             Node::Bool(_) => "bool",
@@ -151,8 +151,9 @@ pub(super) struct Pickle {
 
 /// Rebuilds tensors for [`Pickle::to_value`].
 pub(super) trait Tensors {
-    /// The tensor that `func(*args)` returns, where `args` is a tuple node of `pickle`.
-    fn tensor(&mut self, pickle: &Pickle, func: Global, args: Id) -> Result<Tensor>;
+    /// The tensor that the call node `call`, `func(*args)`, returns, where `args` is a tuple
+    /// node of `pickle`. [`Pickle::to_value`] asks again each time the node is referenced.
+    fn tensor(&mut self, pickle: &Pickle, call: Id, func: Global, args: Id) -> Result<Tensor>;
 }
 
 /// The most entries the memo can have. Each one takes an opcode, so the input's size bounds
@@ -653,6 +654,12 @@ impl Pickle {
         &self.nodes[id as usize]
     }
 
+    /// The budget of values for an input of this size (see [`to_value`](Pickle::to_value)), for
+    /// charging other work whose amount shared references can multiply.
+    pub(super) fn value_budget(&self) -> u64 {
+        budgets(self.input_len).0
+    }
+
     /// The object that the pickle returns, as a [`Value`], with tensors from `tensors`.
     pub(super) fn to_value(&self, tensors: &mut dyn Tensors) -> Result<Value> {
         let (nodes, bytes) = budgets(self.input_len);
@@ -677,7 +684,8 @@ struct Materializer<'a> {
     active: Vec<bool>,
 }
 
-fn over_budget() -> Error {
+/// The error for running out of a budget.
+pub(super) fn over_budget() -> Error {
     unsupported(
         "the objects expand to much more than the size of the file, through shared references",
     )
@@ -746,7 +754,9 @@ impl Materializer<'_> {
             Node::Tuple(items) => Value::Tuple(self.items(items, depth)?),
             Node::List(items) => Value::List(self.items(items, depth)?),
             Node::Dict(dict) => Value::Dict(self.dict(dict, depth)?),
-            Node::Call { func, args } => Value::Tensor(self.tensors.tensor(pickle, *func, *args)?),
+            Node::Call { func, args } => {
+                Value::Tensor(self.tensors.tensor(pickle, id, *func, *args)?)
+            }
             Node::Global(global) => {
                 return Err(unsupported(&format!(
                     "{} is not a supported value",
@@ -830,7 +840,8 @@ pub(super) mod tests {
     pub(crate) struct Placeholders(pub(crate) usize);
 
     impl Tensors for Placeholders {
-        fn tensor(&mut self, pickle: &Pickle, func: Global, args: Id) -> Result<Tensor> {
+        fn tensor(&mut self, pickle: &Pickle, call: Id, func: Global, args: Id) -> Result<Tensor> {
+            assert!(matches!(pickle.node(call), Node::Call { .. }));
             assert!(matches!(
                 func,
                 Global::RebuildTensorV2 | Global::RebuildParameter

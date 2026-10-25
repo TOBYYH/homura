@@ -2,10 +2,10 @@
 //! content or name.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
-use super::{pt, safetensors, shard};
+use super::{Value, pt, safetensors, shard};
 use crate::nn::StateDict;
 use crate::{Error, Result, Tensor};
 
@@ -25,14 +25,13 @@ enum Format {
 /// of its magic number, `0x1950a86a20f9469cfc6c`.
 const LEGACY_MAGIC: [u8; 8] = [0x80, 0x02, 0x8a, 0x0a, 0x6c, 0xfc, 0x9c, 0x46];
 
-/// Tells the format of `file` from its first eight bytes. A safetensors file starts with its
-/// header length, whose upper bytes are zero for any header size the reader accepts (which
-/// also rules out [`LEGACY_MAGIC`]); a JSON text starts with `{` and never contains a zero byte.
-/// The readers seek back to the start themselves.
-fn detect(file: &mut File) -> Result<Format> {
-    let mut start = Vec::with_capacity(8);
-    file.by_ref().take(8).read_to_end(&mut start)?;
-    Ok(if start.starts_with(b"PK\x03\x04") {
+/// Tells the format of a file from its first eight bytes (or all of them, if it is shorter). A
+/// safetensors file starts with its header length, whose upper bytes are zero for any header
+/// size the reader accepts (which also rules out [`LEGACY_MAGIC`]); a JSON text starts with `{`
+/// and never contains a zero byte.
+fn detect_bytes(start: &[u8]) -> Format {
+    let start = &start[..start.len().min(8)];
+    if start.starts_with(b"PK\x03\x04") {
         Format::Zip
     } else if start == LEGACY_MAGIC {
         Format::Legacy
@@ -40,7 +39,15 @@ fn detect(file: &mut File) -> Result<Format> {
         Format::Index
     } else {
         Format::Safetensors
-    })
+    }
+}
+
+/// Tells the format of `file` from its first bytes, as [`detect_bytes`] does. The readers seek
+/// back to the start themselves.
+fn detect(file: &mut File) -> Result<Format> {
+    let mut start = Vec::with_capacity(8);
+    file.by_ref().take(8).read_to_end(&mut start)?;
+    Ok(detect_bytes(&start))
 }
 
 /// How the tensor data gets from a file into the tensors.
@@ -60,6 +67,20 @@ fn legacy_not_supported(path: &Path) -> Error {
     ))
 }
 
+/// Reads the state dict of a `.pt` file.
+///
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`].
+unsafe fn read_pt(file: &mut File, access: Access) -> Result<StateDict> {
+    let value = match access {
+        Access::Read => pt::read_value(file)?,
+        // SAFETY: the caller upholds the contract of `load_mmap`.
+        Access::Map => unsafe { pt::read_value_mmap(file) }?,
+    };
+    pt::to_state_dict(&value)
+}
+
 /// Loads the tensors of one shard of a sharded checkpoint.
 ///
 /// # Safety
@@ -70,7 +91,8 @@ pub(super) unsafe fn load_shard(path: &Path, access: Access) -> Result<Vec<(Stri
     match detect(&mut file)? {
         // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
         Format::Safetensors => unsafe { read_safetensors(&mut file, access) },
-        Format::Zip => Ok(pt::read_state_dict(&mut file)?.into_iter().collect()),
+        // SAFETY: as above.
+        Format::Zip => Ok(unsafe { read_pt(&mut file, access) }?.into_iter().collect()),
         Format::Legacy => Err(legacy_not_supported(path)),
         Format::Index => Err(Error::Format(format!(
             "{} is an index, not a shard",
@@ -100,7 +122,8 @@ unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
         Format::Safetensors => Ok(unsafe { read_safetensors(&mut file, access) }?
             .into_iter()
             .collect()),
-        Format::Zip => pt::read_state_dict(&mut file),
+        // SAFETY: as above.
+        Format::Zip => unsafe { read_pt(&mut file, access) },
         Format::Legacy => Err(legacy_not_supported(path)),
         // SAFETY: as above.
         Format::Index => unsafe { shard::read_index(path, file, access) },
@@ -113,14 +136,20 @@ unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
 ///
 /// - a safetensors file, read as [`load_safetensors`](crate::load_safetensors) does: in header
 ///   order, straight into each tensor's storage;
-/// - a sharded checkpoint's JSON index (Hugging Face's `model.safetensors.index.json`): the
-///   shards that its `weight_map` lists, relative to the index's directory, in `weight_map`
-///   order. Every listed key must be in its shard and every tensor of a shard must be listed;
-///   shard names can't leave the directory;
-/// - PyTorch's zip-based `.pt` format (including `pytorch_model.bin`): the archive and its
-///   pickle are checked as untrusted input, without running any code, but tensors can't be
-///   loaded from them yet. TorchScript archives (`torch.jit.save`) and files in the format before
-///   PyTorch 1.6 are not supported.
+/// - a sharded checkpoint's JSON index (Hugging Face's `model.safetensors.index.json` or
+///   `pytorch_model.bin.index.json`): the shards that its `weight_map` lists, relative to the
+///   index's directory, in `weight_map` order. Every listed key must be in its shard and every
+///   tensor of a shard must be listed; shard names can't leave the directory;
+/// - PyTorch's zip-based `.pt` format (`torch.save`, including `pytorch_model.bin`) holding a
+///   dict or `OrderedDict` of tensors, as `torch.load(path, map_location="cpu",
+///   weights_only=True)` reads it. For other objects, such as a checkpoint with an optimizer's
+///   state, use [`io::load_value`](crate::io::load_value). The archive and its pickle are
+///   checked as untrusted input, without running any code. Tensors that share storage in the
+///   file share it after loading, as views with the file's offsets and strides; each storage
+///   is read once, straight into its memory. BOOL bytes other than 0 and 1, which PyTorch
+///   writes and reads as `True`, become 1. Tensors keep the `requires_grad` saved with them,
+///   and a saved `Parameter` becomes a plain tensor. TorchScript archives (`torch.jit.save`)
+///   and files in the format before PyTorch 1.6 are not supported.
 ///
 /// A state dict from safetensors files has no [versions](StateDict::versions), which they can't
 /// hold; one from a `.pt` file has the versions saved with it (`_metadata`).
@@ -150,19 +179,21 @@ pub fn load(path: impl AsRef<Path>) -> Result<StateDict> {
 /// stay in this process and never reach the file. A file is unmapped when the last tensor that
 /// uses it is dropped, which can be long after the state dict is.
 ///
-/// Which tensors use the mapping is not part of the contract. Currently, a tensor whose data
-/// doesn't start at a multiple of its element size in the file (safetensors doesn't align data,
-/// although Python's `safetensors` and homura write 8-byte aligned files), a multi-byte tensor
-/// on a big-endian host and an empty tensor get memory of their own and a copy of the data.
-/// BOOL data is checked as [`load`] does, which reads only the pages of BOOL tensors.
-///
-/// Tensors can't be loaded from PyTorch's `.pt` format yet, mapped or not.
+/// Which tensors use the mapping is not part of the contract. Currently, these get memory of
+/// their own and a copy of the data: a tensor whose data doesn't start at a multiple of its
+/// element size in the file (safetensors doesn't align data, although Python's `safetensors`
+/// and homura write 8-byte aligned files; `torch.save` aligns to 64 bytes), multi-byte data in
+/// another byte order than the host's (safetensors files are little-endian, `.pt` files say
+/// which), an empty tensor, and the BOOL data of `.pt` files, whose bytes [`load`] changes to 0
+/// and 1. The BOOL data of safetensors files is checked as [`load`] does, which reads only the
+/// pages of BOOL tensors. The CRCs of `.pt` records are not checked, which would read every
+/// page; the structure of the archive is.
 ///
 /// # Safety
 ///
-/// Every file that is mapped (the safetensors file, or each shard that an index lists) must not
-/// be truncated or modified, by this or any other process, while any tensor whose data it holds
-/// is alive. That is not only the returned state dict but every tensor sharing its storage:
+/// Every file that is mapped (the safetensors or `.pt` file, or each shard that an index lists)
+/// must not be truncated or modified, by this or any other process, while any tensor whose data
+/// it holds is alive. That is not only the returned state dict but every tensor sharing its storage:
 /// views and other handles to its tensors, parameters that loading with
 /// [`LoadOptions::assign`](crate::nn::LoadOptions::assign) made use them, and optimizers holding
 /// those parameters. Tensors that hold a copy of the data, such as parameters loaded without
@@ -187,6 +218,73 @@ pub fn load(path: impl AsRef<Path>) -> Result<StateDict> {
 pub unsafe fn load_mmap(path: impl AsRef<Path>) -> Result<StateDict> {
     // SAFETY: the caller upholds the contract above.
     unsafe { load_with(path.as_ref(), Access::Map) }
+}
+
+/// Loads the object that a PyTorch `.pt` file holds, onto the CPU: a state dict, or a
+/// checkpoint of other values, such as `{"model": .., "optimizer": .., "epoch": 3}`.
+///
+/// It reads what `torch.load(path, map_location="cpu", weights_only=True)` reads: `None`,
+/// `bool`, `int` (up to 64 bits), `float`, `str`, `list`, `tuple`, `dict` (with `int` and
+/// `str` keys), `OrderedDict` (with the versions of a state dict's `_metadata`) and tensors,
+/// as [`Value`]s. Tensors are read as [`load`] reads them. The file is checked as untrusted
+/// input, without running any code; objects referenced several times are copied into each place,
+/// as far as a budget that grows with the file's size allows (a tensor stays one tensor, with
+/// the same handle in each place), and objects that contain themselves are an error.
+///
+/// # Errors
+///
+/// Returns an error for IO errors, malformed or unsupported files, and files in other formats
+/// (safetensors files and indexes hold state dicts: read them with [`load`]). No input makes it
+/// panic.
+///
+/// ```no_run
+/// use homura::io::{Value, load_value};
+///
+/// let Value::Dict(checkpoint) = load_value("checkpoint.pt")? else {
+///     panic!("not a checkpoint");
+/// };
+/// let model = checkpoint.get("model").expect("the checkpoint has a model");
+/// let state_dict = homura::nn::StateDict::try_from(model)?;
+/// # let _ = state_dict;
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn load_value(path: impl AsRef<Path>) -> Result<Value> {
+    let path = path.as_ref();
+    let mut file = File::open(path)?;
+    match detect(&mut file)? {
+        Format::Zip => pt::read_value(&mut file),
+        Format::Legacy => Err(legacy_not_supported(path)),
+        Format::Safetensors | Format::Index => Err(not_pt(&path.display().to_string())),
+    }
+}
+
+/// Like [`load_value`], for the bytes of a `.pt` file held in memory.
+///
+/// # Errors
+///
+/// As for [`load_value`].
+///
+/// ```no_run
+/// let bytes = std::fs::read("checkpoint.pt")?;
+/// let value = homura::io::load_value_from_bytes(&bytes)?;
+/// # let _ = value;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[track_caller]
+pub fn load_value_from_bytes(bytes: &[u8]) -> Result<Value> {
+    match detect_bytes(bytes) {
+        Format::Zip => pt::read_value(&mut Cursor::new(bytes)),
+        Format::Legacy => Err(legacy_not_supported(Path::new("the data"))),
+        Format::Safetensors | Format::Index => Err(not_pt("the data")),
+    }
+}
+
+fn not_pt(what: &str) -> Error {
+    Error::Format(format!(
+        "{what} is not a PyTorch .pt file (a zip archive); read safetensors files and indexes \
+         with homura::load"
+    ))
 }
 
 /// Saves a state dict to a file, in the format its extension names.

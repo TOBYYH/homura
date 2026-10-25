@@ -171,7 +171,7 @@ impl Layout {
 
     /// One past the largest element offset this layout touches (0 for an empty layout, which
     /// touches no memory), or `None` if that doesn't fit in `usize`.
-    fn checked_end(&self) -> Option<usize> {
+    pub fn checked_end(&self) -> Option<usize> {
         if crate::shape::checked_num_elements(&self.shape)? == 0 {
             return Some(0);
         }

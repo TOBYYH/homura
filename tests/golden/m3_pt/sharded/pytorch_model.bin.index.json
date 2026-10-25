@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "total_size": 72
+  },
+  "weight_map": {
+    "0.weight": "pytorch_model-00001-of-00002.bin",
+    "0.bias": "pytorch_model-00001-of-00002.bin",
+    "1.weight": "pytorch_model-00001-of-00002.bin",
+    "1.bias": "pytorch_model-00001-of-00002.bin",
+    "1.running_mean": "pytorch_model-00001-of-00002.bin",
+    "1.running_var": "pytorch_model-00001-of-00002.bin",
+    "1.num_batches_tracked": "pytorch_model-00001-of-00002.bin",
+    "2.weight": "pytorch_model-00002-of-00002.bin",
+    "2.bias": "pytorch_model-00002-of-00002.bin"
+  }
+}

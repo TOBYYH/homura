@@ -9,8 +9,10 @@
 //!   (`load` reads them through their index);
 //! - zero-copy loading: [`load_mmap`], which maps the files into memory. It is `unsafe`: the
 //!   files must not change while tensors use them. `load` never maps files;
-//! - the Python objects of PyTorch checkpoints: [`Value`], with [`Dict`] and its [`Key`]s, and
-//!   conversions from and to [`StateDict`](crate::nn::StateDict) that keep the module versions;
+//! - whole PyTorch checkpoints, not only state dicts: [`load_value`] and
+//!   [`load_value_from_bytes`] read the Python objects of `.pt` files as a [`Value`], with
+//!   [`Dict`] and its [`Key`]s, and conversions from and to [`StateDict`](crate::nn::StateDict)
+//!   that keep the module versions;
 //! - lists of tensors without a state dict: [`load_safetensors`],
 //!   [`load_safetensors_from_bytes`], [`save_safetensors`] and [`save_safetensors_to_bytes`],
 //!   also at the crate root.
@@ -19,8 +21,9 @@
 //! never a panic, and every length is checked against the file size before memory is allocated.
 //! PyTorch's `.pt` files are read with a restricted unpickler that never runs code: it accepts
 //! only the objects that [`Value`] describes, and limits how far objects referenced several times
-//! can expand, so a small file can't make it allocate without bound. Their tensors can't be
-//! loaded yet. Their zip archives are checked more strictly than PyTorch checks them: local
+//! can expand, so a small file can't make it allocate without bound. Their tensors are checked
+//! before they are made: the storage records must have the declared sizes and the views must lie
+//! inside them. Their zip archives are checked more strictly than PyTorch checks them: local
 //! headers and data descriptors must agree with the central directory, entries can't overlap,
 //! and nothing can follow the end of central directory record. The archives that `torch.save`
 //! and Python's `zipfile` write pass.
@@ -34,6 +37,9 @@
 //! | `huggingface_hub.save_torch_state_dict(sd, dir, max_shard_size=n)` | `io::save_sharded(&sd, dir, ShardOptions::default().max_shard_size(n))` |
 //! | loading `model.safetensors.index.json` | `homura::load("model.safetensors.index.json")` |
 //! | `torch.load(path, mmap=True)` | `unsafe { io::load_mmap(path) }` |
+//! | `torch.load(path, map_location="cpu", weights_only=True)` (a state dict) | `homura::load(path)` |
+//! | `torch.load(path, map_location="cpu", weights_only=True)` (a checkpoint) | `io::load_value(path)` |
+//! | loading `pytorch_model.bin.index.json` | `homura::load("pytorch_model.bin.index.json")` |
 
 mod file;
 mod json;
@@ -44,7 +50,7 @@ mod shard;
 mod value;
 mod zip;
 
-pub use file::{load, load_mmap, save};
+pub use file::{load, load_mmap, load_value, load_value_from_bytes, save};
 pub use safetensors::{
     load_safetensors, load_safetensors_from_bytes, safetensors_metadata, save_safetensors,
     save_safetensors_to_bytes, save_safetensors_with_metadata,

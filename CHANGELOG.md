@@ -90,11 +90,11 @@ All notable changes to this project are documented in this file. The format is b
   the state dict of a submodule, and `map_keys(f)`, which renames or drops each key (and drops
   the versions). Versions follow the prefixes.
 - `homura::load(path)` and `homura::save(&state_dict, path)` for model files. `load` tells the
-  format from the content: a safetensors file, or a sharded checkpoint's JSON index
-  (`model.safetensors.index.json`), whose shards it reads in `weight_map` order after checking
-  that the index and the shards agree and that shard names stay in the index's directory.
-  PyTorch's `.pt` files are read as far as their tensors (see below), which can't be loaded or
-  saved yet. `save` picks the format by the extension (`.safetensors`).
+  format from the content: a safetensors file, a PyTorch `.pt` file (see below), or a sharded
+  checkpoint's JSON index (`model.safetensors.index.json` or `pytorch_model.bin.index.json`),
+  whose shards it reads in `weight_map` order after checking that the index and the shards agree
+  and that shard names stay in the index's directory. `save` picks the format by the extension
+  (`.safetensors`; `.pt` files can't be saved yet).
 - The module `homura::io` is public, with `io::save_sharded(&sd, dir, ShardOptions)`, which
   splits a state dict into shards and an index in the Hugging Face layout (or one file if it
   fits) and replaces an earlier checkpoint with the same prefix in that directory: it removes
@@ -113,16 +113,28 @@ All notable changes to this project are documented in this file. The format is b
   in the process; a file is unmapped when the last tensor using it is dropped. It is `unsafe`
   because the files must not change while any tensor using them is alive; `load` and the other
   safe functions never map files. Tensors whose data isn't aligned to their element size in the
-  file are copied, and BOOL data is checked as for `load`.
-- Reading PyTorch's `.pt` format, as far as the tensors: `load` checks the zip archive (stored
-  entries, ZIP64, the data descriptors that `torch.save` writes, CRCs unless they are 0, which
-  means the writer didn't compute them) and its layout (`version` 1 to 10, `byteorder`), and
-  reads the pickle with a restricted unpickler that runs no code: it accepts only
-  `collections.OrderedDict`, PyTorch's tensor rebuild functions and storage classes, pickle
-  protocols 2 to 5, and int and str dict keys, and limits how far objects referenced several
-  times can expand, so a small file can't make it allocate without bound; cycles are an error.
-  Rebuilding the tensors follows, so for now only state dicts without tensors load. TorchScript
-  archives and the format before PyTorch 1.6 get errors that say so.
+  file or is in another byte order than the host's are copied, and BOOL data is checked as for
+  `load` (safetensors) or copied (`.pt`).
+- Reading PyTorch's `.pt` format, as `torch.load(path, map_location="cpu", weights_only=True)`
+  does: `load` and `load_mmap` read state dicts, including `pytorch_model.bin`, and the new
+  `io::load_value(path)` and `io::load_value_from_bytes(bytes)` read any checkpoint of the
+  supported objects (for example `{"model": .., "optimizer": .., "epoch": 3}`) as an `io::Value`.
+  Tensors keep the file's views: tensors that share a storage in the file share it after
+  loading (with its version counter), with the file's offsets and strides; a tensor referenced
+  several times is the same handle; each storage is read once, straight into its memory, and
+  swapped if the file's byte order isn't the host's. Tensors keep the `requires_grad` saved with
+  them, a `Parameter` becomes a plain tensor, and BOOL bytes other than 0 and 1, which PyTorch
+  writes and reads as `True`, are read as 1. Everything is checked before a tensor is made:
+  storage records must exist and have the declared size, a storage declared twice must be
+  declared alike, views must lie inside their storage, and only floating point tensors can
+  require grad. The zip archive is checked too (stored entries, ZIP64, the data descriptors that
+  `torch.save` writes, CRCs unless they are 0, which means the writer didn't compute them), and
+  its layout (`version` 1 to 10, `byteorder`). The pickle is read with a restricted unpickler
+  that runs no code: it accepts only `collections.OrderedDict`, PyTorch's tensor rebuild
+  functions and storage classes, pickle protocols 2 to 5, and int and str dict keys, and limits
+  how far objects referenced several times can expand, so a small file can't make it allocate
+  without bound; cycles are an error. TorchScript archives and the format before PyTorch 1.6
+  get errors that say so.
 - `io::Value`, `io::Dict` and `io::Key`: the Python objects of checkpoints (None, bool, int,
   float, str, list, tuple, dict or `OrderedDict` with int or str keys, and tensors). An
   `OrderedDict` keeps the module versions of a state dict (PyTorch's `_metadata`), also inside a

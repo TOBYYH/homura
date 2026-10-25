@@ -526,9 +526,8 @@ impl Archive {
     }
 }
 
-/// Reads the data of `entry`, checking its CRC unless the recorded one is 0, which writers use
-/// when they don't compute it (PyTorch's `set_crc32_options(False)`).
-pub(super) fn read_entry<R: Read + Seek>(r: &mut R, entry: &Entry) -> Result<Vec<u8>> {
+/// Checks that `entry` can be read: only stored entries can.
+pub(super) fn check_stored(entry: &Entry) -> Result<()> {
     if entry.method != 0 {
         return Err(Error::Format(format!(
             "unsupported zip archive: {:?} is compressed (method {}); only stored entries are \
@@ -536,17 +535,43 @@ pub(super) fn read_entry<R: Read + Seek>(r: &mut R, entry: &Entry) -> Result<Vec
             entry.name, entry.method
         )));
     }
+    Ok(())
+}
+
+/// Reads the data of `entry`, checking its CRC unless the recorded one is 0, which writers use
+/// when they don't compute it (PyTorch's `set_crc32_options(False)`).
+pub(super) fn read_entry<R: Read + Seek>(r: &mut R, entry: &Entry) -> Result<Vec<u8>> {
+    check_stored(entry)?;
     // The archive check put the data inside the file, so its size fits in memory as far as the
     // file does.
     let size = usize::try_from(entry.size).map_err(|_| bad("an entry is too large"))?;
-    let data = read_at(r, entry.start, size)?;
-    if entry.crc != 0 && crc32(&data) != entry.crc {
+    let mut data = vec![0; size];
+    read_entry_into(r, entry, &mut data)?;
+    Ok(data)
+}
+
+/// Reads the data of `entry` into `buf`, which must have the entry's size, with the CRC check
+/// of [`read_entry`].
+pub(super) fn read_entry_into<R: Read + Seek>(
+    r: &mut R,
+    entry: &Entry,
+    buf: &mut [u8],
+) -> Result<()> {
+    check_stored(entry)?;
+    assert_eq!(
+        buf.len() as u64,
+        entry.size,
+        "the buffer has the entry's size"
+    );
+    r.seek(SeekFrom::Start(entry.start))?;
+    r.read_exact(buf)?;
+    if entry.crc != 0 && crc32(buf) != entry.crc {
         return Err(bad(&format!(
             "the CRC of {:?} doesn't match its data",
             entry.name
         )));
     }
-    Ok(data)
+    Ok(())
 }
 
 const CRC_TABLE: [u32; 256] = {

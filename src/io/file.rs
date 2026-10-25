@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::{safetensors, shard};
+use super::{pt, safetensors, shard};
 use crate::nn::StateDict;
 use crate::{Error, Result, Tensor};
 
@@ -15,18 +15,27 @@ enum Format {
     Safetensors,
     /// A zip archive: PyTorch's `.pt` format.
     Zip,
+    /// PyTorch's format before 1.6: a sequence of pickles.
+    Legacy,
     /// A JSON index of shards.
     Index,
 }
 
+/// How a file in PyTorch's format before 1.6 starts: pickle protocol 2 and the `LONG1` opcode
+/// of its magic number, `0x1950a86a20f9469cfc6c`.
+const LEGACY_MAGIC: [u8; 8] = [0x80, 0x02, 0x8a, 0x0a, 0x6c, 0xfc, 0x9c, 0x46];
+
 /// Tells the format of `file` from its first eight bytes. A safetensors file starts with its
-/// header length, whose upper bytes are zero for any header size the reader accepts; a JSON text
-/// starts with `{` and never contains a zero byte. The readers seek back to the start themselves.
+/// header length, whose upper bytes are zero for any header size the reader accepts (which
+/// also rules out [`LEGACY_MAGIC`]); a JSON text starts with `{` and never contains a zero byte.
+/// The readers seek back to the start themselves.
 fn detect(file: &mut File) -> Result<Format> {
     let mut start = Vec::with_capacity(8);
     file.by_ref().take(8).read_to_end(&mut start)?;
     Ok(if start.starts_with(b"PK\x03\x04") {
         Format::Zip
+    } else if start == LEGACY_MAGIC {
+        Format::Legacy
     } else if start.first() == Some(&b'{') && !start.contains(&0) {
         Format::Index
     } else {
@@ -43,9 +52,10 @@ pub(super) enum Access {
     Map,
 }
 
-fn pt_not_supported(path: &Path) -> Error {
+fn legacy_not_supported(path: &Path) -> Error {
     Error::Format(format!(
-        "{} is a PyTorch .pt file, which can't be loaded yet",
+        "{} is in the format of PyTorch before 1.6, which is not supported: load it with \
+         torch.load and save it again with torch.save in a newer PyTorch",
         path.display()
     ))
 }
@@ -60,7 +70,8 @@ pub(super) unsafe fn load_shard(path: &Path, access: Access) -> Result<Vec<(Stri
     match detect(&mut file)? {
         // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
         Format::Safetensors => unsafe { read_safetensors(&mut file, access) },
-        Format::Zip => Err(pt_not_supported(path)),
+        Format::Zip => Ok(pt::read_state_dict(&mut file)?.into_iter().collect()),
+        Format::Legacy => Err(legacy_not_supported(path)),
         Format::Index => Err(Error::Format(format!(
             "{} is an index, not a shard",
             path.display()
@@ -89,7 +100,8 @@ unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
         Format::Safetensors => Ok(unsafe { read_safetensors(&mut file, access) }?
             .into_iter()
             .collect()),
-        Format::Zip => Err(pt_not_supported(path)),
+        Format::Zip => pt::read_state_dict(&mut file),
+        Format::Legacy => Err(legacy_not_supported(path)),
         // SAFETY: as above.
         Format::Index => unsafe { shard::read_index(path, file, access) },
     }
@@ -105,9 +117,13 @@ unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
 ///   shards that its `weight_map` lists, relative to the index's directory, in `weight_map`
 ///   order. Every listed key must be in its shard and every tensor of a shard must be listed;
 ///   shard names can't leave the directory;
-/// - PyTorch's zip-based `.pt` format (including `pytorch_model.bin`) can't be loaded yet.
+/// - PyTorch's zip-based `.pt` format (including `pytorch_model.bin`): the archive and its
+///   pickle are checked as untrusted input, without running any code, but tensors can't be
+///   loaded from them yet. TorchScript archives (`torch.jit.save`) and files in the format before
+///   PyTorch 1.6 are not supported.
 ///
-/// The state dict has no [versions](StateDict::versions): safetensors files can't hold them.
+/// A state dict from safetensors files has no [versions](StateDict::versions), which they can't
+/// hold; one from a `.pt` file has the versions saved with it (`_metadata`).
 ///
 /// # Errors
 ///
@@ -140,7 +156,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<StateDict> {
 /// on a big-endian host and an empty tensor get memory of their own and a copy of the data.
 /// BOOL data is checked as [`load`] does, which reads only the pages of BOOL tensors.
 ///
-/// PyTorch's `.pt` format can't be loaded yet, mapped or not.
+/// Tensors can't be loaded from PyTorch's `.pt` format yet, mapped or not.
 ///
 /// # Safety
 ///

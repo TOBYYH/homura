@@ -93,8 +93,8 @@ All notable changes to this project are documented in this file. The format is b
   format from the content: a safetensors file, or a sharded checkpoint's JSON index
   (`model.safetensors.index.json`), whose shards it reads in `weight_map` order after checking
   that the index and the shards agree and that shard names stay in the index's directory.
-  PyTorch's `.pt` files are recognized but can't be loaded or saved yet. `save` picks the format
-  by the extension (`.safetensors`).
+  PyTorch's `.pt` files are read as far as their tensors (see below), which can't be loaded or
+  saved yet. `save` picks the format by the extension (`.safetensors`).
 - The module `homura::io` is public, with `io::save_sharded(&sd, dir, ShardOptions)`, which
   splits a state dict into shards and an index in the Hugging Face layout (or one file if it
   fits) and replaces an earlier checkpoint with the same prefix in that directory: it removes
@@ -114,6 +114,20 @@ All notable changes to this project are documented in this file. The format is b
   because the files must not change while any tensor using them is alive; `load` and the other
   safe functions never map files. Tensors whose data isn't aligned to their element size in the
   file are copied, and BOOL data is checked as for `load`.
+- Reading PyTorch's `.pt` format, as far as the tensors: `load` checks the zip archive (stored
+  entries, ZIP64, the data descriptors that `torch.save` writes, CRCs unless they are 0, which
+  means the writer didn't compute them) and its layout (`version` 1 to 10, `byteorder`), and
+  reads the pickle with a restricted unpickler that runs no code: it accepts only
+  `collections.OrderedDict`, PyTorch's tensor rebuild functions and storage classes, pickle
+  protocols 2 to 5, and int and str dict keys, and limits how far objects referenced several
+  times can expand, so a small file can't make it allocate without bound; cycles are an error.
+  Rebuilding the tensors follows, so for now only state dicts without tensors load. TorchScript
+  archives and the format before PyTorch 1.6 get errors that say so.
+- `io::Value`, `io::Dict` and `io::Key`: the Python objects of checkpoints (None, bool, int,
+  float, str, list, tuple, dict or `OrderedDict` with int or str keys, and tensors). An
+  `OrderedDict` keeps the module versions of a state dict (PyTorch's `_metadata`), also inside a
+  checkpoint: `Value::from(&state_dict)` and `StateDict::try_from(&value)` convert with them,
+  and a plain dict gives a state dict without versions.
 
 ### Changed
 

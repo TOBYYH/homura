@@ -28,7 +28,9 @@ Implemented so far:
 - Model files: `homura::load` / `homura::save` for state dicts in safetensors files, read
   straight into tensor storage; safetensors `__metadata__`; sharded checkpoints in the Hugging
   Face layout (`model.safetensors.index.json`) and zero-copy loading by memory mapping
-  (`unsafe fn io::load_mmap`) through `homura::io`.
+  (`unsafe fn io::load_mmap`) through `homura::io`; `io::Value` for the Python objects of
+  checkpoints. PyTorch `.pt` files are parsed with a restricted unpickler; loading their tensors
+  comes next.
 - The core of `nn` modules: `Parameter`, `#[derive(Module)]` and the `Module` trait with
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
   `Sequential`; `nn::init`, `Linear`, `Embedding`, `LayerNorm`, `RmsNorm`, `Dropout`, the

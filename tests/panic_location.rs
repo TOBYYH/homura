@@ -294,6 +294,8 @@ fn io_options() {
     at!(options().max_shard_size(0));
     at!(options().prefix("a/b"));
     at!(options().prefix("model-00001-of-00002"));
+    let mut dict = homura::io::Dict::new();
+    at!(dict.set_versions(Some(nn::ModuleVersions::new())));
     finish();
 }
 

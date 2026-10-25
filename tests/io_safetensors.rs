@@ -15,6 +15,11 @@ use homura::optim::{Optimizer, Sgd};
 use homura::{DType, Device, Error, Tensor};
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/m3_safetensors");
+/// A PyTorch `.pt` state dict (from `tools/golden/gen_m3_pt.py`).
+const PT_STATE_DICT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/m3_pt/state_dict.pt"
+);
 
 /// A fresh, empty directory for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -457,8 +462,8 @@ fn load_tells_formats_by_content() {
     let bytes = homura::save_safetensors_to_bytes([("w", state_dict.get("w").unwrap())]).unwrap();
     fs::write(dir.join("weights.bin"), &bytes).unwrap();
     assert_same_dict(&homura::load(dir.join("weights.bin")).unwrap(), &state_dict);
-    // A zip archive is PyTorch's format, not supported yet.
-    fs::write(dir.join("model.safetensors"), b"PK\x03\x04rest").unwrap();
+    // A zip archive is PyTorch's format, whose tensors can't be loaded yet.
+    fs::copy(PT_STATE_DICT, dir.join("model.safetensors")).unwrap();
     assert!(is_format_error(
         homura::load(dir.join("model.safetensors")),
         "can't be loaded yet"
@@ -910,7 +915,7 @@ fn sharded_index_errors() {
         &original.replace(&shard(2), "model.safetensors.index.json"),
         "is an index, not a shard",
     );
-    fs::write(dir.join("zip.bin"), b"PK\x03\x04").unwrap();
+    fs::copy(PT_STATE_DICT, dir.join("zip.bin")).unwrap();
     check(
         &original.replace(&shard(2), "zip.bin"),
         "can't be loaded yet",

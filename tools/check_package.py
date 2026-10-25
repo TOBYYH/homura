@@ -112,6 +112,11 @@ fn main() {
 
     net.forward(&hm::randn([2, 3, 4, 4])).sum().backward();
     assert!(net.parameters().iter().all(|p| p.grad().is_some()));
+    let shards = hm::io::ShardOptions::default().max_shard_size(256);
+    hm::io::save_sharded(&net.state_dict(), "shards", shards).unwrap();
+    let loaded = hm::load("shards/model.safetensors.index.json").unwrap();
+    assert_eq!(loaded.keys().collect::<Vec<_>>(), keys);
+    net.load_state_dict(&loaded).unwrap();
     net.eval();
     assert_eq!(net.forward(&hm::randn([1, 3, 4, 4])).shape(), [1, 2]);
     println!("external crate: ok");

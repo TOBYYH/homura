@@ -39,7 +39,7 @@ mod defaults;
 mod device;
 mod dtype;
 mod error;
-mod io;
+pub mod io;
 pub mod nn;
 mod ops;
 pub mod optim;
@@ -61,7 +61,8 @@ pub use device::Device;
 pub use dtype::{DType, Element, Scalar, can_cast, promote_types};
 pub use error::{Error, Result};
 pub use io::{
-    load_safetensors, load_safetensors_from_bytes, save_safetensors, save_safetensors_to_bytes,
+    load, load_safetensors, load_safetensors_from_bytes, save, save_safetensors,
+    save_safetensors_to_bytes,
 };
 pub use ops::{
     GeluApproximate, Number, Operand, ValuesAndIndices, concat, manual_seed, rand, rand_like,

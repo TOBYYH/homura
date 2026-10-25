@@ -3,10 +3,17 @@
 //! The format is an 8-byte little-endian header length, a JSON header describing each tensor
 //! (`dtype`, `shape` and `data_offsets` into the data section) and the raw little-endian data.
 
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::json::{self, Json};
 use crate::backend::cpu;
+use crate::nn::StateDict;
+use crate::storage::Storage;
+use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Error, Result, Shape, Tensor};
 
 fn dtype_name(dtype: DType) -> &'static str {
@@ -44,12 +51,21 @@ fn to_from_le(bytes: &mut [u8], elem_size: usize) {
 const MAX_HEADER_LEN: u64 = 100_000_000;
 
 /// A validated tensor entry of a safetensors header.
-struct Entry<'a> {
-    name: &'a str,
+struct Entry {
+    name: String,
     dtype: DType,
     shape: Shape,
     begin: usize,
     end: usize,
+}
+
+/// A validated safetensors header.
+struct Header {
+    metadata: Vec<(String, String)>,
+    /// In header order.
+    entries: Vec<Entry>,
+    /// Where the data section starts in the file.
+    data_start: u64,
 }
 
 fn bad(msg: &str) -> Error {
@@ -57,7 +73,7 @@ fn bad(msg: &str) -> Error {
 }
 
 /// Parses one tensor entry, checking that its byte range matches its shape and dtype.
-fn parse_entry<'a>(name: &'a str, info: &Json) -> Result<Entry<'a>> {
+fn parse_entry(name: &str, info: &Json) -> Result<Entry> {
     let field = |key: &str| {
         info.get(key)
             .ok_or_else(|| bad(&format!("{name}: missing {key}")))
@@ -92,7 +108,7 @@ fn parse_entry<'a>(name: &'a str, info: &Json) -> Result<Entry<'a>> {
         )));
     }
     Ok(Entry {
-        name,
+        name: name.to_string(),
         dtype,
         shape: Shape::new(&shape),
         begin,
@@ -100,44 +116,46 @@ fn parse_entry<'a>(name: &'a str, info: &Json) -> Result<Entry<'a>> {
     })
 }
 
-/// Parses safetensors data held in memory. Tensors are created on the CPU, in header order.
+/// Reads and validates the header of the safetensors data in `r`, leaving the data alone.
 ///
-/// The whole header is validated before any tensor is created: names must be unique,
-/// `__metadata__` must map strings to strings, and the tensors' byte ranges must exactly tile
-/// the data section without overlaps, holes or trailing bytes.
-#[track_caller]
-pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>> {
-    let len_bytes: [u8; 8] = bytes
-        .get(..8)
-        .ok_or_else(|| bad("missing header length"))?
-        .try_into()
-        .unwrap();
+/// Every length is compared with the size of the data before anything is allocated: the header
+/// must fit, names must be unique, `__metadata__` must map strings to strings, and the tensors'
+/// byte ranges must exactly tile the data section without overlaps, holes or trailing bytes.
+fn read_header<R: Read + Seek>(r: &mut R) -> Result<Header> {
+    let len = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
+    if len < 8 {
+        return Err(bad("missing header length"));
+    }
+    let mut len_bytes = [0; 8];
+    r.read_exact(&mut len_bytes)?;
     let header_len = u64::from_le_bytes(len_bytes);
     if header_len > MAX_HEADER_LEN {
         return Err(bad("header is too large"));
     }
-    let data_start = 8 + header_len as usize;
-    if data_start > bytes.len() {
+    let data_start = 8 + header_len;
+    if data_start > len {
         return Err(bad("header length exceeds file size"));
     }
-    let header =
-        std::str::from_utf8(&bytes[8..data_start]).map_err(|_| bad("header is not UTF-8"))?;
+    let mut header = vec![0; header_len as usize];
+    r.read_exact(&mut header)?;
+    let header = std::str::from_utf8(&header).map_err(|_| bad("header is not UTF-8"))?;
     // The JSON parser rejects duplicate keys, so tensor names are unique.
     let header = json::parse(header)?;
     let members = header
         .as_object()
         .ok_or_else(|| bad("header is not an object"))?;
-    let data = &bytes[data_start..];
 
+    let mut metadata = vec![];
     let mut entries = vec![];
     for (name, info) in members {
         if name == "__metadata__" {
-            let valid = info
-                .as_object()
-                .is_some_and(|m| m.iter().all(|(_, v)| v.as_str().is_some()));
-            if !valid {
-                return Err(bad("__metadata__ must map strings to strings"));
-            }
+            let pairs = info.as_object().and_then(|m| {
+                m.iter()
+                    .map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect::<Option<Vec<_>>>()
+            });
+            metadata = pairs.ok_or_else(|| bad("__metadata__ must map strings to strings"))?;
         } else {
             entries.push(parse_entry(name, info)?);
         }
@@ -151,49 +169,99 @@ pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>
         }
         covered = end;
     }
-    if covered != data.len() {
+    if covered as u64 != len - data_start {
         return Err(bad("data section doesn't match the tensors in the header"));
     }
+    Ok(Header {
+        metadata,
+        entries,
+        data_start,
+    })
+}
 
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let mut raw = data[e.begin..e.end].to_vec();
-        if e.dtype == DType::Bool && raw.iter().any(|&b| b > 1) {
+/// Reads the tensors of the safetensors data in `r` onto the CPU, in header order.
+///
+/// Each tensor's data is read straight into its new storage, so the peak memory is about the
+/// total size of the tensors. BOOL data is checked to consist of the bytes 0 and 1 before the
+/// tensor is created.
+pub(super) fn read<R: Read + Seek>(r: &mut R) -> Result<Vec<(String, Tensor)>> {
+    let header = read_header(r)?;
+    let mut pos = None;
+    let mut out = Vec::with_capacity(header.entries.len());
+    for e in header.entries {
+        let start = header.data_start + e.begin as u64;
+        if pos != Some(start) {
+            r.seek(SeekFrom::Start(start))?;
+        }
+        let mut storage = Storage::new(e.end - e.begin, Device::Cpu);
+        let bytes = storage.cpu_bytes_mut();
+        r.read_exact(bytes)?;
+        pos = Some(header.data_start + e.end as u64);
+        if e.dtype == DType::Bool && bytes.iter().any(|&b| b > 1) {
             return Err(bad(&format!(
                 "{}: BOOL data must consist of the bytes 0 and 1",
                 e.name
             )));
         }
-        to_from_le(&mut raw, e.dtype.size_in_bytes());
-        let t = Tensor::empty_on(e.shape, e.dtype, Device::Cpu);
-        cpu::write_bytes(&t.data(), &raw);
-        out.push((e.name.to_string(), t));
+        to_from_le(bytes, e.dtype.size_in_bytes());
+        let t = Tensor::from_data(TensorData {
+            storage: Arc::new(storage),
+            layout: Layout::contiguous(e.shape),
+            dtype: e.dtype,
+        });
+        out.push((e.name, t));
     }
     Ok(out)
 }
 
-/// Loads every tensor of a safetensors file onto the CPU, in header order.
+/// Parses safetensors data held in memory. Tensors are created on the CPU, in header order.
 ///
-/// The whole file is read into memory; memory mapping and sharded checkpoints come later.
+/// The whole header is validated before any tensor is created: names must be unique,
+/// `__metadata__` must map strings to strings, and the tensors' byte ranges must exactly tile
+/// the data section without overlaps, holes or trailing bytes. BOOL data must consist of the
+/// bytes 0 and 1 (Python's `safetensors` accepts other bytes).
 #[track_caller]
-pub fn load_safetensors(path: impl AsRef<Path>) -> Result<Vec<(String, Tensor)>> {
-    load_safetensors_from_bytes(&std::fs::read(path)?)
+pub fn load_safetensors_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Tensor)>> {
+    read(&mut Cursor::new(bytes))
 }
 
-/// Serializes tensors in the safetensors format.
+/// Loads every tensor of a safetensors file onto the CPU, in header order.
 ///
-/// # Errors
-///
-/// Returns an error for meta tensors (they have no data), duplicate names and the name
-/// `__metadata__`, which the format reserves.
+/// The file is validated as [`load_safetensors_from_bytes`] describes. Each tensor's data is
+/// read from the file straight into its storage, without reading the whole file into memory
+/// first. [`homura::load`](crate::load) does the same and returns a
+/// [`StateDict`](crate::nn::StateDict).
 #[track_caller]
-pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
+pub fn load_safetensors(path: impl AsRef<Path>) -> Result<Vec<(String, Tensor)>> {
+    read(&mut File::open(path)?)
+}
+
+/// The `__metadata__` of a safetensors file: string keys and values, empty if the file has none.
+///
+/// Only the header is read, but all of it is validated as for loading.
+///
+/// ```no_run
+/// let metadata = homura::io::safetensors_metadata("model.safetensors")?;
+/// if metadata.get("format").is_some_and(|f| f == "pt") {
+///     println!("saved from PyTorch");
+/// }
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn safetensors_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
+    Ok(read_header(&mut File::open(path)?)?
+        .metadata
+        .into_iter()
+        .collect())
+}
+
+/// Takes a snapshot of the tensors to save, checking their names and devices first.
+pub(super) fn snapshot<'a, K: AsRef<str>>(
     tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
-) -> Result<Vec<u8>> {
-    let mut header = String::from("{");
-    let mut data: Vec<u8> = vec![];
+) -> Result<Vec<(String, TensorData)>> {
     let mut names = std::collections::HashSet::new();
-    for (i, (name, t)) in tensors.into_iter().enumerate() {
+    let mut out = vec![];
+    for (name, t) in tensors {
         let name = name.as_ref();
         if name == "__metadata__" {
             return Err(Error::Format(
@@ -208,42 +276,91 @@ pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
                 "can't save meta tensor {name:?}: it has no data"
             )));
         }
-        // Made contiguous at the data level, so that saving records nothing for autograd.
-        let c = t.data();
-        let c = if c.layout.is_contiguous() {
-            c
-        } else {
-            crate::ops::clone_data(&c)
-        };
-        let mut raw = cpu::read_bytes(&c);
-        to_from_le(&mut raw, c.dtype.size_in_bytes());
-        if i > 0 {
+        out.push((name.to_string(), t.data()));
+    }
+    Ok(out)
+}
+
+/// The size of the data of a tensor in a safetensors file.
+pub(super) fn data_size(data: &TensorData) -> usize {
+    data.layout.num_elements() * data.dtype.size_in_bytes()
+}
+
+/// Writes `tensors` (from [`snapshot`]) in the safetensors format, with `__metadata__` if
+/// `metadata` is given. Tensors are converted and written one at a time.
+pub(super) fn write<W: Write>(
+    w: &mut W,
+    tensors: &[(String, TensorData)],
+    metadata: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    let mut header = String::from("{");
+    if let Some(metadata) = metadata {
+        header.push_str("\"__metadata__\":{");
+        for (i, (k, v)) in metadata.iter().enumerate() {
+            if i > 0 {
+                header.push(',');
+            }
+            json::write_string(&mut header, k);
+            header.push(':');
+            json::write_string(&mut header, v);
+        }
+        header.push('}');
+    }
+    let mut offset = 0;
+    for (name, data) in tensors {
+        if header.len() > 1 {
             header.push(',');
         }
         json::write_string(&mut header, name);
-        let shape: Vec<String> = c.layout.shape.iter().map(|d| d.to_string()).collect();
+        let shape: Vec<String> = data.layout.shape.iter().map(|d| d.to_string()).collect();
+        let end = offset + data_size(data);
         header.push_str(&format!(
-            ":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
-            dtype_name(c.dtype),
+            ":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{offset},{end}]}}",
+            dtype_name(data.dtype),
             shape.join(","),
-            data.len(),
-            data.len() + raw.len()
         ));
-        data.extend_from_slice(&raw);
+        offset = end;
     }
     header.push('}');
     // Pad the header with spaces so the data starts 8-byte aligned.
     while header.len() % 8 != 0 {
         header.push(' ');
     }
-    let mut out = Vec::with_capacity(8 + header.len() + data.len());
-    out.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(&data);
+    w.write_all(&(header.len() as u64).to_le_bytes())?;
+    w.write_all(header.as_bytes())?;
+    for (_, data) in tensors {
+        // Made contiguous at the data level, so that saving records nothing for autograd.
+        let c = if data.layout.is_contiguous() {
+            data.clone()
+        } else {
+            crate::ops::clone_data(data)
+        };
+        let mut raw = cpu::read_bytes(&c);
+        to_from_le(&mut raw, c.dtype.size_in_bytes());
+        w.write_all(&raw)?;
+    }
+    Ok(())
+}
+
+/// Serializes tensors in the safetensors format.
+///
+/// # Errors
+///
+/// Returns an error for meta tensors (they have no data), duplicate names and the name
+/// `__metadata__`, which the format reserves.
+#[track_caller]
+pub fn save_safetensors_to_bytes<'a, K: AsRef<str>>(
+    tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
+) -> Result<Vec<u8>> {
+    let mut out = vec![];
+    write(&mut out, &snapshot(tensors)?, None)?;
     Ok(out)
 }
 
 /// Writes tensors to a safetensors file.
+///
+/// The tensors are checked as for [`save_safetensors_to_bytes`] before the file is created, and
+/// written to it one at a time.
 ///
 /// ```no_run
 /// let w = homura::randn([2, 3]);
@@ -255,6 +372,33 @@ pub fn save_safetensors<'a, K: AsRef<str>>(
     tensors: impl IntoIterator<Item = (K, &'a Tensor)>,
     path: impl AsRef<Path>,
 ) -> Result<()> {
-    std::fs::write(path, save_safetensors_to_bytes(tensors)?)?;
-    Ok(())
+    let tensors = snapshot(tensors)?;
+    write(&mut File::create(path)?, &tensors, None)
+}
+
+/// Writes a state dict to a safetensors file with `metadata` as its `__metadata__`, like
+/// `safetensors.torch.save_file(state_dict, path, metadata)`.
+///
+/// The `__metadata__` entry is written even when `metadata` is empty, as Python's `safetensors`
+/// does for an empty dict. The format has no place for the state dict's
+/// [versions](StateDict::versions), and each key gets its own copy of the data, even for tensors
+/// that share storage. Errors as for [`save_safetensors_to_bytes`].
+///
+/// ```no_run
+/// use std::collections::BTreeMap;
+///
+/// let model = homura::nn::Linear::new(4, 2);
+/// # use homura::nn::Module;
+/// let metadata = BTreeMap::from([("format".to_string(), "pt".to_string())]);
+/// homura::io::save_safetensors_with_metadata(&model.state_dict(), "model.safetensors", &metadata)?;
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn save_safetensors_with_metadata(
+    state_dict: &StateDict,
+    path: impl AsRef<Path>,
+    metadata: &BTreeMap<String, String>,
+) -> Result<()> {
+    let tensors = snapshot(state_dict)?;
+    write(&mut File::create(path)?, &tensors, Some(metadata))
 }

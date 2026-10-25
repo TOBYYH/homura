@@ -25,7 +25,9 @@ Implemented so far:
   decoder layer.
 - Custom differentiable operations through `autograd::Function`, including higher-order
   derivatives through saved inputs and outputs.
-- Minimal safetensors reading and writing.
+- Model files: `homura::load` / `homura::save` for state dicts in safetensors files, read
+  straight into tensor storage; safetensors `__metadata__`; sharded checkpoints in the Hugging
+  Face layout (`model.safetensors.index.json`) through `homura::io`.
 - The core of `nn` modules: `Parameter`, `#[derive(Module)]` and the `Module` trait with
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
   `Sequential`; `nn::init`, `Linear`, `Embedding`, `LayerNorm`, `RmsNorm`, `Dropout`, the

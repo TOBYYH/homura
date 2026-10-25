@@ -106,6 +106,25 @@ impl Storage {
         }
     }
 
+    /// The host memory of a storage that no tensor uses yet, for filling it (from a file, for
+    /// example) before it is shared. Exclusive access makes the CPU execution lock unnecessary.
+    ///
+    /// This is how raw bytes enter tensors, so the caller must uphold the invariant of `Bool`
+    /// data before the storage gets a `Bool` tensor: every byte is 0 or 1. CPU kernels read it as
+    /// Rust `bool`, for which any other byte is undefined behaviour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the storage is not on the CPU.
+    pub fn cpu_bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.buffer {
+            // SAFETY: the buffer owns `nbytes` initialized (zeroed) bytes at `ptr`, and `&mut self`
+            // rules out any other access while the slice lives.
+            Buffer::Cpu(b) => unsafe { std::slice::from_raw_parts_mut(b.ptr.as_ptr(), b.nbytes) },
+            Buffer::Meta { .. } => panic!("meta tensors have no data"),
+        }
+    }
+
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }

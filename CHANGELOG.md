@@ -89,6 +89,24 @@ All notable changes to this project are documented in this file. The format is b
   `consume_prefix_in_state_dict_if_present`, for `module.*` keys), `add_prefix`, `sub(prefix)`,
   the state dict of a submodule, and `map_keys(f)`, which renames or drops each key (and drops
   the versions). Versions follow the prefixes.
+- `homura::load(path)` and `homura::save(&state_dict, path)` for model files. `load` tells the
+  format from the content: a safetensors file, or a sharded checkpoint's JSON index
+  (`model.safetensors.index.json`), whose shards it reads in `weight_map` order after checking
+  that the index and the shards agree and that shard names stay in the index's directory.
+  PyTorch's `.pt` files are recognized but can't be loaded or saved yet. `save` picks the format
+  by the extension (`.safetensors`).
+- The module `homura::io` is public, with `io::save_sharded(&sd, dir, ShardOptions)`, which
+  splits a state dict into shards and an index in the Hugging Face layout (or one file if it
+  fits) and replaces an earlier checkpoint with the same prefix in that directory: it removes
+  the entry point of the other layout, which loaders could pick instead of the new files, and
+  the old shards that the earlier index lists. `ShardOptions::prefix` refuses prefixes that end
+  like a numbered shard (`model-00001-of-00002`), so different prefixes never share file names;
+  `io::safetensors_metadata(path)` and `io::save_safetensors_with_metadata(&sd, path,
+  &metadata)` for `__metadata__`, and the four existing safetensors functions, which keep their
+  signatures and stay at the crate root.
+- safetensors files are read from the file straight into each tensor's storage instead of being
+  read into memory as a whole first, so loading needs about the size of the tensors, not twice
+  that. Saving writes one tensor at a time.
 
 ### Changed
 

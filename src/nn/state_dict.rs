@@ -71,11 +71,12 @@ impl<V> Ordered<V> {
 /// `OrderedDict` that PyTorch's `state_dict()` returns, and the versions of its modules (PyTorch's
 /// `state_dict._metadata`, see [`versions`](StateDict::versions)).
 ///
-/// [`Module::state_dict`](super::Module::state_dict) fills it; it can also be collected from
-/// `(String, Tensor)` pairs, such as those [`load_safetensors`](crate::load_safetensors)
+/// [`Module::state_dict`](super::Module::state_dict) fills it, [`homura::load`](crate::load)
+/// reads it from a file and [`homura::save`](crate::save) writes it. It can also be collected
+/// from `(String, Tensor)` pairs, such as those [`load_safetensors`](crate::load_safetensors)
 /// returns, and iterated by reference to save it with
-/// [`save_safetensors`](crate::save_safetensors). Neither has versions: a safetensors file
-/// doesn't store them, as in PyTorch.
+/// [`save_safetensors`](crate::save_safetensors). State dicts read from safetensors files have no
+/// versions: the format doesn't store them, as in PyTorch.
 ///
 /// ```
 /// use homura::nn::StateDict;

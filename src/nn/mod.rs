@@ -192,6 +192,7 @@
 //! | `nn.ModuleList`, `nn.ModuleDict` | `Vec<T>`, `BTreeMap<String, T>` fields |
 //! | `self.training` | a [`Training`] field: `self.training.get()` |
 //! | the same submodule assigned twice | an `Arc<T>` in both fields |
+//! | `safetensors.torch.save_file(model.state_dict(), "m.safetensors")`, `safetensors.torch.load_file("m.safetensors")` | [`homura::save(&model.state_dict(), "m.safetensors")`](crate::save), [`homura::load("m.safetensors")`](crate::load); see [`homura::io`](crate::io) for metadata and shards |
 //! | `model.state_dict()`, `model.load_state_dict(sd)`, `model.load_state_dict(sd, strict=False)` | [`model.state_dict()`](Module::state_dict), [`model.load_state_dict(&sd)`](Module::load_state_dict), [`model.load_state_dict_with(&sd, LoadOptions::default().strict(false))`](Module::load_state_dict_with), returning a `Result` |
 //! | `with torch.device("meta"): model = Net()`, `model.load_state_dict(sd, assign=True)` | [`let model = homura::with_device(Device::Meta, Net::new)`](crate::with_device), [`model.load_state_dict_with(&sd, LoadOptions::default().assign(true))`](LoadOptions::assign) |
 //! | `model.to(torch.float64)`, `model.to("meta")` | [`model.to(DType::F64)`](Module::to), `model.to(Device::Meta)` |

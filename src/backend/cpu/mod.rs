@@ -275,34 +275,6 @@ pub(crate) fn write_host<T: Element>(dst: &TensorData, values: &[T]) {
     });
 }
 
-/// Writes raw element bytes into a contiguous tensor.
-///
-/// `Bool` storage must only ever hold the bytes 0 and 1: kernels read it as Rust `bool`, for
-/// which any other byte is undefined behaviour. This function is the only way raw bytes enter a
-/// tensor, so it enforces that invariant.
-pub(crate) fn write_bytes(dst: &TensorData, bytes: &[u8]) {
-    let size = dst.dtype.size_in_bytes();
-    assert!(dst.layout.is_contiguous() && dst.layout.num_elements() * size == bytes.len());
-    assert!(
-        dst.dtype != DType::Bool || bytes.iter().all(|&b| b <= 1),
-        "bool tensor data must consist of the bytes 0 and 1"
-    );
-    if bytes.is_empty() {
-        return;
-    }
-    let p = dst.storage.cpu_ptr();
-    exec(|| {
-        // SAFETY: `dst` is contiguous and covers exactly `bytes.len()` bytes from its offset.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                p.add(dst.layout.offset * size),
-                bytes.len(),
-            )
-        };
-    });
-}
-
 /// The raw element bytes of a contiguous tensor.
 pub(crate) fn read_bytes(src: &TensorData) -> Vec<u8> {
     let size = src.dtype.size_in_bytes();

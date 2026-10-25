@@ -289,6 +289,15 @@ fn params() -> Vec<Parameter> {
 }
 
 #[test]
+fn io_options() {
+    let options = homura::io::ShardOptions::default;
+    at!(options().max_shard_size(0));
+    at!(options().prefix("a/b"));
+    at!(options().prefix("model-00001-of-00002"));
+    finish();
+}
+
+#[test]
 fn optimizers() {
     at!(Sgd::new(params(), -0.1));
     at!(Sgd::new(Vec::<Parameter>::new(), 0.1));

@@ -169,6 +169,12 @@ All notable changes to this project are documented in this file. The format is b
   `PretrainedReport`. The weights are read into memory; only the unsafe `from_pretrained_mmap`
   maps them. Unlike transformers, missing weights (a classification head loaded from a base
   model's repository) are an error.
+- `microsoft/resnet-18` and `microsoft/resnet-50` load from the Hugging Face cache through
+  `model.safetensors`, `pytorch_model.bin` and the memory map, with the same logits in each
+  case, and those logits agree with transformers 5.20.2 in F32 and F64 (checked by a local
+  release test that needs the downloaded repositories). The example `resnet` of `homura-models`
+  prints the five most likely labels of preprocessed images:
+  `cargo run --release -p homura-models --example resnet -- microsoft/resnet-50 input.safetensors`.
 
 ### Changed
 

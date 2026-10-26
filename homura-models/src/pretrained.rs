@@ -132,18 +132,34 @@ pub trait FromPretrained: Module + Sized {
     /// model's tensors use the pages of the files, unless the dtype conversion gives them memory
     /// of their own.
     ///
+    /// ```no_run
+    /// use homura_models::hub::{Repo, Revision};
+    /// use homura_models::pretrained::{FromPretrained, PretrainedOptions};
+    /// use homura_models::resnet::ResNetForImageClassification;
+    ///
+    /// let repo = Repo::cached("microsoft/resnet-50", Revision::main())?;
+    /// // SAFETY: nothing modifies or truncates the files of this cache while the program runs
+    /// // (huggingface_hub itself writes new blobs rather than changing existing ones).
+    /// let loaded = unsafe {
+    ///     ResNetForImageClassification::from_pretrained_mmap(&repo, PretrainedOptions::default())
+    /// }?;
+    /// let x = homura::zeros([1, 3, 224, 224]);
+    /// let logits = homura::with_no_grad(|| loaded.model.forward(&x));
+    /// assert_eq!(logits.shape(), [1, 1000]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Safety
     ///
     /// From before this call, during it and until every tensor that holds data of the
     /// repository's weight files is dropped, the mapped files (the file that
     /// [`Repo::weight_files`] picks, or each shard of the index, at the repository's root) must
-    /// not be modified or
-    /// truncated, by this or any other process. Those tensors are the model's parameters and
-    /// buffers, and every tensor sharing their storage: views and `detach` aliases of them,
-    /// handles from `state_dict()` and the like, and parameters assigned to other modules or held
-    /// by optimizers. Dropping the [`LoadedModel`] or the model doesn't end the period while such
-    /// tensors are alive. Modifying a mapped file is undefined behaviour; truncating it can crash
-    /// the process.
+    /// not be modified or truncated, by this or any other process. Those tensors are the model's
+    /// parameters and buffers, and every tensor sharing their storage: views and `detach` aliases
+    /// of them, handles from `state_dict()` and the like, and parameters assigned to other modules
+    /// or held by optimizers. Dropping the [`LoadedModel`] or the model doesn't end the period
+    /// while such tensors are alive. Modifying a mapped file is undefined behaviour; truncating it
+    /// can crash the process.
     ///
     /// # Errors
     ///

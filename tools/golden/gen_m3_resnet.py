@@ -6,8 +6,9 @@ the tests build.
   the batch normalization parameters and statistics are then set to random values, as after
   training): `config.json` and `model.safetensors`, plus the same weights saved with `torch.save`
   as `pytorch_model.bin`, as older repositories have them.
-- resnet/inputs.safetensors: `pixel_values`, 2 × 3 × 32 × 32 values `((i·7919 + 13) mod 1024) / 1024
-  − 0.5` (exact in F32 and F64), and `target`, the classes [3, 7] for the loss.
+- resnet/inputs.safetensors: `pixel_values`, 2 × 3 × 32 × 32 values `((i·7919 + 13) mod 1021) / 1024
+  − 0.5` (exact in F32 and F64; the modulus doesn't divide the 32 × 32 values of a channel, so the
+  channels and the images differ), and `target`, the classes [3, 7] for the loss.
 - resnet/<name>.safetensors: for the repository's model, in eval mode, `eval_f32.*` and
   `eval_f64.*` (the model and the input converted to F64): `logits`, `last_hidden_state` and
   `pooler_output`. In train mode, in F64: `train.logits` of one forward computation, `train.<key>`
@@ -123,7 +124,11 @@ NO_COUNT_KEY = "resnet.embedder.embedder.normalization.num_batches_tracked"
 
 def pixel_values():
     i = torch.arange(2 * 3 * 32 * 32, dtype=torch.int64)
-    return (((i * 7919 + 13) % 1024).to(torch.float64) / 1024 - 0.5).to(torch.float32).view(2, 3, 32, 32)
+    x = (((i * 7919 + 13) % 1021).to(torch.float64) / 1024 - 0.5).to(torch.float32).view(2, 3, 32, 32)
+    # Every image and every channel differs, so that errors across them show.
+    assert all(not torch.equal(x[a], x[b]) for a in range(2) for b in range(a))
+    assert all(not torch.equal(x[n, a], x[n, b]) for n in range(2) for a in range(3) for b in range(a))
+    return x
 
 
 def build(cls, config, seed):
@@ -273,8 +278,10 @@ def main():
 
     write_file(OUT / "resnet" / "structure.json",
                (json.dumps(structures, separators=(",", ":")) + "\n").encode())
-    total = sum(p.stat().st_size for p in OUT.rglob("*") if p.is_file())
-    print(f"homura-models/tests/golden: {total} bytes")
+    # The budget of this script's files (hf_resnet_logits.safetensors is gen_m3_hf_resnet.py's).
+    total = sum(p.stat().st_size for d in ("repos", "resnet", "pretrained")
+                for p in (OUT / d).rglob("*") if p.is_file())
+    print(f"homura-models/tests/golden/{{repos,resnet,pretrained}}: {total} bytes")
     assert total < 1_000_000
 
 

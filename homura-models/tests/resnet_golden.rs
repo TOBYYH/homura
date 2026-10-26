@@ -95,8 +95,8 @@ fn check(what: &str, found: &Tensor, expected: &Tensor, tolerance: f64) {
     assert!(e <= tolerance, "{what}: error {e:e} above {tolerance:e}");
 }
 
-/// The largest errors measured on x86-64 (`cargo test -- --nocapture` prints them) are 4.4e-7
-/// in F32 and 6.0e-15 in F64.
+/// The largest errors measured on x86-64 (`cargo test -- --nocapture` prints them) are 5.4e-7
+/// in F32 and 2.1e-15 in F64.
 const F32_TOLERANCE: f64 = 1e-5;
 const F64_TOLERANCE: f64 = 1e-13;
 

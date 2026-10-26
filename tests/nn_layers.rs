@@ -1171,3 +1171,24 @@ fn masked_fill_checks_tensor_values_like_scalars() {
     );
     meta.masked_fill_(&meta_mask, &meta_value);
 }
+
+#[test]
+fn identity_returns_its_input() {
+    let x = homura::randn([2, 3]);
+    x.requires_grad_(true);
+    let y = homura::nn::Identity.forward(&x);
+    assert!(y.is_same(&x));
+    let layer: &dyn Forward = &homura::nn::Identity;
+    assert!(layer.forward(&x).is_same(&x));
+    assert!(homura::nn::Identity.state_dict().is_empty());
+    assert_eq!(homura::nn::Identity.version(), 1);
+    // In a Sequential, gradients flow through it unchanged.
+    let model = Sequential::new().append(homura::nn::Identity).append(Relu);
+    model.forward(&x).sum().backward();
+    let expected: Vec<f32> = x
+        .to_vec::<f32>()
+        .iter()
+        .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+        .collect();
+    assert_eq!(x.grad().unwrap().to_vec::<f32>(), expected);
+}

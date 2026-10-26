@@ -12,7 +12,7 @@ categories = ["science", "mathematics"]
 exclude = ["/tools", "/tests"]
 
 [workspace]
-members = ["homura-derive"]
+members = ["homura-derive", "homura-models"]
 
 [workspace.package]
 version = "0.3.0"

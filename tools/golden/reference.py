@@ -1,4 +1,4 @@
-"""The PyTorch version that golden data is generated with.
+"""The PyTorch (and transformers) versions that golden data is generated with.
 
 Gradient boundary semantics (ties, NaN, clamp bounds, degrees of freedom) differ between PyTorch
 releases, so every generator calls `check()` first and refuses to run with any other build.
@@ -18,6 +18,21 @@ def check():
         raise SystemExit(
             f"golden data must be generated with PyTorch {TORCH_VERSION} ({TORCH_GIT}), "
             f"found {found[0]} ({found[1]})"
+        )
+
+
+TRANSFORMERS_VERSION = "5.20.2"
+
+
+def check_transformers():
+    """Exits unless the running transformers is the pinned reference release (after `check()`)."""
+    check()
+    import transformers
+
+    if transformers.__version__ != TRANSFORMERS_VERSION:
+        raise SystemExit(
+            f"golden data must be generated with transformers {TRANSFORMERS_VERSION}, "
+            f"found {transformers.__version__}"
         )
 
 

@@ -140,6 +140,16 @@ All notable changes to this project are documented in this file. The format is b
   `OrderedDict` keeps the module versions of a state dict (PyTorch's `_metadata`), also inside a
   checkpoint: `Value::from(&state_dict)` and `StateDict::try_from(&value)` convert with them,
   and a plain dict gives a state dict without versions.
+- `nn::Identity`, PyTorch's `nn.Identity`: a layer that returns its input, for the places where
+  a model has a layer in some configurations and none in others.
+- The new workspace crate `homura-models` (not published yet): models whose module trees, keys
+  and configuration files are those of transformers, so that Hugging Face repositories load as
+  they are. It has transformers' ResNet (`resnet::ResNetModel`,
+  `ResNetForImageClassification` and their layers), built from a `resnet::ResNetConfig` read
+  from `config.json` with transformers' defaults and label and dtype rules, the shared
+  `config::CommonConfig`, and `activations::Activation` for the activation names of
+  configurations. Small repositories written by transformers 5.20.2 give its outputs, batch
+  norm statistics and gradients.
 
 ### Changed
 

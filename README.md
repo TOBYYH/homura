@@ -36,7 +36,7 @@ Implemented so far:
   PyTorch's traversals, `state_dict` / `load_state_dict` and in-place conversion with `to`;
   `Sequential`; `nn::init`, `Linear`, `Embedding`, `LayerNorm`, `RmsNorm`, `Dropout`, the
   activation layers and the CNN layers `Conv2d`, `BatchNorm2d`, `MaxPool2d`,
-  `AdaptiveAvgPool2d` and `Flatten`, initialized like PyTorch's; the losses `mse_loss`,
+  `AdaptiveAvgPool2d` and `Flatten`, initialized like PyTorch's, and `Identity`; the losses `mse_loss`,
   `nll_loss`, `cross_entropy` and `binary_cross_entropy_with_logits`; the functions `conv2d`,
   `max_pool2d`, `adaptive_avg_pool2d` and `batch_norm`.
 - The optimizers `optim::Sgd`, `Adam` and `AdamW`, with parameter groups, checked step by step

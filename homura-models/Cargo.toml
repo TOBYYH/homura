@@ -1,0 +1,20 @@
+[package]
+name = "homura-models"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Models for homura that read Hugging Face repositories as they are"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TOBYYH/homura"
+keywords = ["deep-learning", "huggingface", "transformers", "resnet"]
+categories = ["science"]
+exclude = ["/tests"]
+# First published with homura 0.4.0.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+homura = { version = "=0.3.0", path = ".." }
+serde_json = "1.0.151"

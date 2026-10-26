@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks that homura's public API carries `#[track_caller]`.
+"""Checks that the public API of homura and homura-models carries `#[track_caller]`.
 
 Programming errors panic (shape, dtype, device, index and option checks), and the panic should
 point at the caller's line, not at homura's internals. The rule: every function of the public
@@ -57,6 +57,9 @@ ALLOWED = {
     ("src/nn/module.rs", "visit_non_persistent"): CALLBACK,
 }
 
+# The source directories of the crates whose API is checked (homura-derive's macros don't panic
+# at run time).
+CRATES = ("src", "homura-models/src")
 SKIP_DIRS = ("src/backend/", "src/autograd/test_support/")
 STD_OPS = {
     "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Not",
@@ -250,15 +253,16 @@ def scan(path, text, internal=frozenset(), used=None):
 def check(root):
     root = Path(root)
     failures = []
-    paths = sorted((root / "src").rglob("*.rs"))
-    internal = internal_types(p.read_text() for p in paths)
     used = set()
-    for path in paths:
-        rel = path.relative_to(root).as_posix()
-        if rel.startswith(SKIP_DIRS) or rel.endswith("_tests.rs"):
-            continue
-        for line, name in scan(rel, path.read_text(), internal, used):
-            failures.append(f"{rel}:{line}: `{name}` lacks #[track_caller]")
+    for crate in CRATES:
+        paths = sorted((root / crate).rglob("*.rs"))
+        internal = internal_types(p.read_text() for p in paths)
+        for path in paths:
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith(SKIP_DIRS) or rel.endswith("_tests.rs"):
+                continue
+            for line, name in scan(rel, path.read_text(), internal, used):
+                failures.append(f"{rel}:{line}: `{name}` lacks #[track_caller]")
     for path, name in sorted(set(ALLOWED) - used):
         failures.append(f"{path}: the ALLOWED entry for `{name}` excuses no function; remove it")
     return failures

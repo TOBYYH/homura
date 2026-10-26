@@ -10,9 +10,9 @@ use std::sync::{Arc, OnceLock};
 
 use homura::nn::functional::Conv2dPadding;
 use homura::nn::{
-    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, LayerNorm,
-    Linear, MaxPool2d, Member, Module, ModuleDisplay, Parameter, Relu, RmsNorm, Sequential,
-    Sigmoid, Silu, Softmax, Tanh, Visitor,
+    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, Identity,
+    LayerNorm, Linear, MaxPool2d, Member, Module, ModuleDisplay, Parameter, Relu, RmsNorm,
+    Sequential, Sigmoid, Silu, Softmax, Tanh, Visitor,
 };
 use homura::{GeluApproximate, Tensor};
 
@@ -135,6 +135,7 @@ fn layers_print_their_settings() {
             Box::new(Flatten::new(0, -2)),
             "Flatten(start_dim=0, end_dim=-2)",
         ),
+        (Box::new(Identity), "Identity()"),
         (
             Box::new(Dropout::default()),
             "Dropout(p=0.5, inplace=False)",

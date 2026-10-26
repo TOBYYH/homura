@@ -130,7 +130,7 @@
 //! [`Relu`], [`Gelu`], [`Silu`], [`Tanh`], [`Sigmoid`] and [`Softmax`], and the CNN layers
 //! [`Conv2d`], [`BatchNorm2d`], [`MaxPool2d`], [`AdaptiveAvgPool2d`] and [`Flatten`] are modules
 //! with a `forward` method and implement [`Forward`]; [`Sequential`] applies such layers one
-//! after another. [`functional`] has their computations as functions of tensors, and [`init`] the
+//! after another, and [`Identity`] stands for a layer that a configuration leaves out. [`functional`] has their computations as functions of tensors, and [`init`] the
 //! initializations that layers use, with PyTorch's formulas. [`Dropout`] and [`BatchNorm2d`]
 //! depend on the mode: they have a [`Training`] flag, which [`Module::eval`] clears. Options are
 //! set one after another, starting from PyTorch's defaults: `Conv2d::new(3, 8, 3).padding(1)`;
@@ -185,7 +185,7 @@
 //! | `nn.Conv2d(3, 8, 3, stride=2, padding=1, bias=False)` | [`Conv2d::new(3, 8, 3).stride(2).padding(1).bias(false)`](Conv2d) |
 //! | `nn.BatchNorm2d(8, momentum=None, affine=False)` | [`BatchNorm2d::new(8).momentum(None).affine(false)`](BatchNorm2d) |
 //! | `nn.MaxPool2d(3, 2, 1)`, `nn.MaxPool2d(2, return_indices=True)` | [`MaxPool2d::new(3).stride(2).padding(1)`](MaxPool2d), [`MaxPool2d::new(2).forward_with_indices(&x)`](MaxPool2d::forward_with_indices) |
-//! | `nn.AdaptiveAvgPool2d(1)`, `nn.Flatten()` | [`AdaptiveAvgPool2d::new(1)`](AdaptiveAvgPool2d::new), [`Flatten::default()`](Flatten) |
+//! | `nn.AdaptiveAvgPool2d(1)`, `nn.Flatten()`, `nn.Identity()` | [`AdaptiveAvgPool2d::new(1)`](AdaptiveAvgPool2d::new), [`Flatten::default()`](Flatten), [`Identity`] |
 //! | `F.batch_norm(x, rm, rv, w, b, training=True)` | [`functional::batch_norm(&x, Some(&rm), Some(&rv), Some(&w), Some(&b), BatchNormOptions { training: true, ..Default::default() })`](functional::batch_norm) |
 //! | `nn.Dropout(0.1)`, `F.dropout(x, 0.1, training)` | [`Dropout::new(0.1)`](Dropout::new), [`functional::dropout(&x, 0.1, training)`](functional::dropout) |
 //! | `nn.init.kaiming_uniform_(w, a=math.sqrt(5))` | [`init::kaiming_uniform_(&w, 5f64.sqrt(), FanMode::FanIn, Nonlinearity::LeakyRelu)`](init::kaiming_uniform_) |
@@ -307,8 +307,9 @@ pub(crate) use display::{
 /// Derives [`Module`](trait@Module) and [`Member`]: see [Deriving `Module`](self#deriving-module).
 pub use homura_derive::Module;
 pub use layers::{
-    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, IntoPair,
-    LayerNorm, Linear, MaxPool2d, Relu, RmsNorm, Sequential, Sigmoid, Silu, Softmax, Tanh,
+    AdaptiveAvgPool2d, BatchNorm2d, Conv2d, Dropout, Embedding, Flatten, Forward, Gelu, Identity,
+    IntoPair, LayerNorm, Linear, MaxPool2d, Relu, RmsNorm, Sequential, Sigmoid, Silu, Softmax,
+    Tanh,
 };
 pub use module::{Member, Module, SharedId, Visitor};
 pub use parameter::Parameter;

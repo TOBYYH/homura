@@ -101,6 +101,7 @@ def layers_print_their_settings():
         (nn.AdaptiveAvgPool2d((2, 3)), "AdaptiveAvgPool2d(output_size=(2, 3))"),
         (nn.Flatten(), "Flatten(start_dim=1, end_dim=-1)"),
         (nn.Flatten(0, -2), "Flatten(start_dim=0, end_dim=-2)"),
+        (nn.Identity(), "Identity()"),
         (nn.Dropout(), "Dropout(p=0.5, inplace=False)"),
         (nn.Dropout(0.1), "Dropout(p=0.1, inplace=False)"),
         (nn.Dropout(0.0), "Dropout(p=0.0, inplace=False)"),

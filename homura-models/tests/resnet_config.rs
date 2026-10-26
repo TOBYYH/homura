@@ -223,6 +223,33 @@ fn invalid_configurations_are_errors() {
         ),
         (r#"{"architectures": "ResNetModel"}"#, "a list of strings"),
         (r#"{"transformers_weights": 3}"#, "must be a string"),
+        (
+            r#"{"transformers_weights": "w.bin"}"#,
+            "must name a safetensors file",
+        ),
+        (
+            r#"{"transformers_weights": "../w.safetensors"}"#,
+            "must name a file inside the repository",
+        ),
+        // homura's limits, which keep a configuration file from making a model's construction
+        // panic or take without end.
+        (
+            r#"{"embedding_size": 18446744073709551615}"#,
+            "can't exceed 1048576",
+        ),
+        (r#"{"num_channels": 1048577}"#, "can't exceed 1048576"),
+        (
+            r#"{"hidden_sizes": [1048577], "depths": [1]}"#,
+            "can't exceed 1048576",
+        ),
+        (
+            r#"{"hidden_sizes": [8, 8], "depths": [32768, 32769]}"#,
+            "can't add up to more than 65536 layers",
+        ),
+        (
+            r#"{"hidden_sizes": [8, 8], "depths": [18446744073709551615, 2]}"#,
+            "can't add up to more than 65536 layers",
+        ),
     ];
     for (json, message) in cases {
         let found = error(json);
@@ -231,6 +258,19 @@ fn invalid_configurations_are_errors() {
     }
     // Basic layers have no quarter-channel convolutions.
     read(r#"{"layer_type": "basic", "hidden_sizes": [2, 3], "depths": [1, 1]}"#);
+    // The limits themselves are valid, and models of them build on the meta device.
+    read(r#"{"hidden_sizes": [8, 8], "depths": [32768, 32768]}"#);
+    let widest = read(
+        r#"{"num_channels": 1048576, "embedding_size": 1048576, "hidden_sizes": [1048576],
+            "depths": [1], "num_labels": 1048576}"#,
+    );
+    for layer_type in [ResNetLayerType::Basic, ResNetLayerType::Bottleneck] {
+        let config = widest.clone().layer_type(layer_type);
+        let model = homura::with_device(homura::Device::Meta, || {
+            homura_models::resnet::ResNetForImageClassification::new(&config)
+        });
+        drop(model);
+    }
 }
 
 #[test]

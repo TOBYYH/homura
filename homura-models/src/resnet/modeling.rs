@@ -7,6 +7,7 @@ use homura::nn::{
 
 use super::{ResNetConfig, ResNetLayerType};
 use crate::activations::Activation;
+use crate::pretrained::FromPretrained;
 
 /// A convolution without bias with `kernel_size / 2` padding, initialized as transformers'
 /// `_init_weights` does (`kaiming_normal_(mode="fan_out", nonlinearity="relu")`).
@@ -619,5 +620,23 @@ impl ResNetForImageClassification {
 impl Forward for ResNetForImageClassification {
     fn forward(&self, input: &Tensor) -> Tensor {
         ResNetForImageClassification::forward(self, input)
+    }
+}
+
+impl FromPretrained for ResNetModel {
+    type Config = ResNetConfig;
+    const BASE_MODEL_PREFIX: &'static str = "resnet";
+
+    fn from_config(config: &ResNetConfig) -> ResNetModel {
+        ResNetModel::new(config)
+    }
+}
+
+impl FromPretrained for ResNetForImageClassification {
+    type Config = ResNetConfig;
+    const BASE_MODEL_PREFIX: &'static str = "resnet";
+
+    fn from_config(config: &ResNetConfig) -> ResNetForImageClassification {
+        ResNetForImageClassification::new(config)
     }
 }

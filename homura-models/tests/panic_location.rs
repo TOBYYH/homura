@@ -1,14 +1,16 @@
 //! Panics of homura-models' public API report the caller's line (`#[track_caller]`): model
 //! constructors with invalid configurations, forward computations with invalid inputs (directly,
-//! through `Forward` and in a `Sequential`), and the panics of the core layers below them.
+//! through `Forward` and in a `Sequential`), the panics of the core layers below them, and
+//! loading options.
 
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
-use homura::Device;
 use homura::nn::{Forward, Sequential};
+use homura::{DType, Device};
 use homura_models::activations::Activation;
+use homura_models::pretrained::PretrainedOptions;
 use homura_models::resnet::{
     ResNetBasicLayer, ResNetBottleNeckLayer, ResNetConfig, ResNetConvLayer, ResNetEmbeddings,
     ResNetEncoder, ResNetForImageClassification, ResNetLayerType, ResNetModel, ResNetShortCut,
@@ -122,12 +124,13 @@ fn core_constructor_failures() {
     at!(meta(&|| drop(ResNetBasicLayer::new(n, 2, 1, relu))));
     at!(meta(&|| drop(bottleneck(n, 8, 1, relu, false))));
     at!(meta(&|| drop(ResNetStage::new(&config(), n, 8, 1, 1))));
-    for json in [
-        r#"{"num_channels":18446744073709551615,"embedding_size":2,"hidden_sizes":[4],"depths":[1]}"#,
-        r#"{"embedding_size":18446744073709551615,"hidden_sizes":[4],"depths":[1]}"#,
-        r#"{"hidden_sizes":[18446744073709551615],"depths":[1]}"#,
+    // Configurations that set such sizes are invalid (homura's limits).
+    for bad in [
+        config().num_channels(n),
+        config().embedding_size(n),
+        config().hidden_sizes([4, n]),
+        config().depths([1, n]),
     ] {
-        let bad = ResNetConfig::from_json(json).unwrap();
         at!(meta(&|| drop(ResNetModel::new(&bad))));
         at!(meta(&|| drop(ResNetForImageClassification::new(&bad))));
     }
@@ -157,5 +160,12 @@ fn invalid_inputs() {
     at!(ResNetShortCut::new(4, 8, 2).forward(&wrong_channels));
     at!(ResNetShortCutOrIdentity::new(4, 8, 2).forward(&wrong_channels));
     at!(relu.forward(&homura::tensor([true])));
+    finish();
+}
+
+#[test]
+fn loading_options() {
+    at!(PretrainedOptions::default().dtype(DType::I64));
+    at!(PretrainedOptions::default().dtype(DType::Bool));
     finish();
 }

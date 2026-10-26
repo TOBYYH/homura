@@ -6,7 +6,7 @@
 //! - safetensors `__metadata__`: [`safetensors_metadata`] and
 //!   [`save_safetensors_with_metadata`];
 //! - sharded checkpoints in the Hugging Face layout: [`save_sharded`] with [`ShardOptions`]
-//!   (`load` reads them through their index);
+//!   (`load` reads them through their index; [`load_index`] reads shards kept apart from it);
 //! - zero-copy loading: [`load_mmap`], which maps the files into memory. It is `unsafe`: the
 //!   files must not change while tensors use them. `load` never maps files;
 //! - whole PyTorch checkpoints, not only state dicts: [`load_value`] and
@@ -50,7 +50,9 @@ mod shard;
 mod value;
 mod zip;
 
-pub use file::{load, load_mmap, load_value, load_value_from_bytes, save};
+pub use file::{
+    load, load_index, load_index_mmap, load_mmap, load_value, load_value_from_bytes, save,
+};
 pub use safetensors::{
     load_safetensors, load_safetensors_from_bytes, safetensors_metadata, save_safetensors,
     save_safetensors_to_bytes, save_safetensors_with_metadata,

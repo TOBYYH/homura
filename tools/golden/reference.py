@@ -39,3 +39,18 @@ def check_transformers():
 def metadata():
     """The safetensors `__metadata__` entries recording the reference build."""
     return {"torch_version": TORCH_VERSION, "torch_git": TORCH_GIT}
+
+
+HUGGINGFACE_HUB_VERSION = "2.3.0"
+
+
+def check_hub():
+    """Exits unless the running transformers and huggingface_hub are the pinned releases."""
+    check_transformers()
+    import huggingface_hub
+
+    if huggingface_hub.__version__ != HUGGINGFACE_HUB_VERSION:
+        raise SystemExit(
+            f"golden data must be generated with huggingface_hub {HUGGINGFACE_HUB_VERSION}, "
+            f"found {huggingface_hub.__version__}"
+        )

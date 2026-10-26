@@ -5,6 +5,7 @@ use homura::DType;
 
 use crate::activations::Activation;
 use crate::config::{self, CommonConfig, ConfigError, Fields, invalid};
+use crate::pretrained::PretrainedConfig;
 
 /// The layers of a ResNet: `"basic"` (two 3 × 3 convolutions, ResNet-18 and -34) or
 /// `"bottleneck"` (1 × 1, 3 × 3 and 1 × 1 convolutions, ResNet-50 and larger).
@@ -91,6 +92,12 @@ impl Default for ResNetConfig {
     }
 }
 
+/// The most channels of a layer that a valid configuration has (homura's limit).
+const MAX_CHANNELS: usize = 1 << 20;
+
+/// The most layers of all stages that a valid configuration has (homura's limit).
+const MAX_LAYERS: usize = 1 << 16;
+
 impl ResNetConfig {
     /// The `model_type` of ResNet configurations.
     pub const MODEL_TYPE: &'static str = "resnet";
@@ -146,7 +153,9 @@ impl ResNetConfig {
     /// Checks that the models can be built from this configuration: the sizes aren't 0, there
     /// are as many depths as hidden sizes and at least one, the hidden sizes of bottleneck
     /// layers are at least 4 (their inner convolutions have a quarter of the channels) and
-    /// `hidden_act` is known.
+    /// `hidden_act` is known. homura also limits the channels of each layer to 2^20 and the
+    /// layers of all stages to 2^16, so that no configuration file makes building a model panic
+    /// or take without end (even on the meta device, where the parameters have no data).
     ///
     /// transformers builds models from some of these configurations: it uses only as many stages
     /// as the shorter list has, gives a stage of depth 0 one layer, and builds layers without
@@ -173,6 +182,29 @@ impl ResNetConfig {
             return Some(format!(
                 "`hidden_sizes` and `depths` must be positive, found {:?} and {:?}",
                 self.hidden_sizes, self.depths
+            ));
+        }
+        let sizes = [self.num_channels, self.embedding_size];
+        if sizes
+            .iter()
+            .chain(&self.hidden_sizes)
+            .any(|&n| n > MAX_CHANNELS)
+        {
+            return Some(format!(
+                "`num_channels`, `embedding_size` and `hidden_sizes` can't exceed {MAX_CHANNELS}, \
+                 found {}, {} and {:?}",
+                self.num_channels, self.embedding_size, self.hidden_sizes
+            ));
+        }
+        if self
+            .depths
+            .iter()
+            .try_fold(0usize, |sum, &d| sum.checked_add(d))
+            .is_none_or(|n| n > MAX_LAYERS)
+        {
+            return Some(format!(
+                "the `depths` can't add up to more than {MAX_LAYERS} layers, found {:?}",
+                self.depths
             ));
         }
         if self.layer_type == ResNetLayerType::Bottleneck
@@ -297,5 +329,19 @@ impl ResNetConfig {
     pub fn dtype(mut self, dtype: impl Into<Option<DType>>) -> ResNetConfig {
         self.common.dtype = dtype.into();
         self
+    }
+}
+
+impl PretrainedConfig for ResNetConfig {
+    fn from_file(path: &Path) -> Result<ResNetConfig, ConfigError> {
+        ResNetConfig::from_file(path)
+    }
+
+    fn common(&self) -> &CommonConfig {
+        &self.common
+    }
+
+    fn common_mut(&mut self) -> &mut CommonConfig {
+        &mut self.common
     }
 }

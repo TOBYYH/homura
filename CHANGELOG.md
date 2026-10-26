@@ -115,6 +115,11 @@ All notable changes to this project are documented in this file. The format is b
   safe functions never map files. Tensors whose data isn't aligned to their element size in the
   file or is in another byte order than the host's are copied, and BOOL data is checked as for
   `load` (safetensors) or copied (`.pt`).
+- `io::load_index(index, shard_dir)` and `unsafe fn io::load_index_mmap(index, shard_dir)` load
+  a sharded checkpoint whose shards aren't in the index's directory, such as the shards at a
+  Hugging Face repository's root of an index in a subdirectory, with the checks of `load`.
+  Shard names in an index, like the prefixes of `ShardOptions`, can't contain `:` (a Windows
+  drive such as `C:x` would replace the directory they are joined to).
 - Reading PyTorch's `.pt` format, as `torch.load(path, map_location="cpu", weights_only=True)`
   does: `load` and `load_mmap` read state dicts, including `pytorch_model.bin`, and the new
   `io::load_value(path)` and `io::load_value_from_bytes(bytes)` read any checkpoint of the
@@ -150,6 +155,20 @@ All notable changes to this project are documented in this file. The format is b
   `config::CommonConfig`, and `activations::Activation` for the activation names of
   configurations. Small repositories written by transformers 5.20.2 give its outputs, batch
   norm statistics and gradients.
+- `homura-models` loads Hugging Face repositories offline: `hub::Repo` is a local directory
+  (`Repo::local`) or a repository of the Hugging Face cache at a revision (`Repo::cached`,
+  `Repo::cached_in`; the cache directory, `hub::cache_dir`, and the resolution of revisions are
+  huggingface_hub's), and `Repo::weight_files` picks the weight files as transformers does
+  (`model.safetensors`, then its index, then `pytorch_model.bin`, then its index, or the
+  configuration's `transformers_weights`, whose shards are at the repository's root even if
+  it is in a subdirectory). `pretrained::FromPretrained`, implemented by both
+  ResNet models, is `from_pretrained`: it reads the configuration, builds the model on the meta
+  device, assigns it the weights with the base model's prefix (`resnet.`) removed or added key
+  by key, converts it to the dtype of the options, the configuration or the weights, and returns
+  it in eval mode; `from_pretrained_with_info` adds the configuration and a
+  `PretrainedReport`. The weights are read into memory; only the unsafe `from_pretrained_mmap`
+  maps them. Unlike transformers, missing weights (a classification head loaded from a base
+  model's repository) are an error.
 
 ### Changed
 

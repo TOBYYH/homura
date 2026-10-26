@@ -75,7 +75,9 @@ pub struct CommonConfig {
     pub id2label: BTreeMap<i64, String>,
     /// `label2id`: the index of each label name.
     pub label2id: BTreeMap<String, i64>,
-    /// `transformers_weights`: the weight file to load instead of the usual names.
+    /// `transformers_weights`: the weight file to load instead of the usual names, a
+    /// `.safetensors` or `.safetensors.index.json` file of the repository
+    /// ([`Repo::weight_files`](crate::hub::Repo::weight_files)).
     pub transformers_weights: Option<String>,
     /// `transformers_version`: the version of transformers that wrote the configuration.
     pub transformers_version: Option<String>,
@@ -144,6 +146,9 @@ impl CommonConfig {
             config.dtype = fields.dtype("torch_dtype")?;
         }
         config.transformers_weights = fields.string("transformers_weights")?;
+        if let Some(name) = &config.transformers_weights {
+            crate::hub::check_transformers_weights(name).map_err(ConfigError::Invalid)?;
+        }
         config.transformers_version = fields.string("transformers_version")?;
 
         let num_labels = fields.integer("num_labels")?;
@@ -181,6 +186,17 @@ impl CommonConfig {
             }
         }
         Ok(config)
+    }
+}
+
+/// The floating-point dtype of homura that a PyTorch dtype name gives (`getattr(torch, name)`).
+pub(crate) fn dtype_from_name(name: &str) -> Option<DType> {
+    match name {
+        "float32" | "float" => Some(DType::F32),
+        "float64" | "double" => Some(DType::F64),
+        "float16" | "half" => Some(DType::F16),
+        "bfloat16" => Some(DType::BF16),
+        _ => None,
     }
 }
 
@@ -295,19 +311,13 @@ impl Fields<'_> {
         let Some(found) = self.string(name)? else {
             return Ok(None);
         };
-        let dtype = match found.as_str() {
-            "float32" | "float" => DType::F32,
-            "float64" | "double" => DType::F64,
-            "float16" | "half" => DType::F16,
-            "bfloat16" => DType::BF16,
-            _ => {
-                return Err(invalid(format!(
-                    "`{name}` must name a floating-point dtype (float32, float64, float16 or \
-                     bfloat16), found \"{found}\""
-                )));
-            }
-        };
-        Ok(Some(dtype))
+        match dtype_from_name(&found) {
+            Some(dtype) => Ok(Some(dtype)),
+            None => Err(invalid(format!(
+                "`{name}` must name a floating-point dtype (float32, float64, float16 or \
+                 bfloat16), found \"{found}\""
+            ))),
+        }
     }
 
     /// `id2label`, with its keys (strings in JSON) as integers.

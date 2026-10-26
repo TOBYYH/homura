@@ -15,6 +15,10 @@ the tests build.
   mode, in F64, `grad.<key>` for every parameter after `cross_entropy(logits, target).backward()`
   (in train mode the batch statistics of the 1 x 1 last stages make the gradients
   ill-conditioned).
+- pretrained/no_count.bin: the weights of repos/bottleneck_downsample saved with `torch.save`
+  without the stem's `num_batches_tracked`, but with `_metadata` (whose BatchNorm2d versions, 2,
+  make the count required for PyTorch's `load_state_dict`; transformers 5 doesn't read them, step
+  4a2).
 - resnet/structure.json: for the configurations of microsoft/resnet-18 and microsoft/resnet-50
   (their structural fields; the label names are left out) and of every repository, the config
   dict, and for `ResNetForImageClassification` the state dict's keys with
@@ -110,6 +114,11 @@ def write_file(path, data):
                     and safetensors_content(old) == safetensors_content(data)):
             return
     path.write_bytes(data)
+
+
+# pretrained/no_count.bin: this repository's weights without this count.
+NO_COUNT_REPO = "bottleneck_downsample"
+NO_COUNT_KEY = "resnet.embedder.embedder.normalization.num_batches_tracked"
 
 
 def pixel_values():
@@ -253,6 +262,13 @@ def main():
         assert all(torch.equal(loaded.state_dict()[k], sd[k]) for k in sd)
         write_file(OUT / "resnet" / f"{name}.safetensors",
                    save_safetensors(outputs(model, x), metadata=reference.metadata()))
+        if name == NO_COUNT_REPO:
+            # Keeps `_metadata`, whose BatchNorm2d versions are 2.
+            del sd[NO_COUNT_KEY]
+            assert sd._metadata[NO_COUNT_KEY.rsplit(".", 1)[0]]["version"] == 2
+            buf = io.BytesIO()
+            torch.save(sd, buf)
+            write_file(OUT / "pretrained" / "no_count.bin", buf.getvalue())
         structures[name] = structure(json.loads(config_text))
 
     write_file(OUT / "resnet" / "structure.json",

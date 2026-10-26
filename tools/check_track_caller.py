@@ -55,6 +55,8 @@ ALLOWED = {
     ("src/nn/module.rs", "version"): CALLBACK,
     ("src/nn/module.rs", "added_in"): CALLBACK,
     ("src/nn/module.rs", "visit_non_persistent"): CALLBACK,
+    ("homura-models/src/pretrained.rs", "from_file"): CALLBACK,
+    ("homura-models/src/pretrained.rs", "from_config"): CALLBACK,
 }
 
 # The source directories of the crates whose API is checked (homura-derive's macros don't panic

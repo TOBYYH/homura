@@ -751,6 +751,49 @@ fn version(v: i64) -> StateDict {
     .collect()
 }
 
+/// `io::load_index` and `io::load_index_mmap`: the shards of an index kept apart from them.
+#[test]
+fn indexes_apart_from_their_shards() {
+    let dir = scratch("index_apart");
+    let state_dict = shard_test_dict();
+    let options = ShardOptions::default().max_shard_size(80).prefix("net");
+    io::save_sharded(&state_dict, &dir, options).unwrap();
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let index = dir.join("sub/net.safetensors.index.json");
+    fs::rename(dir.join("net.safetensors.index.json"), &index).unwrap();
+    assert_same_dict(&io::load_index(&index, &dir).unwrap(), &state_dict);
+    // SAFETY: the shards aren't modified while the test runs.
+    let mapped = unsafe { io::load_index_mmap(&index, &dir) }.unwrap();
+    assert_same_dict(&mapped, &state_dict);
+    // `load` looks for the shards next to the index.
+    assert!(matches!(homura::load(&index), Err(Error::Io(_))));
+    assert!(matches!(
+        io::load_index(&index, dir.join("sub")),
+        Err(Error::Io(_))
+    ));
+    // The shards' names are still plain file names, and the file must be an index.
+    let shard = dir.join("net-00001-of-00003.safetensors");
+    match io::load_index(&shard, &dir) {
+        Err(Error::Format(m)) => assert!(m.contains("is not an index of shards"), "{m}"),
+        r => panic!("{r:?}"),
+    }
+    match io::load_index(PT_STATE_DICT, &dir) {
+        Err(Error::Format(m)) => assert!(m.contains("is not an index of shards"), "{m}"),
+        r => panic!("{r:?}"),
+    }
+    fs::write(
+        &index,
+        r#"{"weight_map": {"a": "../net-00001-of-00003.safetensors"}}"#,
+    )
+    .unwrap();
+    match io::load_index(&index, dir.join("sub")) {
+        Err(Error::Format(m)) => {
+            assert!(m.contains("is not a file in the shards' directory"), "{m}")
+        }
+        r => panic!("{r:?}"),
+    }
+}
+
 #[test]
 fn sharded_saves_replace_earlier_layouts() {
     let dir = scratch("layouts");
@@ -894,12 +937,34 @@ fn sharded_index_errors() {
         "",
     ] {
         let text = original.replace(&shard(2), name);
-        check(&text, "is not a file in the index's directory");
+        check(&text, "is not a file in the shards' directory");
+    }
+    // Windows drives and prefixes, which replace the directory they are joined to (R119): refused
+    // before reading, even where a file of that name exists, by every entry point.
+    for name in [
+        "C:weights.safetensors",
+        "D:weights.safetensors",
+        "Z:outside",
+        "x:y",
+    ] {
+        fs::copy(dir.join(shard(2)), dir.join(name)).unwrap();
+        let text = original.replace(&shard(2), name);
+        check(&text, "is not a file in the shards' directory");
+        let needle = "is not a file in the shards' directory";
+        assert!(is_format_error(load_mmap(&index), needle), "{name}");
+        assert!(
+            is_format_error(io::load_index(&index, &dir), needle),
+            "{name}"
+        );
+        // SAFETY: the files aren't modified while they are mapped.
+        let mapped = unsafe { io::load_index_mmap(&index, &dir) };
+        assert!(is_format_error(mapped, needle), "{name}");
+        fs::remove_file(dir.join(name)).unwrap();
     }
     let absolute = dir.join(shard(2));
     check(
         &original.replace(&shard(2), absolute.to_str().unwrap()),
-        "is not a file in the index's directory",
+        "is not a file in the shards' directory",
     );
     check(
         &original.replace(&format!("\"{}\"", shard(2)), "2"),
@@ -951,6 +1016,10 @@ fn shard_options_check_their_arguments() {
         (
             Box::new(|| drop(ShardOptions::default().prefix(".."))),
             "not \"..\"",
+        ),
+        (
+            Box::new(|| drop(ShardOptions::default().prefix("C:model"))),
+            "not \"C:model\"",
         ),
         (
             Box::new(|| drop(ShardOptions::default().prefix("model-00001-of-00002"))),

@@ -68,8 +68,8 @@ impl ShardOptions {
     ///
     /// # Panics
     ///
-    /// Panics if `prefix` is empty, `.` or `..`, contains `/` or `\`, or ends like a numbered
-    /// shard.
+    /// Panics if `prefix` is empty, `.` or `..`, contains `/`, `\`, `:` or NUL, or ends like a
+    /// numbered shard.
     #[track_caller]
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
@@ -94,9 +94,11 @@ impl ShardOptions {
     }
 }
 
-/// Whether `name` names a file in a directory, without leaving it.
+/// Whether `name` names a file in a directory, without leaving it on any platform: not empty, `.`
+/// or `..`, without `/`, `\\`, `:` (a Windows drive or prefix, such as `C:x`, replaces the
+/// directory it is joined to) or NUL.
 fn is_file_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])
 }
 
 /// Saves a state dict as safetensors shards in the directory `dir`, which is created if needed,
@@ -277,13 +279,13 @@ fn bad(msg: &str) -> Error {
     Error::Format(format!("invalid sharded checkpoint index: {msg}"))
 }
 
-/// Loads the shards that the index at `path` (open as `file`) lists, in `weight_map` order. Shard
-/// names are relative to the index's directory; each shard is opened and read once.
+/// Loads the shards that the index open as `file` lists, in `weight_map` order. Shard names are
+/// relative to `dir`; each shard is opened and read once.
 ///
 /// # Safety
 ///
 /// With [`Access::Map`], as for [`load_mmap`](super::load_mmap).
-pub(super) unsafe fn read_index(path: &Path, mut file: File, access: Access) -> Result<StateDict> {
+pub(super) unsafe fn read_index(mut file: File, dir: &Path, access: Access) -> Result<StateDict> {
     if file.metadata()?.len() > MAX_INDEX_LEN {
         return Err(bad("the file is too large"));
     }
@@ -306,7 +308,7 @@ pub(super) unsafe fn read_index(path: &Path, mut file: File, access: Access) -> 
         let file = Json::as_str(file).ok_or_else(|| bad(&format!("{key:?}: not a file name")))?;
         if !is_file_name(file) {
             return Err(bad(&format!(
-                "{key:?}: {file:?} is not a file in the index's directory"
+                "{key:?}: {file:?} is not a file in the shards' directory"
             )));
         }
         let i = *position.entry(file).or_insert_with(|| {
@@ -316,7 +318,6 @@ pub(super) unsafe fn read_index(path: &Path, mut file: File, access: Access) -> 
         shards[i].1.push(key);
     }
 
-    let dir = path.parent().unwrap_or(Path::new(""));
     let mut loaded: HashMap<String, Tensor> = HashMap::new();
     for (file, keys) in shards {
         // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.

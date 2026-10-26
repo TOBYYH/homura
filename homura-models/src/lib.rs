@@ -9,9 +9,29 @@
 //! as in transformers, so the layers that a configuration chooses are enums and
 //! [`Sequential`](homura::nn::Sequential)s rather than type parameters.
 //!
+//! - [`hub`]: repositories in local directories and in the Hugging Face cache (offline), and
+//!   their weight files.
+//! - [`pretrained`]: [`FromPretrained`](pretrained::FromPretrained), transformers'
+//!   `from_pretrained`, which loads a model from a repository.
 //! - [`resnet`]: transformers' ResNet (`ResNetModel`, `ResNetForImageClassification`).
 //! - [`config`]: the fields that every model's configuration has, such as the labels and dtype.
 //! - [`activations`]: the activation functions that configurations name, transformers' `ACT2FN`.
+//!
+//! ```no_run
+//! use homura::nn::Module;
+//! use homura_models::hub::{Repo, Revision};
+//! use homura_models::pretrained::{FromPretrained, PretrainedOptions};
+//! use homura_models::resnet::ResNetForImageClassification;
+//!
+//! // Downloaded before with `hf download microsoft/resnet-50`.
+//! let repo = Repo::cached("microsoft/resnet-50", Revision::main())?;
+//! let model = ResNetForImageClassification::from_pretrained(&repo, PretrainedOptions::default())?;
+//! let logits = homura::with_no_grad(|| model.forward(&homura::zeros([1, 3, 224, 224])));
+//! # let _ = logits;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! A model can also be built from a configuration, without weights:
 //!
 //! ```
 //! use homura::nn::{LoadOptions, Module};
@@ -35,4 +55,6 @@
 
 pub mod activations;
 pub mod config;
+pub mod hub;
+pub mod pretrained;
 pub mod resnet;

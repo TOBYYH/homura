@@ -126,7 +126,24 @@ unsafe fn load_with(path: &Path, access: Access) -> Result<StateDict> {
         Format::Zip => unsafe { read_pt(&mut file, access) },
         Format::Legacy => Err(legacy_not_supported(path)),
         // SAFETY: as above.
-        Format::Index => unsafe { shard::read_index(path, file, access) },
+        Format::Index => unsafe {
+            shard::read_index(file, path.parent().unwrap_or(Path::new("")), access)
+        },
+    }
+}
+
+/// # Safety
+///
+/// With [`Access::Map`], as for [`load_mmap`].
+unsafe fn load_index_with(index: &Path, shard_dir: &Path, access: Access) -> Result<StateDict> {
+    let mut file = File::open(index)?;
+    match detect(&mut file)? {
+        // SAFETY: the caller upholds the contract of `load_mmap` for `Access::Map`.
+        Format::Index => unsafe { shard::read_index(file, shard_dir, access) },
+        _ => Err(Error::Format(format!(
+            "{} is not an index of shards (a JSON object)",
+            index.display()
+        ))),
     }
 }
 
@@ -218,6 +235,51 @@ pub fn load(path: impl AsRef<Path>) -> Result<StateDict> {
 pub unsafe fn load_mmap(path: impl AsRef<Path>) -> Result<StateDict> {
     // SAFETY: the caller upholds the contract above.
     unsafe { load_with(path.as_ref(), Access::Map) }
+}
+
+/// Loads a sharded checkpoint like [`load`] loads its index, but with the shard names of the
+/// index relative to `shard_dir` rather than to the index's directory: for an index kept apart
+/// from its shards, such as a Hugging Face repository's `transformers_weights` index in a
+/// subdirectory, whose shards transformers looks for at the repository's root.
+///
+/// # Errors
+///
+/// As for [`load`], and for a file that isn't an index.
+///
+/// ```no_run
+/// let sd = homura::io::load_index("repo/sub/model.safetensors.index.json", "repo")?;
+/// # let _ = sd;
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn load_index(index: impl AsRef<Path>, shard_dir: impl AsRef<Path>) -> Result<StateDict> {
+    // SAFETY: reading has no preconditions; only `Access::Map` has.
+    unsafe { load_index_with(index.as_ref(), shard_dir.as_ref(), Access::Read) }
+}
+
+/// Like [`load_index`], with the shards mapped into memory as [`load_mmap`] maps them.
+///
+/// # Safety
+///
+/// As for [`load_mmap`], for every shard.
+///
+/// # Errors
+///
+/// As for [`load_index`].
+///
+/// ```no_run
+/// // SAFETY: nothing modifies the shards while the program runs.
+/// let sd = unsafe { homura::io::load_index_mmap("repo/sub/model.safetensors.index.json", "repo")? };
+/// # let _ = sd;
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub unsafe fn load_index_mmap(
+    index: impl AsRef<Path>,
+    shard_dir: impl AsRef<Path>,
+) -> Result<StateDict> {
+    // SAFETY: the caller upholds the contract above, which is `load_mmap`'s.
+    unsafe { load_index_with(index.as_ref(), shard_dir.as_ref(), Access::Map) }
 }
 
 /// Loads the object that a PyTorch `.pt` file holds, onto the CPU: a state dict, or a

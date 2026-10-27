@@ -62,9 +62,9 @@ All notable changes to this project are documented in this file. The format is b
 - `Module::num_parameters()`: the number of elements of the parameters, each parameter once
   (`sum(p.numel() for p in model.parameters())`).
 
-  The new provided methods of `Module` (`display`, `extra_repr`, `type_name`,
-  `num_parameters`, and `version` and `added_in` below) can make a call of a method of the same name from another trait in scope
-  ambiguous; inherent methods of the same name keep precedence.
+  The new provided methods of `Module` (`display`, `extra_repr`, `type_name`, `num_parameters`,
+  and `version` and `added_in` below) can make a call of a method of the same name from another
+  trait in scope ambiguous; inherent methods of the same name keep precedence.
 - Loading by assignment, PyTorch's `load_state_dict(sd, assign=True)`:
   `LoadOptions::default().assign(true)` (read with `is_assign()`) gives the parameters and
   buffers the dtype, device, layout and storage of the entries instead of copying, so a model
@@ -186,13 +186,14 @@ All notable changes to this project are documented in this file. The format is b
   (PyTorch shares it when the dtype matches); Adam's step count keeps its dtype.
 - `nn::Identity`, PyTorch's `nn.Identity`: a layer that returns its input, for the places where
   a model has a layer in some configurations and none in others.
-- The new workspace crate `homura-models` (not published yet): models whose module trees, keys
-  and configuration files are those of transformers, so that Hugging Face repositories load as
-  they are. It has transformers' ResNet (`resnet::ResNetModel`,
-  `ResNetForImageClassification` and their layers), built from a `resnet::ResNetConfig` read
-  from `config.json` with transformers' defaults and label and dtype rules, the shared
-  `config::CommonConfig`, and `activations::Activation` for the activation names of
-  configurations. Small repositories written by transformers 5.20.2 give its outputs, batch
+- The new workspace crate `homura-models`, released for the first time with this version: models
+  whose module trees, keys and configuration files are those of transformers, so that Hugging Face
+  repositories load as they are; one implementation per architecture, with the differences from
+  transformers in its README and crate documentation. It has transformers' ResNet
+  (`resnet::ResNetModel`, `ResNetForImageClassification` and their layers), built from a
+  `resnet::ResNetConfig` read from `config.json` with transformers' defaults and label and dtype
+  rules, the shared `config::CommonConfig`, and `activations::Activation` for the activation names
+  of configurations. Small repositories written by transformers 5.20.2 give its outputs, batch
   norm statistics and gradients.
 - `homura-models` loads Hugging Face repositories offline: `hub::Repo` is a local directory
   (`Repo::local`) or a repository of the Hugging Face cache at a revision (`Repo::cached`,
@@ -222,7 +223,8 @@ All notable changes to this project are documented in this file. The format is b
   one that unpacked it already did. It used to run a graph that didn't save the parameter.
   The messages also cover loading by assignment.
 - **Breaking** for implementations of `optim::Optimizer` outside homura: the trait has the new
-  required methods `state_dict` and `load_state_dict`. Calling the optimizers is unchanged.
+  required methods `num_param_groups`, `params`, `lr`, `set_lr`, `state_dict` and
+  `load_state_dict`. Code that only calls the optimizers is unaffected by this item.
 - **Breaking**: the methods of `optim::Optimizer` that use the optimizer's options type moved to
   the new trait `optim::TypedOptimizer: Optimizer`, which has the associated type `Options`:
   `defaults`, `param_groups`, `options_mut` and `add_param_group`. Code that calls them needs

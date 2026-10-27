@@ -51,7 +51,23 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! # Differences from transformers
+//!
+//! - Repositories are read offline, from a local directory or the Hugging Face cache; there are
+//!   no downloads, image preprocessing (`preprocessor_config.json`), tokenizers or datasets yet.
+//! - Missing weights are an error, where transformers initializes them randomly and warns (a
+//!   classification head loaded from a base model's repository). There is no
+//!   `ignore_mismatched_sizes`, weight `variant`, quantization, `device_map` or offloading.
+//! - The ResNet has no `ResNetBackbone`, `output_hidden_states`, `return_dict`, or `labels` and
+//!   loss in `forward`.
+//! - File names of repositories are checked more strictly (see [`hub`]).
+//!
 //! [transformers]: https://github.com/huggingface/transformers
+
+// The README's examples are compiled as documentation tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 pub mod activations;
 pub mod config;

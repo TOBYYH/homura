@@ -70,6 +70,29 @@ let [d2y] = autograd::grad_array(&[&dy.sum()], [&x], GradOptions::default()).map
 assert_eq!(d2y.to_vec::<f32>(), [6.0, 12.0, 18.0]);
 ```
 
+## Models from Hugging Face
+
+The workspace crate [homura-models](homura-models) has models whose module trees, parameter names
+and configuration files are those of transformers, so that Hugging Face repositories load as they
+are, from a local directory or the Hugging Face cache (`hf download microsoft/resnet-50`). The
+example below is compiled as a test of homura-models:
+
+```rust,ignore
+use homura_models::hub::{Repo, Revision};
+use homura_models::pretrained::{FromPretrained, PretrainedOptions};
+use homura_models::resnet::ResNetForImageClassification;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repo::cached("microsoft/resnet-50", Revision::main())?;
+    let model = ResNetForImageClassification::from_pretrained(&repo, PretrainedOptions::default())?;
+    // Images resized, cropped and normalized as the repository's preprocessor_config.json says.
+    let pixel_values = homura::zeros([1, 3, 224, 224]);
+    let logits = homura::with_no_grad(|| model.forward(&pixel_values));
+    assert_eq!(logits.shape(), [1, 1000]);
+    Ok(())
+}
+```
+
 ## Minimum supported Rust version
 
 Rust 1.88 or later. Raising it is a minor version change.

@@ -8,9 +8,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/TOBYYH/homura"
 keywords = ["deep-learning", "huggingface", "transformers", "resnet"]
 categories = ["science"]
+readme = "README.md"
 exclude = ["/tests"]
-# First published with homura 0.4.0.
-publish = false
 
 [lints]
 workspace = true

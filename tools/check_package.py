@@ -1,16 +1,20 @@
 """Checks the packages of the workspace before a release, as `cargo publish --workspace` will
 upload them:
 
-1. `cargo package --workspace --locked` packages homura-derive and homura and builds each package;
-   homura is built against the packaged homura-derive, which Cargo serves from a temporary
-   registry since it isn't on crates.io yet.
-2. The packaged homura depends on exactly the workspace version of homura-derive (`=0.y.z`,
-   without a path), and neither package contains the tests or the tools.
-3. The tests of both unpacked packages pass (homura's unit tests and doctests, homura-derive's
-   unit tests), with homura built against the unpacked homura-derive.
-4. A crate outside the workspace that depends on the unpacked homura under another name
-   (`hm = { package = "homura", ... }`) derives `Module` with `#[module(crate = "hm")]` and an
-   `extra_repr`, a version and an `added_in` buffer, builds and runs.
+1. `cargo package --workspace --locked` packages homura-derive, homura and homura-models and
+   builds each package; homura is built against the packaged homura-derive and homura-models
+   against the packaged homura, which Cargo serves from a temporary registry since the versions
+   aren't on crates.io yet.
+2. The packaged homura depends on exactly the workspace version of homura-derive, and the
+   packaged homura-models on exactly that of homura (`=0.y.z`, without a path), and no package
+   contains the tests or the tools.
+3. The tests of the unpacked packages pass (homura's unit tests and doctests, homura-derive's
+   unit tests, homura-models' doctests), each built against the unpacked crates it depends on.
+4. A crate outside the workspace that depends on the unpacked homura and homura-models under
+   other names (`hm = { package = "homura", ... }`, `hmm = { package = "homura-models", ... }`)
+   derives `Module` with `#[module(crate = "hm")]` and an `extra_repr`, a version and an
+   `added_in` buffer, writes a ResNet repository and loads it back with `from_pretrained` from
+   safetensors and PyTorch's format, builds and runs.
 
 The working tree must be clean, as for `cargo publish` (the tool never passes `--allow-dirty`).
 The packages are unpacked into a temporary directory outside the workspace; the build output goes
@@ -31,7 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "target" / "check-package"
-CRATES = ["homura-derive", "homura"]
+CRATES = ["homura-derive", "homura", "homura-models"]
 
 EXTERNAL_MANIFEST = """\
 [package]
@@ -44,8 +48,10 @@ publish = false
 
 [dependencies]
 hm = {{ package = "homura", path = {homura} }}
+hmm = {{ package = "homura-models", path = {models} }}
 
 [patch.crates-io]
+homura = {{ path = {homura} }}
 homura-derive = {{ path = {derive} }}
 """
 
@@ -77,7 +83,34 @@ impl Net {
     }
 }
 
+/// A ResNet written as a local repository and loaded back from both weight formats.
+fn models() {
+    use hm::nn::Module;
+    use hmm::hub::{Repo, WeightFormat};
+    use hmm::pretrained::{FromPretrained, PretrainedOptions};
+    use hmm::resnet::{ResNetConfig, ResNetForImageClassification};
+
+    let json = r#"{"model_type": "resnet", "layer_type": "bottleneck", "embedding_size": 8,
+        "hidden_sizes": [8, 16], "depths": [1, 1], "num_labels": 3}"#;
+    let config = ResNetConfig::from_json(json).unwrap();
+    let model = ResNetForImageClassification::new(&config);
+    model.eval();
+    std::fs::create_dir_all("repo").unwrap();
+    std::fs::write("repo/config.json", json).unwrap();
+    hm::save(&model.state_dict(), "repo/model.safetensors").unwrap();
+    hm::save(&model.state_dict(), "repo/pytorch_model.bin").unwrap();
+    let repo = Repo::local("repo").unwrap();
+    let x = hm::randn([2, 3, 32, 32]);
+    let expected = hm::with_no_grad(|| model.forward(&x)).to_vec::<f32>();
+    for format in [WeightFormat::Safetensors, WeightFormat::PyTorch] {
+        let options = PretrainedOptions::default().format(format);
+        let loaded = ResNetForImageClassification::from_pretrained(&repo, options).unwrap();
+        assert_eq!(hm::with_no_grad(|| loaded.forward(&x)).to_vec::<f32>(), expected);
+    }
+}
+
 fn main() {
+    models();
     let net = Net {
         conv: nn::Conv2d::new(3, 4, 3).padding(1),
         bn: nn::BatchNorm2d::new(4),
@@ -146,12 +179,13 @@ def check_cargo():
         sys.exit(f"Cargo 1.90 or later is needed to package a workspace, found: {version.strip()}")
 
 
-def check_manifest(unpacked, version):
+def check_manifest(unpacked, dependency, version):
     manifest = tomllib.loads((unpacked / "Cargo.toml").read_text())
-    derive = manifest["dependencies"]["homura-derive"]
-    if derive != {"version": f"={version}"}:
-        sys.exit(f"the packaged homura depends on homura-derive as {derive}, expected version ={version}")
-    print(f"the packaged homura depends on homura-derive ={version}")
+    found = manifest["dependencies"][dependency]
+    name = manifest["package"]["name"]
+    if found != {"version": f"={version}"}:
+        sys.exit(f"the packaged {name} depends on {dependency} as {found}, expected version ={version}")
+    print(f"the packaged {name} depends on {dependency} ={version}")
 
 
 def check_contents(crate):
@@ -178,17 +212,23 @@ def main():
                 tar.extractall(tmp, filter="data")
         derive = tmp / f"homura-derive-{version}"
         homura = tmp / f"homura-{version}"
-        check_manifest(homura, version)
+        models = tmp / f"homura-models-{version}"
+        check_manifest(homura, "homura-derive", version)
+        check_manifest(models, "homura", version)
 
         run(["cargo", "test", "--locked", *target], derive)
         # The lock file of the package names the derive crate of the temporary registry, which the
         # patch replaces, so it can't be used as is.
         patch = f"patch.crates-io.homura-derive.path={toml_string(derive)}"
         run(["cargo", "test", "--config", patch, *target], homura)
+        patch_homura = f"patch.crates-io.homura.path={toml_string(homura)}"
+        run(["cargo", "test", "--config", patch, "--config", patch_homura, *target], models)
 
         external = tmp / "external"
         (external / "src").mkdir(parents=True)
-        manifest = EXTERNAL_MANIFEST.format(homura=toml_string(homura), derive=toml_string(derive))
+        manifest = EXTERNAL_MANIFEST.format(
+            homura=toml_string(homura), derive=toml_string(derive), models=toml_string(models)
+        )
         (external / "Cargo.toml").write_text(manifest)
         (external / "src" / "main.rs").write_text(EXTERNAL_MAIN)
         run(["cargo", "run", *target], external)

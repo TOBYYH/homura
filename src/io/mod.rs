@@ -43,6 +43,36 @@
 //! | `torch.save(model.state_dict(), "model.pt")` | `homura::save(&model.state_dict(), "model.pt")` |
 //! | `torch.save(checkpoint, path)` | `io::save_value(&checkpoint, path)` |
 //! | loading `pytorch_model.bin.index.json` | `homura::load("pytorch_model.bin.index.json")` |
+//!
+//! # Differences from PyTorch
+//!
+//! - Loading is stricter, as the paragraph above says: archives whose local headers, data
+//!   descriptors and central directory disagree, overlapping entries and data after the end of
+//!   the archive are errors, and records are checked against their CRCs, except a CRC of 0,
+//!   which means that the writer didn't compute it (`torch.save` with CRCs turned off). PyTorch
+//!   doesn't check them when it loads.
+//!   [`load_mmap`] doesn't check CRCs, which would read every page.
+//! - BOOL bytes other than 0 and 1 in `.pt` files, which PyTorch reads as `True`, become 1; in
+//!   safetensors files, where the safetensors library keeps them, they are an error.
+//! - A saved `torch.nn.Parameter` loads as a plain tensor with the `requires_grad` saved with
+//!   it: homura's parameters belong to modules, not to state dicts.
+//! - Only CPU tensors are saved and loaded (`map_location="cpu"`).
+//! - Mapping files is the `unsafe` [`load_mmap`], whose callers promise that the files don't
+//!   change while tensors use them; [`load`] never maps files.
+//! - Written `.pt` files are read by `torch.load` with `weights_only=True` and `mmap=True`, with
+//!   PyTorch's records, alignment and pickle opcodes, but they aren't byte for byte those of
+//!   `torch.save`: the archive has no data descriptors, uses ZIP64 records only where sizes
+//!   need them, memoizes only tensors in the pickle, and its `serialization_id` is a hash of the
+//!   content, so equal values give equal files.
+//!
+//! # Not supported
+//!
+//! - `.pt` files in the format before PyTorch 1.6 (save them again with a newer PyTorch),
+//!   TorchScript archives (`torch.jit.save`), `torch.export` programs, and pickles of whole
+//!   modules or of objects of other classes, which need Python code: [`Value`] lists what loads.
+//! - Python integers outside `i64`, `bytes`, sets and recursive objects in checkpoints.
+//! - GGUF; quantized and sparse tensors; dtypes that homura doesn't have, such as the
+//!   safetensors dtypes `F8_E4M3` and `U16`.
 
 mod file;
 mod json;

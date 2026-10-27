@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "homura"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "homura-derive",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "homura-derive"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "homura-models"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "homura",
  "serde_json",

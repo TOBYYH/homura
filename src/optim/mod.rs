@@ -50,8 +50,20 @@
 //! The state of a parameter is created at its first step with a gradient, with the parameter's
 //! dtype and device. Create the optimizer after moving the model with
 //! [`Module::to`](crate::nn::Module::to): if a parameter is moved after its state was created,
-//! [`step`](Optimizer::step) panics before updating anything. Optimizers can't save or load
-//! their state yet, so a training run can't be resumed exactly.
+//! [`step`](Optimizer::step) panics before updating anything.
+//!
+//! [`state_dict`](Optimizer::state_dict) and [`load_state_dict`](Optimizer::load_state_dict)
+//! save and load the options and state as PyTorch's do, in an [`OptimizerStateDict`] with
+//! PyTorch's names, which converts to and from the [`Value`](crate::io::Value)s of `.pt` files.
+//! Training resumes exactly from a state dict saved by homura or by PyTorch, and PyTorch resumes
+//! from homura's.
+//!
+//! | PyTorch | homura |
+//! | --- | --- |
+//! | `opt.state_dict()` | `opt.state_dict()` |
+//! | `opt.load_state_dict(sd)` | `opt.load_state_dict(&sd)?` |
+//! | `torch.save({"model": model.state_dict(), "optimizer": opt.state_dict()}, path)` | `io::save_value(&Value::from(checkpoint), path)`, with `Value::from(&opt.state_dict())` in the checkpoint |
+//! | `opt.load_state_dict(torch.load(path)["optimizer"])` | `opt.load_state_dict(&OptimizerStateDict::try_from(value)?)?` |
 //!
 //! # Differences from PyTorch
 //!
@@ -67,15 +79,26 @@
 //!   that depend on each other (SGD's `nesterov`) are checked when a group is added and in
 //!   `step`, not by the chained methods, so they can be set in any order.
 //! - Learning rates and other options are `f64`s, not tensors; there are no closures, `foreach`,
-//!   `fused`, `capturable` or `differentiable` variants, and no hooks.
+//!   `fused`, `capturable` or `differentiable` variants, and no hooks. State dicts have these
+//!   options with the values that select what homura does, and loading accepts only those.
+//! - [`load_state_dict`](Optimizer::load_state_dict) checks the state dict before it changes
+//!   anything and returns an error for what PyTorch loads and fails on later, or never: a state
+//!   dict of another optimizer type (PyTorch merges the options, and its `step` fails if the
+//!   type needs other ones), unknown options or state entries, state tensors of another shape
+//!   (PyTorch fails in `step`), Adam's `max_exp_avg_sq` missing with `amsgrad`, and step counts
+//!   that aren't whole numbers from 0 to 2^53. It copies the state, where PyTorch shares the
+//!   tensors of the state dict when their dtype is the parameter's. The names of parameters that
+//!   PyTorch saves for optimizers made with named parameters are accepted and not kept.
 
 mod adam;
 #[cfg(doctest)]
 mod errors;
 mod sgd;
+mod state_dict;
 
 pub use adam::{Adam, AdamOptions, AdamState, AdamW};
 pub use sgd::{Sgd, SgdOptions, SgdState};
+pub use state_dict::{LoadError, OptimizerStateDict, ParamGroupRecord};
 
 use crate::backend::cpu::{self, Fused};
 use crate::nn::Parameter;
@@ -156,6 +179,35 @@ pub trait Optimizer {
     /// [`add_param_group`](TypedOptimizer::add_param_group); the group is unchanged then.
     #[track_caller]
     fn set_lr(&mut self, group: usize, lr: f64);
+
+    /// The options of the groups and the state of the parameters (`state_dict()`), with
+    /// PyTorch's names, numbering the parameters across the groups from 0. The options that
+    /// homura doesn't have are saved with the values that select what homura does, as PyTorch
+    /// saves its defaults (`foreach: None`). The state tensors are the optimizer's, not copies,
+    /// as in PyTorch: copy them to keep them while training goes on.
+    #[track_caller]
+    fn state_dict(&self) -> OptimizerStateDict;
+
+    /// Loads options and state saved by [`state_dict`](Optimizer::state_dict) here or by
+    /// PyTorch (`load_state_dict(state_dict)`), into an optimizer of the same type whose groups
+    /// have as many parameters as the saved ones, in the same order. The options of each group
+    /// are replaced and checked as [`add_param_group`](TypedOptimizer::add_param_group) checks
+    /// them; the defaults stay. The state is copied, converted to the dtype and device of each
+    /// parameter, except Adam's `step`, which stays an F32 or F64 tensor on the CPU. A parameter
+    /// without an entry in the state, or with an empty one, has no state then.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] listing what doesn't fit; nothing has changed then, neither
+    /// options nor state. The checks are stricter than PyTorch's, which merges what it finds
+    /// and fails later, in `step`, if at all: the number of groups and their sizes, the
+    /// parameter numbers (each once), options that this optimizer doesn't have (a state dict of
+    /// another optimizer type), option values (PyTorch's checks of `add_param_group`, and the
+    /// neutral values of the options homura doesn't have), state entries that this optimizer
+    /// doesn't keep or that it needs (Adam's `max_exp_avg_sq` with `amsgrad`), and the shapes
+    /// and dtypes of the state tensors. Adam's `step` must be a whole number from 0 to 2^53.
+    #[track_caller]
+    fn load_state_dict(&mut self, state_dict: &OptimizerStateDict) -> Result<(), LoadError>;
 }
 
 /// The options of an optimizer's parameter groups: its typed options struct, such as
@@ -231,6 +283,14 @@ impl<O: Optimizer + ?Sized> Optimizer for Box<O> {
     fn set_lr(&mut self, group: usize, lr: f64) {
         (**self).set_lr(group, lr);
     }
+
+    fn state_dict(&self) -> OptimizerStateDict {
+        (**self).state_dict()
+    }
+
+    fn load_state_dict(&mut self, state_dict: &OptimizerStateDict) -> Result<(), LoadError> {
+        (**self).load_state_dict(state_dict)
+    }
 }
 
 impl<O: Optimizer + ?Sized> Optimizer for &mut O {
@@ -256,6 +316,14 @@ impl<O: Optimizer + ?Sized> Optimizer for &mut O {
 
     fn set_lr(&mut self, group: usize, lr: f64) {
         (**self).set_lr(group, lr);
+    }
+
+    fn state_dict(&self) -> OptimizerStateDict {
+        (**self).state_dict()
+    }
+
+    fn load_state_dict(&mut self, state_dict: &OptimizerStateDict) -> Result<(), LoadError> {
+        (**self).load_state_dict(state_dict)
     }
 }
 
@@ -328,15 +396,31 @@ impl<O> ParamGroup<O> {
 /// statically, not callbacks: `#[track_caller]` passes the location of the user's call through
 /// direct and generic calls, but not through function pointers or closures.
 trait GroupOptions: Copy {
-    /// The checks of single values, made by the chained option methods.
-    #[track_caller]
-    fn check_values(&self) {
-        self.check();
+    /// The checks of single values, made by the chained option methods: the message of the
+    /// first one that fails.
+    fn validate_values(&self) -> Result<(), String> {
+        self.validate()
     }
 
-    /// All checks of a group's options, made when it is added, by `set_lr` and in `step`.
+    /// All checks of a group's options, made when it is added, by `set_lr`, in `step` and when a
+    /// state dict is loaded: the message of the first one that fails.
+    fn validate(&self) -> Result<(), String>;
+
+    /// Panics with the message of [`validate_values`](GroupOptions::validate_values).
     #[track_caller]
-    fn check(&self);
+    fn check_values(&self) {
+        if let Err(message) = self.validate_values() {
+            panic!("{message}");
+        }
+    }
+
+    /// Panics with the message of [`validate`](GroupOptions::validate).
+    #[track_caller]
+    fn check(&self) {
+        if let Err(message) = self.validate() {
+            panic!("{message}");
+        }
+    }
 
     /// The learning rate, `lr`.
     fn lr(&self) -> f64;

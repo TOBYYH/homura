@@ -166,6 +166,24 @@ All notable changes to this project are documented in this file. The format is b
   `Vec<Value>` (a list), `Dict`, `Tensor` and `&Tensor`, `Value::list(items)` and
   `Value::tuple(items)` of anything that converts, and `FromIterator` and `Extend` for `Dict`
   (a plain dict). `Dict::insert` takes any value that converts: `checkpoint.insert("epoch", 3)`.
+- Saving and loading optimizer state, PyTorch's `optimizer.state_dict()` and
+  `optimizer.load_state_dict(sd)`: `Optimizer::state_dict()` returns an
+  `optim::OptimizerStateDict` with the options of each group (`optim::ParamGroupRecord`, with
+  PyTorch 2.14's names and order) and the state of each parameter that has state, by its number
+  across the groups; `Optimizer::load_state_dict(&sd)` loads one saved by homura or PyTorch, and
+  `Value::from(&sd)` and `OptimizerStateDict::try_from(&value)` convert it to and from the
+  objects of `.pt` files, so a checkpoint `{"model": .., "optimizer": .., "epoch": ..}` resumes
+  training in either library. Training resumed from the reference's state dicts of SGD, Adam
+  and AdamW gives its parameters and state bit for bit, and the reference resumes from homura's
+  the same way (checked locally against PyTorch 2.14.1). Loading checks everything before it
+  changes anything and returns an `optim::LoadError` listing every problem; it is stricter than
+  PyTorch's: a state dict of another optimizer type, unknown options or state entries, state of
+  the wrong shape, non-neutral values of options homura doesn't have (`fused`, `capturable`,
+  `differentiable`) and step counts that aren't whole numbers from 0 to 2^53 are errors. It
+  accepts what older versions of PyTorch saved: missing optional options, step counts saved as
+  Python numbers, `None` momentum buffers, and the parameter names of optimizers made with
+  named parameters. The loaded state is a copy, converted to each parameter's dtype and device
+  (PyTorch shares it when the dtype matches); Adam's step count keeps its dtype.
 - `nn::Identity`, PyTorch's `nn.Identity`: a layer that returns its input, for the places where
   a model has a layer in some configurations and none in others.
 - The new workspace crate `homura-models` (not published yet): models whose module trees, keys
@@ -203,6 +221,8 @@ All notable changes to this project are documented in this file. The format is b
   and device: a backward pass that reaches a converted parameter's old accumulator panics, as
   one that unpacked it already did. It used to run a graph that didn't save the parameter.
   The messages also cover loading by assignment.
+- **Breaking** for implementations of `optim::Optimizer` outside homura: the trait has the new
+  required methods `state_dict` and `load_state_dict`. Calling the optimizers is unchanged.
 - **Breaking**: the methods of `optim::Optimizer` that use the optimizer's options type moved to
   the new trait `optim::TypedOptimizer: Optimizer`, which has the associated type `Options`:
   `defaults`, `param_groups`, `options_mut` and `add_param_group`. Code that calls them needs

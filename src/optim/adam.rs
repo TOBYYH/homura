@@ -1,9 +1,12 @@
 //! [`Adam`] and [`AdamW`].
 
+use super::state_dict::{Fields, Schema, load_moment, load_step};
 use super::{
-    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, TypedOptimizer, addcdiv, addcmul,
-    check_coefficients, check_state_tensor, computation, lerp, scaled_add,
+    GroupOptions, Groups, LoadError, Optimizer, OptimizerStateDict, ParamCheck, ParamGroup,
+    TypedOptimizer, addcdiv, addcmul, check_coefficients, check_state_tensor, computation, lerp,
+    scaled_add,
 };
+use crate::io::Value;
 use crate::nn::Parameter;
 use crate::{DType, Device, Tensor};
 
@@ -38,13 +41,8 @@ pub struct AdamState {
 
 impl AdamState {
     fn new(p: &Tensor, amsgrad: bool) -> AdamState {
-        // PyTorch's `_get_scalar_dtype()`, on the CPU whatever the parameter's device.
-        let dtype = match crate::default_dtype() {
-            DType::F64 => DType::F64,
-            _ => DType::F32,
-        };
         AdamState {
-            step: crate::zeros_with([], (dtype, Device::Cpu)),
+            step: crate::zeros_with([], (scalar_dtype(), Device::Cpu)),
             exp_avg: crate::zeros_like(p),
             exp_avg_sq: crate::zeros_like(p),
             max_exp_avg_sq: amsgrad.then(|| crate::zeros_like(p)),
@@ -79,6 +77,15 @@ impl AdamState {
     }
 }
 
+/// The dtype of a new `step`, PyTorch's `_get_scalar_dtype()`; it is on the CPU whatever the
+/// parameter's device.
+fn scalar_dtype() -> DType {
+    match crate::default_dtype() {
+        DType::F64 => DType::F64,
+        _ => DType::F32,
+    }
+}
+
 /// What Adam and AdamW share: they differ in the default weight decay and how it is applied.
 #[derive(Debug)]
 struct Inner {
@@ -104,6 +111,12 @@ impl Inner {
         Inner {
             groups: Groups::new(params, defaults),
             decoupled_weight_decay,
+        }
+    }
+
+    fn schema(&self) -> AdamSchema {
+        AdamSchema {
+            decoupled: self.decoupled_weight_decay,
         }
     }
 
@@ -158,6 +171,113 @@ impl Inner {
     }
 }
 
+/// What Adam and AdamW save: PyTorch 2.14's options, and the state.
+struct AdamSchema {
+    decoupled: bool,
+}
+
+impl Schema<AdamOptions, AdamState> for AdamSchema {
+    fn save_options(&self, o: &AdamOptions) -> Vec<(String, Value)> {
+        [
+            ("lr", Value::Float(o.lr)),
+            ("betas", Value::tuple([o.betas.0, o.betas.1])),
+            ("eps", Value::Float(o.eps)),
+            ("weight_decay", Value::Float(o.weight_decay)),
+            ("amsgrad", Value::Bool(o.amsgrad)),
+            ("maximize", Value::Bool(o.maximize)),
+            ("foreach", Value::None),
+            ("capturable", Value::Bool(false)),
+            ("differentiable", Value::Bool(false)),
+            ("fused", Value::None),
+            ("decoupled_weight_decay", Value::Bool(self.decoupled)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// The options of `Adam()` are required; the others default as in PyTorch's
+    /// `Adam.__setstate__`. A `decoupled_weight_decay` must be the optimizer's: False for Adam,
+    /// True for AdamW. Without it, both load the options.
+    fn load_options(&self, f: &mut Fields) -> AdamOptions {
+        let options = AdamOptions {
+            lr: f.number("lr", None),
+            betas: f.pair("betas"),
+            eps: f.number("eps", None),
+            weight_decay: f.number("weight_decay", None),
+            amsgrad: f.flag("amsgrad", false),
+            maximize: f.flag("maximize", false),
+        };
+        f.unsupported(
+            "foreach",
+            |v| matches!(v, Value::None | Value::Bool(_)),
+            "None or a bool",
+        );
+        f.unsupported("capturable", |v| matches!(v, Value::Bool(false)), "False");
+        f.unsupported(
+            "differentiable",
+            |v| matches!(v, Value::Bool(false)),
+            "False",
+        );
+        f.unsupported(
+            "fused",
+            |v| matches!(v, Value::None | Value::Bool(false)),
+            "None or False",
+        );
+        let name = "decoupled_weight_decay";
+        if f.flag(name, self.decoupled) != self.decoupled {
+            let (other, this) = match self.decoupled {
+                true => ("Adam", "AdamW"),
+                false => ("AdamW", "Adam"),
+            };
+            f.error(
+                name,
+                format_args!(
+                    "is {}: the state dict is {other}'s, this is {this}",
+                    !self.decoupled
+                ),
+            );
+        }
+        options
+    }
+
+    fn save_state(&self, s: &AdamState) -> Vec<(String, Value)> {
+        let mut out = vec![
+            ("step".to_string(), Value::Tensor(s.step.clone())),
+            ("exp_avg".to_string(), Value::Tensor(s.exp_avg.clone())),
+            (
+                "exp_avg_sq".to_string(),
+                Value::Tensor(s.exp_avg_sq.clone()),
+            ),
+        ];
+        if let Some(max) = &s.max_exp_avg_sq {
+            out.push(("max_exp_avg_sq".to_string(), Value::Tensor(max.clone())));
+        }
+        out
+    }
+
+    /// No state for an empty record. `max_exp_avg_sq` is required with `amsgrad` and kept
+    /// without it, for when `amsgrad` is turned on again.
+    fn load_state(&self, o: &AdamOptions, p: &Tensor, f: &mut Fields) -> Option<AdamState> {
+        if f.is_empty() {
+            return None;
+        }
+        let step = load_step(f, scalar_dtype());
+        let exp_avg = load_moment(p, f, "exp_avg");
+        let exp_avg_sq = load_moment(p, f, "exp_avg_sq");
+        let max_exp_avg_sq = match o.amsgrad || f.get("max_exp_avg_sq").is_some() {
+            true => Some(load_moment(p, f, "max_exp_avg_sq")?),
+            false => None,
+        };
+        Some(AdamState {
+            step: step?,
+            exp_avg: exp_avg?,
+            exp_avg_sq: exp_avg_sq?,
+            max_exp_avg_sq,
+        })
+    }
+}
+
 /// `lr / (1 - beta1^step)`, the size of the update at `step`.
 fn step_size(o: &AdamOptions, step: f64) -> f64 {
     o.lr / (1.0 - o.betas.0.powf(step))
@@ -197,9 +317,8 @@ impl ParamCheck<AdamOptions, AdamState> for AdamCheck {
 }
 
 impl GroupOptions for AdamOptions {
-    /// The checks of PyTorch's `Adam()`; NaN fails them, as there.
-    fn check(&self) {
-        check(self);
+    fn validate(&self) -> Result<(), String> {
+        validate(self)
     }
 
     fn lr(&self) -> f64 {
@@ -212,24 +331,24 @@ impl GroupOptions for AdamOptions {
 }
 
 /// The checks of PyTorch's `Adam()`; NaN fails them, as there.
-#[track_caller]
-fn check(o: &AdamOptions) {
+fn validate(o: &AdamOptions) -> Result<(), String> {
     if !(0.0..).contains(&o.lr) {
-        panic!("Invalid learning rate: {}", o.lr);
+        return Err(format!("Invalid learning rate: {}", o.lr));
     }
     if !(0.0..).contains(&o.eps) {
-        panic!("Invalid epsilon value: {}", o.eps);
+        return Err(format!("Invalid epsilon value: {}", o.eps));
     }
     let (beta1, beta2) = o.betas;
     if !(0.0..1.0).contains(&beta1) {
-        panic!("Invalid beta parameter at index 0: {beta1}");
+        return Err(format!("Invalid beta parameter at index 0: {beta1}"));
     }
     if !(0.0..1.0).contains(&beta2) {
-        panic!("Invalid beta parameter at index 1: {beta2}");
+        return Err(format!("Invalid beta parameter at index 1: {beta2}"));
     }
     if !(0.0..).contains(&o.weight_decay) {
-        panic!("Invalid weight_decay value: {}", o.weight_decay);
+        return Err(format!("Invalid weight_decay value: {}", o.weight_decay));
     }
+    Ok(())
 }
 
 /// The chained option methods, `state` and the [`Optimizer`] and [`TypedOptimizer`]
@@ -320,6 +439,18 @@ macro_rules! adam_methods {
 
             fn set_lr(&mut self, group: usize, lr: f64) {
                 self.0.groups.set_lr(group, lr);
+            }
+
+            fn state_dict(&self) -> OptimizerStateDict {
+                self.0.groups.state_dict(&self.0.schema())
+            }
+
+            fn load_state_dict(
+                &mut self,
+                state_dict: &OptimizerStateDict,
+            ) -> Result<(), LoadError> {
+                let schema = self.0.schema();
+                self.0.groups.load_state_dict(&schema, state_dict)
             }
         }
 

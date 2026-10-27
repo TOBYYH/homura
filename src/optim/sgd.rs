@@ -1,10 +1,12 @@
 //! [`Sgd`]: stochastic gradient descent.
 
+use super::state_dict::{Fields, Schema, load_moment};
 use super::{
-    GroupOptions, Groups, Optimizer, ParamCheck, ParamGroup, TypedOptimizer, check_coefficients,
-    check_state_tensor, scaled_add,
+    GroupOptions, Groups, LoadError, Optimizer, OptimizerStateDict, ParamCheck, ParamGroup,
+    TypedOptimizer, check_coefficients, check_state_tensor, scaled_add,
 };
 use crate::Tensor;
+use crate::io::Value;
 use crate::nn::Parameter;
 
 /// The options of an [`Sgd`] parameter group, with PyTorch's names and defaults.
@@ -207,6 +209,14 @@ impl Optimizer for Sgd {
     fn set_lr(&mut self, group: usize, lr: f64) {
         self.groups.set_lr(group, lr);
     }
+
+    fn state_dict(&self) -> OptimizerStateDict {
+        self.groups.state_dict(&SgdSchema)
+    }
+
+    fn load_state_dict(&mut self, state_dict: &OptimizerStateDict) -> Result<(), LoadError> {
+        self.groups.load_state_dict(&SgdSchema, state_dict)
+    }
 }
 
 impl TypedOptimizer for Sgd {
@@ -231,23 +241,25 @@ impl TypedOptimizer for Sgd {
 
 impl GroupOptions for SgdOptions {
     /// The checks of single values, which PyTorch makes in `SGD()`; NaN passes them, as there.
-    fn check_values(&self) {
+    fn validate_values(&self) -> Result<(), String> {
         if self.lr < 0.0 {
-            panic!("Invalid learning rate: {}", self.lr);
+            return Err(format!("Invalid learning rate: {}", self.lr));
         }
         if self.momentum < 0.0 {
-            panic!("Invalid momentum value: {}", self.momentum);
+            return Err(format!("Invalid momentum value: {}", self.momentum));
         }
         if self.weight_decay < 0.0 {
-            panic!("Invalid weight_decay value: {}", self.weight_decay);
+            return Err(format!("Invalid weight_decay value: {}", self.weight_decay));
         }
+        Ok(())
     }
 
-    fn check(&self) {
-        self.check_values();
+    fn validate(&self) -> Result<(), String> {
+        self.validate_values()?;
         if self.nesterov && (self.momentum <= 0.0 || self.dampening != 0.0) {
-            panic!("Nesterov momentum requires a momentum and zero dampening");
+            return Err("Nesterov momentum requires a momentum and zero dampening".into());
         }
+        Ok(())
     }
 
     fn lr(&self) -> f64 {
@@ -283,5 +295,73 @@ impl ParamCheck<SgdOptions, SgdState> for SgdCheck {
         alphas.push(-o.lr);
         let dtype = p.dtype();
         check_coefficients(p, alphas.into_iter().map(|a| (a, dtype)));
+    }
+}
+
+/// What SGD saves: PyTorch 2.14's options, and the momentum buffer.
+struct SgdSchema;
+
+impl Schema<SgdOptions, SgdState> for SgdSchema {
+    fn save_options(&self, o: &SgdOptions) -> Vec<(String, Value)> {
+        [
+            ("lr", Value::Float(o.lr)),
+            ("momentum", Value::Float(o.momentum)),
+            ("dampening", Value::Float(o.dampening)),
+            ("weight_decay", Value::Float(o.weight_decay)),
+            ("nesterov", Value::Bool(o.nesterov)),
+            ("maximize", Value::Bool(o.maximize)),
+            ("foreach", Value::None),
+            ("differentiable", Value::Bool(false)),
+            ("fused", Value::None),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// The options of `SGD()` are required; the others default as in PyTorch's
+    /// `SGD.__setstate__`.
+    fn load_options(&self, f: &mut Fields) -> SgdOptions {
+        let options = SgdOptions {
+            lr: f.number("lr", None),
+            momentum: f.number("momentum", None),
+            dampening: f.number("dampening", None),
+            weight_decay: f.number("weight_decay", None),
+            nesterov: f.flag("nesterov", false),
+            maximize: f.flag("maximize", false),
+        };
+        f.unsupported(
+            "foreach",
+            |v| matches!(v, Value::None | Value::Bool(_)),
+            "None or a bool",
+        );
+        f.unsupported(
+            "differentiable",
+            |v| matches!(v, Value::Bool(false)),
+            "False",
+        );
+        f.unsupported(
+            "fused",
+            |v| matches!(v, Value::None | Value::Bool(false)),
+            "None or False",
+        );
+        options
+    }
+
+    fn save_state(&self, s: &SgdState) -> Vec<(String, Value)> {
+        vec![(
+            "momentum_buffer".into(),
+            Value::Tensor(s.momentum_buffer.clone()),
+        )]
+    }
+
+    /// No state for an empty record and for a `None` buffer, which PyTorch saved with a momentum
+    /// of 0 before version 2.
+    fn load_state(&self, _: &SgdOptions, p: &Tensor, f: &mut Fields) -> Option<SgdState> {
+        if f.is_empty() || matches!(f.get("momentum_buffer"), Some(Value::None)) {
+            return None;
+        }
+        let momentum_buffer = load_moment(p, f, "momentum_buffer")?;
+        Some(SgdState { momentum_buffer })
     }
 }

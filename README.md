@@ -43,11 +43,11 @@ Implemented so far:
 - The optimizers `optim::Sgd`, `Adam` and `AdamW`, with parameter groups, checked step by step
   against PyTorch's. Ten steps of training a small MLP, and a small CNN with batch
   normalization, give PyTorch's losses, gradients, parameters and optimizer state (and the
-  batch norm statistics) at every step.
+  batch norm statistics) at every step. Their state dicts are PyTorch's, so training resumes
+  from a checkpoint written by either library.
 
-Not available yet: GPU backends (ROCm comes first), most neural network layers, saving and
-loading optimizer state, autograd hooks, and in-place operations on views
-that require grad.
+Not available yet: GPU backends (ROCm comes first), most neural network layers, autograd hooks,
+and in-place operations on views that require grad.
 
 ## Example
 

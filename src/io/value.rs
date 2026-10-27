@@ -69,7 +69,7 @@ impl Value {
     }
 
     /// The Python type's name, for messages.
-    pub(super) fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Value::None => "None",
             Value::Bool(_) => "bool",

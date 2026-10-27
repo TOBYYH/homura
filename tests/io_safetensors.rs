@@ -422,13 +422,11 @@ fn state_dicts_round_trip() {
 fn save_picks_the_format_by_extension() {
     let dir = scratch("extension");
     let state_dict: StateDict = [("w", homura::ones([2]))].into_iter().collect();
+    // PyTorch's format, which tests/io_pt_write.rs tests.
     for name in ["model.pt", "model.pth", "model.bin", "model.PT"] {
         let path = dir.join(name);
-        assert!(is_format_error(
-            homura::save(&state_dict, &path),
-            "can't be saved yet"
-        ));
-        assert!(!path.exists());
+        homura::save(&state_dict, &path).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..4], b"PK\x03\x04");
     }
     for name in ["model.txt", "model", "model.safetensors.json"] {
         let path = dir.join(name);

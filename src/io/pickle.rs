@@ -11,12 +11,17 @@
 //! Only `collections.OrderedDict`, PyTorch's tensor rebuild functions and its storage classes
 //! can be referenced, and only the first two called. Tensors are rebuilt by a [`Tensors`]
 //! implementation from their call's arguments.
+//!
+//! [`dump`] writes a [`Value`] as Python's pickler writes the same objects with protocol 2, as
+//! `torch.save` does, except that only tensors go in the memo: a `Value` is a tree, but the same
+//! tensor can be in several places, and Python reads it back as one object then.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::value::{Dict, Key, Value};
 use crate::nn::ModuleVersions;
+use crate::tensor::Layout;
 use crate::{DType, Error, Result, Tensor};
 
 /// The id of a node in the arena.
@@ -831,6 +836,304 @@ impl Materializer<'_> {
     }
 }
 
+/// A tensor as [`dump`] writes it: a `_rebuild_tensor_v2` call on a storage record.
+pub(super) struct TensorRef {
+    pub(super) dtype: DType,
+    /// The key of the storage record.
+    pub(super) key: usize,
+    /// The number of elements of the storage.
+    pub(super) numel: usize,
+    pub(super) layout: Layout,
+    pub(super) requires_grad: bool,
+}
+
+/// Python's pickler takes items of lists and dicts in batches of this many.
+const BATCH: usize = 1000;
+
+/// The position of a value inside the object being written, for messages: a list index or a
+/// dict key.
+enum Step<'v> {
+    Index(usize),
+    Key(&'v Key),
+}
+
+struct Pickler<'v, 'f> {
+    out: Vec<u8>,
+    path: Vec<Step<'v>>,
+    tensor: &'f mut dyn FnMut(&Tensor) -> Result<TensorRef>,
+    /// The memo index of each tensor written, by [`Tensor::id`]. The value holds the tensors,
+    /// so the ids stay unique.
+    memo: HashMap<usize, u32>,
+}
+
+/// Writes `value` as a pickle of protocol 2, with `tensor` saying how each tensor refers to its
+/// storage. Fails if containers are nested deeper than the unpickler reads, for strings of 4 GiB
+/// or more (protocol 2 has no opcode for them) and if `tensor` fails; the message says where
+/// in `value` it happened.
+pub(super) fn dump(
+    value: &Value,
+    tensor: &mut dyn FnMut(&Tensor) -> Result<TensorRef>,
+) -> Result<Vec<u8>> {
+    let mut p = Pickler {
+        out: vec![op::PROTO, 2],
+        path: vec![],
+        tensor,
+        memo: HashMap::new(),
+    };
+    p.value(value, 0)?;
+    p.out.push(op::STOP);
+    Ok(p.out)
+}
+
+impl<'v> Pickler<'v, '_> {
+    /// `msg` with where in the object it happened.
+    fn error(&self, msg: &str) -> Error {
+        if self.path.is_empty() {
+            return Error::Format(msg.to_string());
+        }
+        let mut at = String::new();
+        for step in &self.path {
+            match step {
+                Step::Index(i) => at.push_str(&format!("[{i}]")),
+                Step::Key(key) => at.push_str(&format!("[{key:?}]")),
+            }
+        }
+        Error::Format(format!("{msg} (at {at})"))
+    }
+
+    fn int(&mut self, i: i64) {
+        if let Ok(b) = u8::try_from(i) {
+            self.out.extend_from_slice(&[op::BININT1, b]);
+        } else if let Ok(b) = u16::try_from(i) {
+            self.out.push(op::BININT2);
+            self.out.extend_from_slice(&b.to_le_bytes());
+        } else if let Ok(b) = i32::try_from(i) {
+            self.out.push(op::BININT);
+            self.out.extend_from_slice(&b.to_le_bytes());
+        } else {
+            // The shortest little-endian two's complement form, as Python's `encode_long`.
+            let bytes = i.to_le_bytes();
+            let mut n = bytes.len();
+            while n > 1 {
+                let (last, sign) = (bytes[n - 1], bytes[n - 2] & 0x80);
+                if (last == 0 && sign == 0) || (last == 0xff && sign != 0) {
+                    n -= 1;
+                } else {
+                    break;
+                }
+            }
+            self.out.extend_from_slice(&[op::LONG1, n as u8]);
+            self.out.extend_from_slice(&bytes[..n]);
+        }
+    }
+
+    /// A size, offset or other count of a tensor.
+    fn count(&mut self, n: usize) -> Result<()> {
+        let n = i64::try_from(n).map_err(|_| self.error("a tensor is too large to save"))?;
+        self.int(n);
+        Ok(())
+    }
+
+    fn string(&mut self, s: &str) -> Result<()> {
+        let len = u32::try_from(s.len())
+            .map_err(|_| self.error("can't save a string of 4 GiB or more in a .pt file"))?;
+        self.out.push(op::BINUNICODE);
+        self.out.extend_from_slice(&len.to_le_bytes());
+        self.out.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    fn global(&mut self, module: &str, name: &str) {
+        self.out.push(op::GLOBAL);
+        for part in [module, name] {
+            self.out.extend_from_slice(part.as_bytes());
+            self.out.push(b'\n');
+        }
+    }
+
+    /// `collections.OrderedDict()`.
+    fn ordered_dict(&mut self) {
+        self.global("collections", "OrderedDict");
+        self.out.extend_from_slice(&[op::EMPTY_TUPLE, op::REDUCE]);
+    }
+
+    /// A tuple of `n` items that `items` writes.
+    fn tuple(&mut self, n: usize, items: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        if n == 0 {
+            self.out.push(op::EMPTY_TUPLE);
+            return Ok(());
+        }
+        if n > 3 {
+            self.out.push(op::MARK);
+        }
+        items(self)?;
+        self.out.push(match n {
+            1 => op::TUPLE1,
+            2 => op::TUPLE2,
+            3 => op::TUPLE3,
+            _ => op::TUPLE,
+        });
+        Ok(())
+    }
+
+    /// Items appended or set in batches, as Python's `_batch_appends` and `_batch_setitems`:
+    /// `MARK .. many` for a batch of several items, `one` after a single one.
+    fn batches<'a, T>(
+        &mut self,
+        items: &'a [T],
+        many: u8,
+        one: u8,
+        mut item: impl FnMut(&mut Self, usize, &'a T) -> Result<()>,
+    ) -> Result<()> {
+        for (b, batch) in items.chunks(BATCH).enumerate() {
+            if batch.len() > 1 {
+                self.out.push(op::MARK);
+            }
+            for (i, x) in batch.iter().enumerate() {
+                item(self, b * BATCH + i, x)?;
+            }
+            self.out.push(if batch.len() > 1 { many } else { one });
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, value: &'v Value, depth: usize) -> Result<()> {
+        let container = matches!(value, Value::List(_) | Value::Tuple(_) | Value::Dict(_));
+        if container && depth >= MAX_DEPTH {
+            return Err(self.error(&format!(
+                "can't save objects nested more than {MAX_DEPTH} levels deep: homura reads no \
+                 deeper"
+            )));
+        }
+        match value {
+            Value::None => self.out.push(op::NONE),
+            Value::Bool(b) => self.out.push(if *b { op::NEWTRUE } else { op::NEWFALSE }),
+            Value::Int(i) => self.int(*i),
+            Value::Float(f) => {
+                self.out.push(op::BINFLOAT);
+                self.out.extend_from_slice(&f.to_be_bytes());
+            }
+            Value::Str(s) => self.string(s)?,
+            Value::List(items) => {
+                self.out.push(op::EMPTY_LIST);
+                self.batches(items, op::APPENDS, op::APPEND, |p, i, item| {
+                    p.child(Step::Index(i), item, depth)
+                })?;
+            }
+            Value::Tuple(items) => self.tuple(items.len(), |p| {
+                for (i, item) in items.iter().enumerate() {
+                    p.child(Step::Index(i), item, depth)?;
+                }
+                Ok(())
+            })?,
+            Value::Dict(dict) => self.dict(dict, depth)?,
+            Value::Tensor(t) => {
+                if let Some(&index) = self.memo.get(&t.id()) {
+                    self.memo_op(op::BINGET, op::LONG_BINGET, index);
+                    return Ok(());
+                }
+                let r = (self.tensor)(t).map_err(|e| match e {
+                    Error::Format(msg) => self.error(&msg),
+                    e => e,
+                })?;
+                self.tensor(r)?;
+                let index = u32::try_from(self.memo.len())
+                    .map_err(|_| self.error("can't save more than 2^32 tensors"))?;
+                self.memo.insert(t.id(), index);
+                self.memo_op(op::BINPUT, op::LONG_BINPUT, index);
+            }
+        }
+        Ok(())
+    }
+
+    /// `BINPUT` / `BINGET` (`short`) for a memo index below 256, else the `LONG_` form.
+    fn memo_op(&mut self, short: u8, long: u8, index: u32) {
+        match u8::try_from(index) {
+            Ok(i) => self.out.extend_from_slice(&[short, i]),
+            Err(_) => {
+                self.out.push(long);
+                self.out.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+    }
+
+    fn child(&mut self, step: Step<'v>, value: &'v Value, depth: usize) -> Result<()> {
+        self.path.push(step);
+        self.value(value, depth + 1)?;
+        self.path.pop();
+        Ok(())
+    }
+
+    fn dict(&mut self, dict: &'v Dict, depth: usize) -> Result<()> {
+        if dict.is_ordered() {
+            self.ordered_dict();
+        } else {
+            self.out.push(op::EMPTY_DICT);
+        }
+        self.batches(
+            dict.items(),
+            op::SETITEMS,
+            op::SETITEM,
+            |p, _, (key, value)| {
+                match key {
+                    Key::Int(i) => p.int(*i),
+                    Key::Str(s) => p.string(s)?,
+                }
+                p.child(Step::Key(key), value, depth)
+            },
+        )?;
+        if let Some(versions) = dict.versions() {
+            // The state of `BUILD`: {"_metadata": OrderedDict((path, {"version": v}), ..)}.
+            self.out.push(op::EMPTY_DICT);
+            self.string("_metadata")?;
+            self.ordered_dict();
+            let versions: Vec<(&str, u32)> = versions.iter().collect();
+            self.batches(
+                &versions,
+                op::SETITEMS,
+                op::SETITEM,
+                |p, _, &(path, version)| {
+                    p.string(path)?;
+                    p.out.push(op::EMPTY_DICT);
+                    p.string("version")?;
+                    p.int(version.into());
+                    p.out.push(op::SETITEM);
+                    Ok(())
+                },
+            )?;
+            self.out.extend_from_slice(&[op::SETITEM, op::BUILD]);
+        }
+        Ok(())
+    }
+
+    /// `_rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad,
+    /// OrderedDict())`, where `storage` is the persistent id `('storage', torch.<X>Storage, key,
+    /// 'cpu', numel)`.
+    fn tensor(&mut self, t: TensorRef) -> Result<()> {
+        self.global("torch._utils", "_rebuild_tensor_v2");
+        self.out.extend_from_slice(&[op::MARK, op::MARK]);
+        self.string("storage")?;
+        let class = STORAGES.iter().find(|(_, d)| *d == t.dtype).unwrap().0;
+        self.global("torch", class);
+        self.string(&t.key.to_string())?;
+        self.string("cpu")?;
+        self.count(t.numel)?;
+        self.out.extend_from_slice(&[op::TUPLE, op::BINPERSID]);
+        self.count(t.layout.offset)?;
+        for dims in [t.layout.shape.as_slice(), t.layout.strides.as_slice()] {
+            self.tuple(dims.len(), |p| dims.iter().try_for_each(|&d| p.count(d)))?;
+        }
+        self.out.push(if t.requires_grad {
+            op::NEWTRUE
+        } else {
+            op::NEWFALSE
+        });
+        self.ordered_dict();
+        self.out.extend_from_slice(&[op::TUPLE, op::REDUCE]);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1248,5 +1551,212 @@ pub(super) mod tests {
         }
         ops.push(b'.');
         err(&ops, "expand to much more");
+    }
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Pickles a value without tensors.
+    fn dumped(v: &Value) -> Result<Vec<u8>> {
+        dump(v, &mut |_| unreachable!("no tensors"))
+    }
+
+    #[test]
+    fn dump_writes_what_pythons_pickler_writes() {
+        // `pickle._Pickler(f, 2)` with `fast = True` (no memo) on the same objects.
+        let ints = [
+            0,
+            255,
+            256,
+            65535,
+            65536,
+            -1,
+            -(1 << 31),
+            (1 << 31) - 1,
+            1 << 31,
+            -(1 << 31) - 1,
+            i64::MAX,
+            i64::MIN,
+            1 << 39,
+            -129,
+        ];
+        let cases: [(Value, &str); 13] = [
+            (
+                Value::list(ints),
+                "80025d284b004bff4d00014dffff4a000001004affffffff4a000000804affffff7f8a0500000080\
+                 008a05ffffff7fff8a08ffffffffffffff7f8a0800000000000000808a060000000080004a7fff\
+                 ffff652e",
+            ),
+            (
+                Value::tuple([f64::NAN, -0.0, f64::INFINITY, 1.5]),
+                "800228477ff8000000000000478000000000000000477ff0000000000000473ff8000000000000\
+                 742e",
+            ),
+            (
+                Value::tuple([
+                    Value::from(""),
+                    Value::from("é✓"),
+                    Value::from(true),
+                    Value::from(false),
+                    Value::None,
+                ]),
+                "80022858000000005805000000c3a9e29c9388894e742e",
+            ),
+            (Value::tuple::<Value>([]), "8002292e"),
+            (Value::tuple([1]), "80024b01852e"),
+            (Value::tuple([1, 2]), "80024b014b02862e"),
+            (Value::tuple([1, 2, 3]), "80024b014b024b03872e"),
+            (Value::tuple([1, 2, 3, 4]), "8002284b014b024b034b04742e"),
+            (Value::from(Dict::new()), "80027d2e"),
+            (
+                Value::from([(0, Value::None)].into_iter().collect::<Dict>()),
+                "80027d4b004e732e",
+            ),
+            (
+                Value::from([("a", 1), ("b", 2)].into_iter().collect::<Dict>()),
+                "80027d285801000000614b015801000000624b02752e",
+            ),
+            (
+                Value::from(Dict::new_ordered()),
+                "800263636f6c6c656374696f6e730a4f726465726564446963740a29522e",
+            ),
+            (Value::list::<Value>([]), "80025d2e"),
+        ];
+        for (v, hex) in cases {
+            let hex: String = hex.split_whitespace().collect();
+            assert_eq!(dumped(&v).unwrap(), unhex(&hex), "{v:?}");
+            // And the unpickler reads it back.
+            let back = Pickle::parse(&unhex(&hex))
+                .unwrap()
+                .to_value(&mut Placeholders::default())
+                .unwrap();
+            assert_eq!(canonical(&back), canonical(&v));
+        }
+    }
+
+    #[test]
+    fn dump_batches_items_by_a_thousand() {
+        for n in [1, 2, 999, 1000, 1001, 2000, 2001] {
+            let list = Value::list(vec![Value::None; n]);
+            let dict: Dict = (0..n as i64).map(|i| (i, Value::None)).collect();
+            // Each batch of several items is MARK .. many; a batch of one item ends in one.
+            let expected = |start: u8, many: u8, one: u8, item: &dyn Fn(usize) -> Vec<u8>| {
+                let mut out = vec![op::PROTO, 2, start];
+                for batch in (0..n).collect::<Vec<_>>().chunks(1000) {
+                    if batch.len() > 1 {
+                        out.push(op::MARK);
+                    }
+                    for &i in batch {
+                        out.extend(item(i));
+                    }
+                    out.push(if batch.len() > 1 { many } else { one });
+                }
+                out.push(op::STOP);
+                out
+            };
+            let key = |i: usize| match u8::try_from(i) {
+                Ok(b) => vec![op::BININT1, b, op::NONE],
+                Err(_) => {
+                    let [lo, hi] = (i as u16).to_le_bytes();
+                    vec![op::BININT2, lo, hi, op::NONE]
+                }
+            };
+            let cases = [
+                (
+                    list,
+                    expected(op::EMPTY_LIST, op::APPENDS, op::APPEND, &|_| vec![op::NONE]),
+                ),
+                (
+                    Value::from(dict),
+                    expected(op::EMPTY_DICT, op::SETITEMS, op::SETITEM, &key),
+                ),
+            ];
+            for (v, expected) in cases {
+                let bytes = dumped(&v).unwrap();
+                assert_eq!(bytes, expected, "{n}");
+                let back = Pickle::parse(&bytes)
+                    .unwrap()
+                    .to_value(&mut Placeholders::default())
+                    .unwrap();
+                assert_eq!(canonical(&back), canonical(&v));
+            }
+        }
+    }
+
+    #[test]
+    fn dump_writes_versions_with_build() {
+        let mut sd = Dict::new_ordered();
+        sd.insert("w", Value::Int(1));
+        sd.set_versions(Some([("", 1), ("bn", 2)].into_iter().collect()));
+        let bytes = dumped(&Value::from(sd.clone())).unwrap();
+        // Python's pickler (fast) on an OrderedDict({"w": 1}) whose _metadata is
+        // OrderedDict({"": {"version": 1}, "bn": {"version": 2}}).
+        let expected = "800263636f6c6c656374696f6e730a4f726465726564446963740a29525801000000774b01737d\
+                        58090000005f6d6574616461746163636f6c6c656374696f6e730a4f72646572656444696374\
+                        0a29522858000000007d580700000076657273696f6e4b01735802000000626e7d5807000000\
+                        76657273696f6e4b02737573622e";
+        assert_eq!(bytes, unhex(expected));
+        let back = Pickle::parse(&bytes)
+            .unwrap()
+            .to_value(&mut Placeholders::default())
+            .unwrap();
+        assert_eq!(canonical(&back), canonical(&Value::from(sd.clone())));
+        // Empty versions are kept too.
+        sd.set_versions(Some(ModuleVersions::new()));
+        let bytes = dumped(&Value::from(sd)).unwrap();
+        let Value::Dict(back) = Pickle::parse(&bytes)
+            .unwrap()
+            .to_value(&mut Placeholders::default())
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(back.versions(), Some(&ModuleVersions::new()));
+    }
+
+    #[test]
+    fn dump_refuses_what_the_unpickler_wont_read() {
+        let nested = |n: usize| {
+            let mut v = Value::tuple::<Value>([]);
+            for _ in 1..n {
+                v = Value::tuple([v]);
+            }
+            v
+        };
+        // MAX_DEPTH containers inside each other are read; one more is not, so it isn't written.
+        let bytes = dumped(&nested(MAX_DEPTH)).unwrap();
+        Pickle::parse(&bytes)
+            .unwrap()
+            .to_value(&mut Placeholders::default())
+            .unwrap();
+        let message = |r: Result<Vec<u8>>| match r {
+            Err(Error::Format(m)) => m,
+            other => panic!("expected a format error, got {other:?}"),
+        };
+        let m = message(dumped(&nested(MAX_DEPTH + 1)));
+        assert!(m.contains("nested more than 256 levels deep"), "{m}");
+        assert!(
+            m.ends_with(&format!("(at {})", "[0]".repeat(MAX_DEPTH))),
+            "{m}"
+        );
+        // Scalars don't count as levels.
+        dumped(&Value::tuple([nested(MAX_DEPTH - 1)])).unwrap();
+        // Errors of the tensor callback say where the tensor is.
+        let mut inner = Dict::new_ordered();
+        inner.insert("w", crate::zeros([1]));
+        let mut outer = Dict::new();
+        outer.insert(3, Value::list([Value::None, Value::from(inner)]));
+        let m = message(dump(&Value::from(outer), &mut |_| {
+            Err(Error::Format("no tensors here".into()))
+        }));
+        assert_eq!(m, r#"no tensors here (at [3][1]["w"])"#);
+        let m = message(dump(&Value::from(crate::zeros([1])), &mut |_| {
+            Err(Error::Format("no tensors here".into()))
+        }));
+        assert_eq!(m, "no tensors here");
     }
 }

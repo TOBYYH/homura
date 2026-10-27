@@ -10,7 +10,8 @@
 //! - zero-copy loading: [`load_mmap`], which maps the files into memory. It is `unsafe`: the
 //!   files must not change while tensors use them. `load` never maps files;
 //! - whole PyTorch checkpoints, not only state dicts: [`load_value`] and
-//!   [`load_value_from_bytes`] read the Python objects of `.pt` files as a [`Value`], with
+//!   [`load_value_from_bytes`] read the Python objects of `.pt` files as a [`Value`], and
+//!   [`save_value`] and [`save_value_to_bytes`] write them, with
 //!   [`Dict`] and its [`Key`]s, and conversions from and to [`StateDict`](crate::nn::StateDict)
 //!   that keep the module versions;
 //! - lists of tensors without a state dict: [`load_safetensors`],
@@ -39,6 +40,8 @@
 //! | `torch.load(path, mmap=True)` | `unsafe { io::load_mmap(path) }` |
 //! | `torch.load(path, map_location="cpu", weights_only=True)` (a state dict) | `homura::load(path)` |
 //! | `torch.load(path, map_location="cpu", weights_only=True)` (a checkpoint) | `io::load_value(path)` |
+//! | `torch.save(model.state_dict(), "model.pt")` | `homura::save(&model.state_dict(), "model.pt")` |
+//! | `torch.save(checkpoint, path)` | `io::save_value(&checkpoint, path)` |
 //! | loading `pytorch_model.bin.index.json` | `homura::load("pytorch_model.bin.index.json")` |
 
 mod file;
@@ -52,6 +55,7 @@ mod zip;
 
 pub use file::{
     load, load_index, load_index_mmap, load_mmap, load_value, load_value_from_bytes, save,
+    save_value, save_value_to_bytes,
 };
 pub use safetensors::{
     load_safetensors, load_safetensors_from_bytes, safetensors_metadata, save_safetensors,

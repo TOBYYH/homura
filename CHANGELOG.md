@@ -94,7 +94,7 @@ All notable changes to this project are documented in this file. The format is b
   checkpoint's JSON index (`model.safetensors.index.json` or `pytorch_model.bin.index.json`),
   whose shards it reads in `weight_map` order after checking that the index and the shards agree
   and that shard names stay in the index's directory. `save` picks the format by the extension
-  (`.safetensors`; `.pt` files can't be saved yet).
+  (`.safetensors`, or `.pt`, `.pth` and `.bin` for PyTorch's format, see below).
 - The module `homura::io` is public, with `io::save_sharded(&sd, dir, ShardOptions)`, which
   splits a state dict into shards and an index in the Hugging Face layout (or one file if it
   fits) and replaces an earlier checkpoint with the same prefix in that directory: it removes
@@ -145,6 +145,27 @@ All notable changes to this project are documented in this file. The format is b
   `OrderedDict` keeps the module versions of a state dict (PyTorch's `_metadata`), also inside a
   checkpoint: `Value::from(&state_dict)` and `StateDict::try_from(&value)` convert with them,
   and a plain dict gives a state dict without versions.
+- Writing PyTorch's `.pt` format, as `torch.save` does: `homura::save(&sd, "model.pt")` (also
+  `.pth` and `.bin`, such as `pytorch_model.bin`) writes a state dict as an `OrderedDict` with
+  its versions as `_metadata`, and `io::save_value(&value, path)` and
+  `io::save_value_to_bytes(&value)` write any `io::Value`, such as a checkpoint
+  `{"model": .., "optimizer": .., "epoch": 3}`. `torch.load` reads the files with
+  `weights_only=True` and with `mmap=True`, and `homura::load`, `io::load_mmap` and
+  `io::load_value` read them back: the pickle (protocol 2) is the one Python's pickler writes for
+  the same objects, with the same globals, dict and `OrderedDict` types, batches and integer
+  opcodes; tensors keep their dtype, shape, strides, storage offset and `requires_grad`;
+  tensors that share a storage refer to one record holding the whole storage, as in PyTorch, and
+  the same tensor in several places is one object again when loaded. Every record is 64-byte
+  aligned, so loading with `mmap` can avoid copying tensor data. The archive has no data
+  descriptors and uses ZIP64 records only where sizes need them; its
+  `.data/serialization_id` uses homura's content hash, so equal values give equal files.
+  Everything is checked before the file is created: meta tensors, containers nested more than
+  256 levels deep (which `load_value` doesn't read) and strings of 4 GiB or more are errors that
+  say where in the value they are, and leave no file.
+- Building `io::Value`s: `From` for `bool`, `i64`, `i32`, `f64`, `&str`, `String`,
+  `Vec<Value>` (a list), `Dict`, `Tensor` and `&Tensor`, `Value::list(items)` and
+  `Value::tuple(items)` of anything that converts, and `FromIterator` and `Extend` for `Dict`
+  (a plain dict). `Dict::insert` takes any value that converts: `checkpoint.insert("epoch", 3)`.
 - `nn::Identity`, PyTorch's `nn.Identity`: a layer that returns its input, for the places where
   a model has a layer in some configurations and none in others.
 - The new workspace crate `homura-models` (not published yet): models whose module trees, keys

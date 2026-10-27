@@ -16,13 +16,17 @@ use crate::{Error, Result, Tensor};
 /// use homura::io::{Dict, Value};
 /// use homura::nn::StateDict;
 ///
-/// // {"model": state_dict, "epoch": 3}
+/// // {"model": state_dict, "epoch": 3, "losses": [0.5, 0.25]}
 /// let mut state_dict = StateDict::new();
 /// state_dict.insert("weight", homura::zeros([2]));
-/// let mut checkpoint = Dict::new();
-/// checkpoint.insert("model", Value::from(&state_dict));
-/// checkpoint.insert("epoch", Value::Int(3));
-/// let checkpoint = Value::Dict(checkpoint);
+/// let checkpoint: Dict = [
+///     ("model", Value::from(&state_dict)),
+///     ("epoch", Value::from(3)),
+///     ("losses", Value::list([0.5, 0.25])),
+/// ]
+/// .into_iter()
+/// .collect();
+/// let checkpoint = Value::from(checkpoint);
 ///
 /// let Value::Dict(dict) = &checkpoint else { unreachable!() };
 /// let model = StateDict::try_from(dict.get("model").unwrap())?;
@@ -52,6 +56,18 @@ pub enum Value {
 }
 
 impl Value {
+    /// A `list` of the items.
+    #[track_caller]
+    pub fn list<T: Into<Value>>(items: impl IntoIterator<Item = T>) -> Value {
+        Value::List(items.into_iter().map(Into::into).collect())
+    }
+
+    /// A `tuple` of the items.
+    #[track_caller]
+    pub fn tuple<T: Into<Value>>(items: impl IntoIterator<Item = T>) -> Value {
+        Value::Tuple(items.into_iter().map(Into::into).collect())
+    }
+
     /// The Python type's name, for messages.
     pub(super) fn type_name(&self) -> &'static str {
         match self {
@@ -66,6 +82,69 @@ impl Value {
             Value::Dict(_) => "dict",
             Value::Tensor(_) => "Tensor",
         }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        Value::Bool(b)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Value {
+        Value::Int(i)
+    }
+}
+
+/// So that integer literals without a suffix work: `Value::from(3)`.
+impl From<i32> for Value {
+    fn from(i: i32) -> Value {
+        Value::Int(i.into())
+    }
+}
+
+impl From<f64> for Value {
+    fn from(f: f64) -> Value {
+        Value::Float(f)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        Value::Str(s.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Value {
+        Value::Str(s)
+    }
+}
+
+/// A `list`.
+impl From<Vec<Value>> for Value {
+    fn from(items: Vec<Value>) -> Value {
+        Value::List(items)
+    }
+}
+
+impl From<Dict> for Value {
+    fn from(dict: Dict) -> Value {
+        Value::Dict(dict)
+    }
+}
+
+impl From<Tensor> for Value {
+    fn from(t: Tensor) -> Value {
+        Value::Tensor(t)
+    }
+}
+
+/// The same tensor: a new handle, not a copy.
+impl From<&Tensor> for Value {
+    fn from(t: &Tensor) -> Value {
+        Value::Tensor(t.clone())
     }
 }
 
@@ -170,8 +249,8 @@ impl Dict {
     /// Sets the value for `key` and returns the one it had. A new key goes last; an existing
     /// one keeps its position, as in Python.
     #[track_caller]
-    pub fn insert(&mut self, key: impl Into<Key>, value: Value) -> Option<Value> {
-        let key = key.into();
+    pub fn insert(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> Option<Value> {
+        let (key, value) = (key.into(), value.into());
         match self.index.get(&key) {
             Some(&i) => Some(std::mem::replace(&mut self.items[i].1, value)),
             None => {
@@ -180,6 +259,11 @@ impl Dict {
                 None
             }
         }
+    }
+
+    /// The entries, in order.
+    pub(super) fn items(&self) -> &[(Key, Value)] {
+        &self.items
     }
 
     /// The entries, in order.
@@ -208,6 +292,24 @@ impl Dict {
             "only an OrderedDict can have versions; create it with Dict::new_ordered"
         );
         self.versions = versions;
+    }
+}
+
+/// A `dict` of the entries, inserted in order as [`insert`](Dict::insert) does.
+impl<K: Into<Key>, V: Into<Value>> FromIterator<(K, V)> for Dict {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Dict {
+        let mut dict = Dict::new();
+        dict.extend(iter);
+        dict
+    }
+}
+
+/// Inserts each entry as [`insert`](Dict::insert) does.
+impl<K: Into<Key>, V: Into<Value>> Extend<(K, V)> for Dict {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (key, value) in iter {
+            self.insert(key, value);
+        }
     }
 }
 

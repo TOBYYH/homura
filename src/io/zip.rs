@@ -1,14 +1,17 @@
-//! Reading zip archives whose entries are stored, not compressed: PyTorch's `.pt` format.
-//! Compressed entries can be listed (TorchScript archives have some) but not read.
+//! Reading and writing zip archives whose entries are stored, not compressed: PyTorch's `.pt`
+//! format. Compressed entries can be listed (TorchScript archives have some) but not read.
 //!
 //! The central directory is the authority on each entry's name, size and CRC. Every local file
 //! header must agree with it, and so must the data descriptor that follows the data of entries
 //! with general purpose bit 3 set (PyTorch sets it on every entry and leaves the CRC and sizes in
 //! the local header zero). ZIP64 is supported. Entries can't overlap each other or the central
 //! directory, and each one has a byte range in the file, so callers can read or map the data.
+//!
+//! [`ZipWriter`] writes archives as PyTorch reads them best: each entry's data 64-byte aligned,
+//! so that it can be mapped, and the CRC and sizes in the local header, without data descriptors.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::{Error, Result};
 
@@ -601,6 +604,202 @@ pub(super) fn crc32(data: &[u8]) -> u32 {
     })
 }
 
+/// The extra field that pads local headers so that the data after them is aligned, with the id
+/// PyTorch uses (`"FB"`).
+const PADDING_EXTRA: u16 = 0x4246;
+/// Where [`ZipWriter`] aligns the data of each entry, as PyTorch does.
+pub(super) const ALIGNMENT: u64 = 64;
+/// The largest value of a 32-bit field; it is also the placeholder for a ZIP64 value.
+const MAX32: u64 = 0xffff_ffff;
+/// The version needed to extract: 2.0 for stored entries, 4.5 for ZIP64 ones.
+const VERSION: u16 = 20;
+const VERSION_ZIP64: u16 = 45;
+/// Bit 11: names are UTF-8.
+const UTF8: u16 = 0x0800;
+/// 1980-01-01 00:00, the earliest DOS date, so that equal input gives equal bytes.
+const DOS_DATE: u16 = (1 << 5) | 1;
+
+/// An entry that [`ZipWriter`] wrote, for the central directory.
+struct Written {
+    name: String,
+    crc: u32,
+    size: u64,
+    offset: u64,
+}
+
+/// Writes a zip archive of stored entries to `w`, one entry at a time.
+///
+/// ZIP64 fields are written where a size, an offset or the number of entries doesn't fit the
+/// 32-bit (or 16-bit) fields, or everywhere if `force_zip64` is set, which tests use to read
+/// archives larger than they can write.
+pub(super) struct ZipWriter<W> {
+    w: W,
+    /// How many bytes have been written.
+    pos: u64,
+    entries: Vec<Written>,
+    force_zip64: bool,
+}
+
+fn put16(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+fn put32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+fn put64(v: &mut Vec<u8>, x: u64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+/// `value` as a 32-bit field: the value, or the placeholder if it goes into a ZIP64 field.
+fn field32(value: u64, zip64: bool) -> u32 {
+    if zip64 { MAX32 as u32 } else { value as u32 }
+}
+
+impl<W: Write> ZipWriter<W> {
+    pub(super) fn new(w: W, force_zip64: bool) -> ZipWriter<W> {
+        ZipWriter {
+            w,
+            pos: 0,
+            entries: vec![],
+            force_zip64,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.w.write_all(bytes)?;
+        self.pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Adds a stored entry whose data starts [`ALIGNMENT`]-aligned and returns its CRC.
+    pub(super) fn add(&mut self, name: &str, data: &[u8]) -> Result<u32> {
+        let crc = crc32(data);
+        let size = data.len() as u64;
+        let zip64 = self.force_zip64 || size >= MAX32;
+        let name_len = u16::try_from(name.len()).expect("entry names are short");
+        let mut header = Vec::with_capacity(30 + name.len() + 20 + 4 + ALIGNMENT as usize);
+        put32(&mut header, LOCAL_SIG);
+        put16(&mut header, if zip64 { VERSION_ZIP64 } else { VERSION });
+        put16(&mut header, UTF8);
+        put16(&mut header, 0);
+        put16(&mut header, 0);
+        put16(&mut header, DOS_DATE);
+        put32(&mut header, crc);
+        put32(&mut header, field32(size, zip64));
+        put32(&mut header, field32(size, zip64));
+        put16(&mut header, name_len);
+        let extra_len_at = header.len();
+        put16(&mut header, 0);
+        header.extend_from_slice(name.as_bytes());
+        if zip64 {
+            // A local header's ZIP64 field has both sizes.
+            put16(&mut header, ZIP64_EXTRA);
+            put16(&mut header, 16);
+            put64(&mut header, size);
+            put64(&mut header, size);
+        }
+        // The padding field's own 4 bytes come first, then zeros up to the alignment.
+        let unpadded = self.pos + header.len() as u64 + 4;
+        let padding = (ALIGNMENT - unpadded % ALIGNMENT) % ALIGNMENT;
+        put16(&mut header, PADDING_EXTRA);
+        put16(&mut header, padding as u16);
+        header.resize(header.len() + padding as usize, 0);
+        let extra_len = (header.len() - 30 - name.len()) as u16;
+        header[extra_len_at..extra_len_at + 2].copy_from_slice(&extra_len.to_le_bytes());
+        let offset = self.pos;
+        self.write(&header)?;
+        debug_assert!(self.pos.is_multiple_of(ALIGNMENT));
+        self.write(data)?;
+        self.entries.push(Written {
+            name: name.to_string(),
+            crc,
+            size,
+            offset,
+        });
+        Ok(crc)
+    }
+
+    /// Writes the central directory and the end records, and returns the writer.
+    pub(super) fn finish(mut self) -> Result<W> {
+        let force = self.force_zip64;
+        let mut central = vec![];
+        for e in &self.entries {
+            let zip64_size = force || e.size >= MAX32;
+            let zip64_offset = force || e.offset >= MAX32;
+            let zip64 = zip64_size || zip64_offset;
+            let version = if zip64 { VERSION_ZIP64 } else { VERSION };
+            put32(&mut central, CENTRAL_SIG);
+            put16(&mut central, version);
+            put16(&mut central, version);
+            put16(&mut central, UTF8);
+            put16(&mut central, 0);
+            put16(&mut central, 0);
+            put16(&mut central, DOS_DATE);
+            put32(&mut central, e.crc);
+            put32(&mut central, field32(e.size, zip64_size));
+            put32(&mut central, field32(e.size, zip64_size));
+            put16(&mut central, e.name.len() as u16);
+            // The ZIP64 field has the values whose 32-bit fields hold placeholders, in order.
+            let extra_len = 16 * zip64_size as u16 + 8 * zip64_offset as u16;
+            put16(&mut central, if zip64 { 4 + extra_len } else { 0 });
+            put16(&mut central, 0);
+            put16(&mut central, 0);
+            put16(&mut central, 0);
+            put32(&mut central, 0);
+            put32(&mut central, field32(e.offset, zip64_offset));
+            central.extend_from_slice(e.name.as_bytes());
+            if zip64 {
+                put16(&mut central, ZIP64_EXTRA);
+                put16(&mut central, extra_len);
+                if zip64_size {
+                    put64(&mut central, e.size);
+                    put64(&mut central, e.size);
+                }
+                if zip64_offset {
+                    put64(&mut central, e.offset);
+                }
+            }
+        }
+        let cd_offset = self.pos;
+        let cd_size = central.len() as u64;
+        let count = self.entries.len() as u64;
+        let zip64_count = force || count >= 0xffff;
+        let zip64_cd_size = force || cd_size >= MAX32;
+        let zip64_cd_offset = force || cd_offset >= MAX32;
+        let mut end = central;
+        if zip64_count || zip64_cd_size || zip64_cd_offset {
+            let eocd64 = cd_offset + cd_size;
+            put32(&mut end, EOCD64_SIG);
+            put64(&mut end, EOCD64_LEN - 12);
+            put16(&mut end, VERSION_ZIP64);
+            put16(&mut end, VERSION_ZIP64);
+            put32(&mut end, 0);
+            put32(&mut end, 0);
+            put64(&mut end, count);
+            put64(&mut end, count);
+            put64(&mut end, cd_size);
+            put64(&mut end, cd_offset);
+            put32(&mut end, LOCATOR_SIG);
+            put32(&mut end, 0);
+            put64(&mut end, eocd64);
+            put32(&mut end, 1);
+        }
+        let count16 = if zip64_count { 0xffff } else { count as u16 };
+        put32(&mut end, EOCD_SIG);
+        put16(&mut end, 0);
+        put16(&mut end, 0);
+        put16(&mut end, count16);
+        put16(&mut end, count16);
+        put32(&mut end, field32(cd_size, zip64_cd_size));
+        put32(&mut end, field32(cd_offset, zip64_cd_offset));
+        put16(&mut end, 0);
+        self.write(&end)?;
+        Ok(self.w)
+    }
+}
+
 /// Writes zip archives with the layouts that the readers must handle, for tests.
 #[cfg(test)]
 pub(super) mod testing {
@@ -1161,6 +1360,79 @@ mod tests {
             for len in (0..good.len()).step_by(7) {
                 assert!(read(&good[..len]).is_err(), "{len}");
             }
+        }
+    }
+
+    /// Entries of sizes around the alignment, with names of different lengths.
+    fn written(force_zip64: bool) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let entries: Vec<(String, Vec<u8>)> = [0usize, 1, 63, 64, 65, 200]
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| ("x".repeat(i * 7 + 1), (0..n).map(|b| b as u8).collect()))
+            .collect();
+        let mut w = ZipWriter::new(vec![], force_zip64);
+        for (name, data) in &entries {
+            assert_eq!(w.add(name, data).unwrap(), crc32(data));
+        }
+        (w.finish().unwrap(), entries)
+    }
+
+    #[test]
+    fn written_archives_are_read_back() {
+        for force_zip64 in [false, true] {
+            let (bytes, entries) = written(force_zip64);
+            let archive = read(&bytes).unwrap();
+            assert_eq!(archive.entries().len(), entries.len());
+            // The local headers follow each other, each just before its data.
+            let mut pos = 0;
+            let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            for (e, (name, expected)) in archive.entries().iter().zip(&entries) {
+                assert_eq!(&e.name, name);
+                assert!(e.start.is_multiple_of(ALIGNMENT), "{name}");
+                assert_eq!(e.crc, crc32(expected));
+                assert_eq!(data(&bytes, &archive, name).unwrap(), *expected);
+                assert_eq!(u32_at(pos), LOCAL_SIG);
+                // No data descriptor: bit 3 is clear and the local header has the CRC and sizes.
+                assert_eq!(u16_at(pos + 6), UTF8);
+                assert_eq!(u32_at(pos + 14), e.crc);
+                let size = if force_zip64 {
+                    0xffff_ffff
+                } else {
+                    expected.len() as u32
+                };
+                assert_eq!((u32_at(pos + 18), u32_at(pos + 22)), (size, size));
+                let (name_len, extra_len) = (u16_at(pos + 26) as usize, u16_at(pos + 28) as usize);
+                assert_eq!(pos + 30 + name_len + extra_len, e.start as usize);
+                pos = e.start as usize + expected.len();
+            }
+            let has = |sig: u32| bytes.windows(4).any(|w| w == sig.to_le_bytes());
+            assert_eq!(has(EOCD64_SIG), force_zip64);
+            assert_eq!(has(LOCATOR_SIG), force_zip64);
+            assert!(!has(DESCRIPTOR_SIG));
+        }
+        // Equal input gives equal bytes.
+        assert_eq!(written(false).0, written(false).0);
+    }
+
+    #[test]
+    fn written_archives_switch_to_zip64_for_many_entries() {
+        for (count, zip64) in [(0xfffe, false), (0xffff, true)] {
+            let mut w = ZipWriter::new(vec![], false);
+            for i in 0..count {
+                w.add(&i.to_string(), b"").unwrap();
+            }
+            let bytes = w.finish().unwrap();
+            let archive = read(&bytes).unwrap();
+            assert_eq!(archive.entries().len(), count);
+            assert_eq!(archive.entries()[count - 1].name, (count - 1).to_string());
+            // The 32-bit end record holds the count or, if it doesn't fit, the placeholder.
+            let eocd = &bytes[bytes.len() - EOCD_LEN..];
+            let entries = u16::from_le_bytes(eocd[10..12].try_into().unwrap());
+            assert_eq!(entries, if zip64 { 0xffff } else { count as u16 });
+            let locator = bytes.len() - EOCD_LEN - LOCATOR_LEN;
+            let sig = u32::from_le_bytes(bytes[locator..locator + 4].try_into().unwrap());
+            assert_eq!(sig == LOCATOR_SIG, zip64);
         }
     }
 }

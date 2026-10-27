@@ -3,12 +3,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use super::pickle::{Global, Id, Node, Pickle, Tensors, over_budget};
+use super::pickle::{self, Global, Id, Node, Pickle, TensorRef, Tensors, over_budget};
 use super::value::Value;
-use super::zip::{self, Archive, Entry};
+use super::zip::{self, Archive, Entry, ZipWriter};
+use crate::backend::cpu;
 use crate::nn::StateDict;
 use crate::shape::checked_num_elements;
 use crate::storage::{FileMap, Storage};
@@ -538,6 +539,113 @@ pub(super) fn to_state_dict(value: &Value) -> Result<StateDict> {
     })
 }
 
+/// A value ready to be written: its pickle and the storages it refers to, by key.
+pub(super) struct Prepared {
+    pickle: Vec<u8>,
+    storages: Vec<(Arc<Storage>, DType)>,
+}
+
+/// Pickles `value` and collects the storages of its tensors, checking everything that can make
+/// writing fail other than IO, so that nothing needs to be written when it does.
+///
+/// Tensors that share a storage refer to one record, which holds the whole storage, with their
+/// own offsets and strides, as `torch.save` writes them. Keys are numbered in the order the
+/// storages first appear.
+pub(super) fn prepare(value: &Value) -> Result<Prepared> {
+    let mut keys: HashMap<*const Storage, usize> = HashMap::new();
+    let mut storages: Vec<(Arc<Storage>, DType)> = vec![];
+    let pickle = pickle::dump(value, &mut |t| {
+        let data = t.data();
+        match data.storage.device() {
+            Device::Cpu => {}
+            Device::Meta => {
+                return Err(Error::Format(
+                    "can't save a meta tensor: it has no data".into(),
+                ));
+            }
+            Device::Rocm(_) => {
+                return Err(Error::Format(
+                    "can't save a ROCm tensor yet: move it to the CPU first".into(),
+                ));
+            }
+        }
+        let key = *keys.entry(Arc::as_ptr(&data.storage)).or_insert_with(|| {
+            storages.push((data.storage.clone(), data.dtype));
+            storages.len() - 1
+        });
+        // A storage has the dtype of its tensors: no operation views data as another dtype.
+        debug_assert_eq!(storages[key].1, data.dtype, "a storage with two dtypes");
+        Ok(TensorRef {
+            dtype: data.dtype,
+            key,
+            numel: data.storage.nbytes() / data.dtype.size_in_bytes(),
+            layout: data.layout,
+            requires_grad: t.requires_grad(),
+        })
+    })?;
+    Ok(Prepared { pickle, storages })
+}
+
+/// The bytes of a whole storage, little-endian.
+fn storage_bytes(storage: &Arc<Storage>, dtype: DType) -> Vec<u8> {
+    let size = dtype.size_in_bytes();
+    let whole = TensorData {
+        storage: storage.clone(),
+        layout: Layout::contiguous(Shape::new(&[storage.nbytes() / size])),
+        dtype,
+    };
+    let mut bytes = cpu::read_bytes(&whole);
+    if cfg!(target_endian = "big") && size > 1 {
+        for element in bytes.chunks_mut(size) {
+            element.reverse();
+        }
+    }
+    bytes
+}
+
+/// The 128-bit FNV-1a hash, for the serialization id.
+struct Fnv(u128);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0x6c62_272e_07bb_0142_62b8_2175_6295_c58d)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 =
+                (self.0 ^ u128::from(b)).wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+        }
+    }
+}
+
+/// Writes `prepared` as a `.pt` archive to `w`, one record at a time, with the records of
+/// `torch.save` in its order and every record's data 64-byte aligned.
+///
+/// `.data/serialization_id` holds 40 decimal digits of homura's hash of the pickle and of the
+/// size and CRC of each storage record, so that equal values give equal files.
+pub(super) fn write<W: Write>(prepared: &Prepared, w: W, force_zip64: bool) -> Result<W> {
+    const DIR: &str = "archive";
+    let mut zip = ZipWriter::new(w, force_zip64);
+    let mut id = Fnv::new();
+    zip.add(&format!("{DIR}/data.pkl"), &prepared.pickle)?;
+    id.update(&prepared.pickle);
+    zip.add(&format!("{DIR}/.format_version"), b"1")?;
+    let alignment = zip::ALIGNMENT.to_string();
+    zip.add(&format!("{DIR}/.storage_alignment"), alignment.as_bytes())?;
+    zip.add(&format!("{DIR}/byteorder"), b"little")?;
+    for (key, (storage, dtype)) in prepared.storages.iter().enumerate() {
+        let bytes = storage_bytes(storage, *dtype);
+        let crc = zip.add(&format!("{DIR}/data/{key}"), &bytes)?;
+        id.update(&(bytes.len() as u64).to_le_bytes());
+        id.update(&crc.to_le_bytes());
+    }
+    zip.add(&format!("{DIR}/version"), b"3\n")?;
+    let id = format!("{:040}", id.0);
+    zip.add(&format!("{DIR}/.data/serialization_id"), id.as_bytes())?;
+    zip.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::fixtures::{self, pt};
@@ -546,7 +654,7 @@ mod tests {
     use super::super::zip::testing::{Options, Writer};
     use super::*;
     use std::io::Cursor;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn value(bytes: &[u8]) -> Result<Value> {
         read_value(&mut Cursor::new(bytes))
@@ -1485,6 +1593,162 @@ mod tests {
                 };
                 let _ = pickle.to_value(&mut storages);
             }
+        }
+    }
+
+    fn written(v: &Value, force_zip64: bool) -> Vec<u8> {
+        write(&prepare(v).unwrap(), vec![], force_zip64).unwrap()
+    }
+
+    /// Every reference file that `homura` reads, written again, reads back with the reference's
+    /// values, layouts, identities and storage sharing: from bytes, mapped and with ZIP64.
+    #[test]
+    fn written_files_match_the_reference() {
+        if !fixtures::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("homura-pt-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in TENSOR_FILES {
+            let v = value(&pt(&format!("{name}.pt"))).unwrap();
+            let bytes = written(&v, false);
+            check(name, &value(&bytes).unwrap());
+            check(name, &value(&written(&v, true)).unwrap());
+            let file = dir.join(format!("{name}.pt"));
+            std::fs::write(&file, &bytes).unwrap();
+            // SAFETY: only this test uses the file, and it is removed after the tensors drop.
+            let back = unsafe { read_value_mmap(&mut File::open(&file).unwrap()) }.unwrap();
+            check(name, &back);
+            // Every storage that needs no change is mapped: the records are aligned.
+            let mut found = vec![];
+            tensors(&back, &mut found);
+            for t in &found {
+                let data = t.data();
+                let mapped = data.dtype != DType::Bool && data.storage.nbytes() > 0;
+                assert_eq!(data.storage.is_mapped(), mapped, "{name}");
+            }
+        }
+        for name in [
+            "values_p2",
+            "empty_state_dict",
+            "build_once",
+            "build_replaced",
+        ] {
+            let expected = String::from_utf8(pt(&format!("{name}.expected"))).unwrap();
+            let v = value(&pt(&format!("{name}.pt"))).unwrap();
+            let back = value(&written(&v, false)).unwrap();
+            assert_eq!(canonical(&back), expected.trim_end(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The records of `torch.save` in its order, with whole storages, and an id from the content.
+    #[test]
+    fn written_files_have_the_records_of_torch_save() {
+        let base = crate::arange(12).to(DType::F32);
+        let mut sd = crate::nn::StateDict::new();
+        sd.insert("view", base.index(3..5));
+        sd.insert("flag", crate::tensor([true, false]));
+        sd.insert("base", base.clone());
+        let bytes = written(&Value::from(&sd), false);
+        let archive = Archive::read(&mut Cursor::new(&bytes)).unwrap();
+        let names: Vec<&str> = archive.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "archive/data.pkl",
+                "archive/.format_version",
+                "archive/.storage_alignment",
+                "archive/byteorder",
+                "archive/data/0",
+                "archive/data/1",
+                "archive/version",
+                "archive/.data/serialization_id",
+            ]
+        );
+        let record = |name: &str| {
+            let entry = archive.get(&format!("archive/{name}")).unwrap();
+            zip::read_entry(&mut Cursor::new(&bytes), entry).unwrap()
+        };
+        assert_eq!(record(".format_version"), b"1");
+        assert_eq!(record(".storage_alignment"), b"64");
+        assert_eq!(record("byteorder"), b"little");
+        assert_eq!(record("version"), b"3\n");
+        // The view's record is its whole storage, shared with "base".
+        let floats: Vec<u8> = (0..12).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        assert_eq!(record("data/0"), floats);
+        assert_eq!(record("data/1"), [1, 0]);
+        let id = record(".data/serialization_id");
+        assert_eq!(id.len(), 40);
+        assert!(id.iter().all(u8::is_ascii_digit));
+        // Equal values give equal bytes; other data gives another id.
+        assert_eq!(written(&Value::from(&sd), false), bytes);
+        sd.insert("flag", crate::tensor([true, true]));
+        let other = written(&Value::from(&sd), false);
+        let other_archive = Archive::read(&mut Cursor::new(&other)).unwrap();
+        let other_id = zip::read_entry(
+            &mut Cursor::new(&other),
+            other_archive.get("archive/.data/serialization_id").unwrap(),
+        )
+        .unwrap();
+        assert_ne!(other_id, id);
+        // Only the globals that the unpickler accepts are referenced; it parses the pickle.
+        let pickle = Pickle::parse(&record("data.pkl")).unwrap();
+        let back = pickle.to_value(&mut Placeholders::default()).unwrap();
+        assert_eq!(canonical(&back), "O{s76696577:t,s666c6167:t,s62617365:t}");
+    }
+
+    /// A tensor in several places is one object when read back, also past the 256 memo entries
+    /// of `BINPUT` / `BINGET`.
+    #[test]
+    fn same_tensors_stay_one_object() {
+        let ts: Vec<Tensor> = (0..300).map(|i| crate::full([1], i)).collect();
+        let v = Value::list(ts.iter().chain(&ts));
+        let bytes = written(&v, false);
+        let Value::List(back) = value(&bytes).unwrap() else {
+            unreachable!()
+        };
+        let back: Vec<Tensor> = back
+            .into_iter()
+            .map(|v| match v {
+                Value::Tensor(t) => t,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        for i in 0..300 {
+            assert!(back[i].is_same(&back[i + 300]), "{i}");
+            assert!(!back[i].is_same(&back[(i + 1) % 300]), "{i}");
+            assert_eq!(back[i].to_vec::<i64>(), [i as i64]);
+        }
+    }
+
+    #[test]
+    fn only_cpu_tensors_are_written() {
+        let meta = crate::zeros_with([2], Device::Meta);
+        let mut d = super::super::Dict::new();
+        d.insert("ok", crate::zeros([1]));
+        d.insert("m", Value::list([meta]));
+        err(
+            prepare(&Value::from(d)).map(|_| ()),
+            r#"can't save a meta tensor: it has no data (at ["m"][0])"#,
+        );
+    }
+
+    /// The reference files that [`written_files_match_the_reference`] writes back, saved to
+    /// `target/tmp/m3_pt_written_fixtures/` for `tools/golden/check_m3_pt_written.py`: `<name>.pt`
+    /// and, with ZIP64 records everywhere, `<name>_zip64.pt`.
+    #[test]
+    fn fixture_files_for_python() {
+        if !fixtures::available() {
+            return;
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/m3_pt_written_fixtures");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in TENSOR_FILES.iter().chain(&["values_p2", "build_once"]) {
+            let v = value(&pt(&format!("{name}.pt"))).unwrap();
+            std::fs::write(dir.join(format!("{name}.pt")), written(&v, false)).unwrap();
+            std::fs::write(dir.join(format!("{name}_zip64.pt")), written(&v, true)).unwrap();
         }
     }
 }

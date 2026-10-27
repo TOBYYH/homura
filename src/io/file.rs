@@ -1,5 +1,5 @@
 //! [`load`], [`load_mmap`] and [`save`]: state dicts in files whose format is told from their
-//! content or name.
+//! content or name; [`load_value`] and [`save_value`]: other objects in `.pt` files.
 
 use std::fs::File;
 use std::io::{Cursor, Read};
@@ -356,21 +356,27 @@ fn not_pt(what: &str) -> Error {
 ///   [`save_safetensors_with_metadata`](crate::io::save_safetensors_with_metadata)). The format
 ///   has no place for the state dict's [versions](StateDict::versions), and each key gets its own
 ///   copy of the data, even for tensors that share storage;
-/// - `.pt`, `.pth` and `.bin` (PyTorch's format) can't be saved yet.
+/// - `.pt`, `.pth` and `.bin`: PyTorch's format, as `torch.save(state_dict, path)` writes it, an
+///   `OrderedDict` of the tensors with the state dict's versions as its `_metadata` (see
+///   [`save_value`]). Tensors that share storage share it in the file too.
 ///
 /// Extensions are compared ignoring ASCII case. For sharded checkpoints, see
 /// [`save_sharded`](crate::io::save_sharded).
 ///
+/// Everything is checked before the file is created, so a failed check leaves no file; an IO
+/// error can leave a partial one.
+///
 /// # Errors
 ///
 /// Returns an error for other extensions, meta tensors (they have no data), the key
-/// `__metadata__`, which safetensors reserves, and IO errors.
+/// `__metadata__` in safetensors files, which the format reserves, and IO errors.
 ///
 /// ```no_run
 /// use homura::nn::Module;
 ///
 /// let model = homura::nn::Linear::new(4, 2);
 /// homura::save(&model.state_dict(), "model.safetensors")?;
+/// homura::save(&model.state_dict(), "model.pt")?;
 /// # Ok::<(), homura::Error>(())
 /// ```
 #[track_caller]
@@ -386,15 +392,78 @@ pub fn save(state_dict: &StateDict, path: impl AsRef<Path>) -> Result<()> {
             let tensors = safetensors::snapshot(state_dict)?;
             safetensors::write(&mut File::create(path)?, &tensors, None)
         }
-        "pt" | "pth" | "bin" => Err(Error::Format(format!(
-            "can't save {}: PyTorch .pt files can't be saved yet",
-            path.display()
-        ))),
+        "pt" | "pth" | "bin" => save_value(&Value::from(state_dict), path),
         _ => Err(Error::Format(format!(
-            "can't tell the format to save {} in from its extension: use .safetensors",
+            "can't tell the format to save {} in from its extension: use .safetensors, .pt, \
+             .pth or .bin",
             path.display()
         ))),
     }
+}
+
+/// Saves an object in PyTorch's `.pt` format, as `torch.save(obj, path)` does: a state dict or
+/// a checkpoint of other values, such as `{"model": .., "optimizer": .., "epoch": 3}`, which
+/// [`load_value`] and `torch.load(path, weights_only=True)` read back.
+///
+/// The file is what `torch.save` writes for the same objects, with pickle protocol 2 and every
+/// record 64-byte aligned, so it can be mapped with [`load_mmap`] or `torch.load(path,
+/// mmap=True)`. There are no data descriptors, ZIP64 records are used only where sizes need
+/// them, and the pickle memo holds only tensors (the other objects of a [`Value`] are never
+/// shared). The `.data/serialization_id` record uses homura's content hash; equal values give
+/// equal files.
+///
+/// A [`Dict`](super::Dict) is saved as a `dict` or an `OrderedDict`, as it says, with its
+/// versions as `_metadata`. A tensor is saved with its dtype, shape, strides, storage offset and
+/// `requires_grad`, never as a `Parameter`. Tensors that share storage (views, tied
+/// parameters) refer to one record, which holds the whole storage, even where they use only part
+/// of it; they share storage again when loaded. The same tensor in several places is one tensor
+/// again when loaded, as one object is in Python.
+///
+/// The pickle is built and checked before the file is created, so a failed check leaves no file;
+/// then the storages are written one at a time. An IO error can leave a partial file.
+///
+/// # Errors
+///
+/// Returns an error for meta tensors (they have no data), containers nested more than 256 levels
+/// deep (which [`load_value`] doesn't read), strings of 4 GiB or more, and IO errors. The message
+/// says where in `value` a check failed.
+///
+/// ```no_run
+/// use homura::io::{Dict, Value, save_value};
+/// use homura::nn::Module;
+///
+/// let model = homura::nn::Linear::new(4, 2);
+/// let mut checkpoint = Dict::new();
+/// checkpoint.insert("model", &model.state_dict());
+/// checkpoint.insert("epoch", 3);
+/// save_value(&Value::from(checkpoint), "checkpoint.pt")?;
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn save_value(value: &Value, path: impl AsRef<Path>) -> Result<()> {
+    let prepared = pt::prepare(value)?;
+    pt::write(&prepared, File::create(path)?, false)?;
+    Ok(())
+}
+
+/// Like [`save_value`], into memory: the bytes of the `.pt` file.
+///
+/// # Errors
+///
+/// As for [`save_value`], without IO errors.
+///
+/// ```
+/// use homura::io::{Value, load_value_from_bytes, save_value_to_bytes};
+///
+/// let bytes = save_value_to_bytes(&Value::list([1, 2, 3]))?;
+/// let Value::List(items) = load_value_from_bytes(&bytes)? else { unreachable!() };
+/// assert_eq!(items.len(), 3);
+/// # Ok::<(), homura::Error>(())
+/// ```
+#[track_caller]
+pub fn save_value_to_bytes(value: &Value) -> Result<Vec<u8>> {
+    let prepared = pt::prepare(value)?;
+    pt::write(&prepared, vec![], false)
 }
 
 #[cfg(test)]

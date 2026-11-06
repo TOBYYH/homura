@@ -4,7 +4,7 @@
 //! runs a kernel. On the meta device only the first step runs, so meta tensors get correct shapes
 //! and dtypes without any data.
 
-use crate::backend::cpu;
+use crate::backend;
 use crate::dtype::Kind;
 use crate::shape::compute_view_strides;
 use crate::tensor::{Layout, TensorData};
@@ -177,8 +177,8 @@ pub(crate) fn cast_data(data: &TensorData, dtype: DType) -> TensorData {
         return data.clone();
     }
     let out = Tensor::empty_on(data.layout.shape.clone(), dtype, data.device()).data();
-    if data.device() == Device::Cpu {
-        cpu::copy(&out, data);
+    if data.device() != Device::Meta {
+        backend::copy(&out, data);
     }
     out
 }
@@ -187,8 +187,8 @@ pub(crate) fn cast_data(data: &TensorData, dtype: DType) -> TensorData {
 /// to use internally: it is never recorded for autograd.
 pub(crate) fn clone_data(data: &TensorData) -> TensorData {
     let out = Tensor::empty_on(data.layout.shape.clone(), data.dtype, data.device()).data();
-    if data.device() == Device::Cpu {
-        cpu::copy(&out, data);
+    if data.device() != Device::Meta {
+        backend::copy(&out, data);
     }
     out
 }
@@ -248,8 +248,8 @@ pub(crate) fn scalar_value(t: &Tensor) -> Scalar {
 /// A zero-dimensional tensor holding `value`.
 pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> TensorData {
     let out = Tensor::empty_on(Shape::scalar(), dtype, device).data();
-    if device == Device::Cpu {
-        cpu::fill(&out, value);
+    if device != Device::Meta {
+        backend::fill(&out, value);
     }
     out
 }

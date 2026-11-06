@@ -3,7 +3,7 @@
 use super::{
     BinaryOp, Operand, cast_data, clone_data, common_device, fill_value, scalar_data, scalar_value,
 };
-use crate::backend::cpu;
+use crate::backend;
 use crate::dtype::ResultType;
 use crate::shape::broadcast_shapes;
 use crate::tensor::TensorData;
@@ -114,7 +114,7 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
     };
     let shape = broadcast_shapes(&a.shape(), &b.shape());
     let out = Tensor::empty_on(shape.clone(), out_dtype, device);
-    if device == Device::Cpu {
+    if device != Device::Meta {
         // As in PyTorch, `f16` and `bf16` products and quotients keep a scalar operand in their
         // `f32` computation type, while the other operations round it to the dtype first.
         let keeps_scalar = matches!(op, Mul | Div) && matches!(compute, DType::F16 | DType::BF16);
@@ -126,12 +126,12 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
                 let scalar_first = matches!(a, Resolved::Scalar(_));
                 let t = if scalar_first { &b } else { &a };
                 let td = t.materialize(compute, device, &shape);
-                cpu::binary_scalar(op, &out.data(), &td, s.to_f64(), scalar_first);
+                backend::binary_scalar(op, &out.data(), &td, s.to_f64(), scalar_first);
             }
             _ => {
                 let ad = a.materialize(compute, device, &shape);
                 let bd = b.materialize(compute, device, &shape);
-                cpu::binary(op, &out.data(), &ad, &bd);
+                backend::binary(op, &out.data(), &ad, &bd);
             }
         }
     }
@@ -177,8 +177,8 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
         &y.shape(),
     );
     let out = Tensor::empty_on(shape.clone(), dtype, device);
-    if device == Device::Cpu {
-        cpu::where_(
+    if device != Device::Meta {
+        backend::where_(
             &out.data(),
             &cond.expand_to(&shape),
             &x.materialize(dtype, device, &shape),
@@ -440,7 +440,7 @@ impl Tensor {
                 }
                 // The value must fit the dtype like a scalar value (PyTorch reads it as one); it
                 // is still converted with a recorded `to`, so that it gets its gradient.
-                if t.device() == Device::Cpu {
+                if t.device() != Device::Meta {
                     fill_value(scalar_value(&t), self.dtype(), self.device());
                 }
                 t.to(self.dtype())
@@ -544,8 +544,8 @@ impl Tensor {
             s = clone_data(&s);
         }
         // The version changes in the same critical section as the data.
-        cpu::exec(|| {
-            cpu::copy(&dst, &s);
+        backend::exec(dst.device(), || {
+            backend::copy(&dst, &s);
             dst.storage.bump_version();
         });
     }
@@ -572,9 +572,9 @@ impl Tensor {
     pub(crate) fn write_fill(&self, value: Scalar) {
         let dst = self.data();
         check_writable(&dst);
-        if dst.device() == Device::Cpu {
-            cpu::exec(|| {
-                cpu::fill(&dst, value);
+        if dst.device() != Device::Meta {
+            backend::exec(dst.device(), || {
+                backend::fill(&dst, value);
                 dst.storage.bump_version();
             });
         } else {

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::json::{self, Json};
-use crate::backend::cpu;
+use crate::backend;
 use crate::nn::StateDict;
 use crate::storage::{FileMap, Storage};
 use crate::tensor::{Layout, TensorData};
@@ -337,6 +337,11 @@ pub(super) fn snapshot<'a, K: AsRef<str>>(
                 "can't save meta tensor {name:?}: it has no data"
             )));
         }
+        if let Device::Rocm(_) = t.device() {
+            return Err(Error::Format(format!(
+                "can't save ROCm tensor {name:?} yet: move it to the CPU first"
+            )));
+        }
         out.push((name.to_string(), t.data()));
     }
     Ok(out)
@@ -396,7 +401,7 @@ pub(super) fn write<W: Write>(
         } else {
             crate::ops::clone_data(data)
         };
-        let mut raw = cpu::read_bytes(&c);
+        let mut raw = backend::read_bytes(&c);
         to_from_le(&mut raw, c.dtype.size_in_bytes());
         w.write_all(&raw)?;
     }

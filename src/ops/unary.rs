@@ -1,7 +1,7 @@
 //! Elementwise unary operations.
 
 use super::{UnaryOp, cast_data};
-use crate::backend::cpu;
+use crate::backend;
 use crate::{DType, Device, Tensor};
 
 /// Which formula [`Tensor::gelu`] uses (PyTorch's `approximate` argument).
@@ -49,8 +49,8 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
         compute
     };
     let out = Tensor::empty_on(src.layout.shape.clone(), out_dtype, src.device());
-    if src.device() == Device::Cpu {
-        cpu::unary(op, &out.data(), &cast_data(&src, compute));
+    if src.device() != Device::Meta {
+        backend::unary(op, &out.data(), &cast_data(&src, compute));
     }
     crate::autograd::formulas::unary(op, x, &out);
     out

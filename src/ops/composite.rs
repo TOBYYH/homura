@@ -2,7 +2,7 @@
 
 use super::{Operand, common_device, scalar_data};
 use crate::autograd::formulas::ScaledProduct;
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::normalize_dim;
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
@@ -18,8 +18,8 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
     }
     let dim = normalize_dim(dim, src.layout.shape.len());
     let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
-    if src.device() == Device::Cpu {
-        cpu::softmax(&out.data(), &src, dim, log);
+    if src.device() != Device::Meta {
+        backend::softmax(&out.data(), &src, dim, log);
     }
     crate::autograd::formulas::softmax(x, dim, log, &out);
     out

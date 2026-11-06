@@ -46,7 +46,7 @@ pub fn embedding(input: &Tensor, weight: &Tensor, padding_idx: Option<i64>) -> T
              i64, i32; but got {dtype} instead (while checking arguments for embedding)"
         );
     }
-    if input.device() == Device::Cpu
+    if input.device() != Device::Meta
         && input
             .to(DType::I64)
             .to_vec::<i64>()

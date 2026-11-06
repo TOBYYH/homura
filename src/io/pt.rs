@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::pickle::{self, Global, Id, Node, Pickle, TensorRef, Tensors, over_budget};
 use super::value::Value;
 use super::zip::{self, Archive, Entry, ZipWriter};
-use crate::backend::cpu;
+use crate::backend;
 use crate::nn::StateDict;
 use crate::shape::checked_num_elements;
 use crate::storage::{FileMap, Storage};
@@ -594,7 +594,7 @@ fn storage_bytes(storage: &Arc<Storage>, dtype: DType) -> Vec<u8> {
         layout: Layout::contiguous(Shape::new(&[storage.nbytes() / size])),
         dtype,
     };
-    let mut bytes = cpu::read_bytes(&whole);
+    let mut bytes = backend::read_bytes(&whole);
     if cfg!(target_endian = "big") && size > 1 {
         for element in bytes.chunks_mut(size) {
             element.reverse();

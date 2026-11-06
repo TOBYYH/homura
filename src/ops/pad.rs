@@ -2,7 +2,7 @@
 
 use super::clone_data;
 use crate::autograd::formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::tensor::TensorData;
 use crate::{Device, Scalar, Shape, Tensor};
 
@@ -83,12 +83,12 @@ pub(crate) fn constant_pad_nd(input: &Tensor, pad: &[i64], value: Scalar) -> Ten
     } else {
         // Checks `value` before anything is written, also on an empty result.
         let out = crate::full_with(Shape::new(&out_shape), value, (dtype, device));
-        if let (Some(c), Device::Cpu) = (&cropped, device) {
+        if let Some(c) = cropped.as_ref().filter(|_| device != Device::Meta) {
             let mut dst = out.data();
             for d in 0..nd {
                 dst.layout = dst.layout.slice(d, out_start[d], crop_shape[d], 1);
             }
-            cpu::copy(&dst, c);
+            backend::copy(&dst, c);
         }
         out
     };

@@ -2,7 +2,7 @@
 
 use half::{bf16, f16};
 
-use crate::backend::cpu::{self, dispatch_all};
+use crate::backend::{self, cpu::dispatch_all};
 use crate::dtype::sealed::Sealed;
 use crate::shape::IntoShape;
 use crate::{DType, Device, Element, Scalar, Shape, Tensor, default_device, default_dtype};
@@ -241,8 +241,8 @@ fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
         Scalar::Int(v) => v == 0,
         Scalar::Float(v) => v.to_bits() == 0,
     };
-    if device == Device::Cpu && !zero_bits {
-        cpu::fill(&t.data(), value);
+    if device != Device::Meta && !zero_bits {
+        backend::fill(&t.data(), value);
     }
     t
 }
@@ -333,10 +333,10 @@ pub fn full_like(t: &Tensor, value: impl Into<Scalar>) -> Tensor {
 fn from_values(n: usize, dtype: DType, device: Device, f: impl Fn(usize) -> Scalar) -> Tensor {
     // Allocating first rejects sizes that are too large before computing any values.
     let t = Tensor::empty_on(Shape::new(&[n]), dtype, device);
-    if device == Device::Cpu {
+    if device != Device::Meta {
         dispatch_all!(dtype, T => {
             let values: Vec<T> = (0..n).map(|i| T::from_scalar(f(i))).collect();
-            cpu::write_host(&t.data(), &values);
+            backend::write_host(&t.data(), &values);
         });
     }
     t

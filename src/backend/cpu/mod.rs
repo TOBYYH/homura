@@ -50,6 +50,7 @@ pub(crate) fn exec<R>(f: impl FnOnce() -> R) -> R {
     if HOLDS_EXEC.get() {
         return f();
     }
+    let _rank = super::locks::acquire(super::locks::Rank::CpuExec);
     let _guard = EXEC.lock().unwrap_or_else(|e| e.into_inner());
     struct Release;
     impl Drop for Release {

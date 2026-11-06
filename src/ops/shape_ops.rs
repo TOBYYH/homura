@@ -4,7 +4,7 @@ use std::borrow::Borrow;
 
 use super::common_device;
 use crate::autograd::formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::dtype::ResultType;
 use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
 use crate::{Device, Shape, Tensor};
@@ -66,7 +66,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
             .expect("concat(): the result has too many elements");
     }
     let out = Tensor::empty_on(shape, dtype, device);
-    if device == Device::Cpu {
+    if device != Device::Meta {
         let out_data = out.data();
         let mut start = 0;
         for t in parts {
@@ -75,7 +75,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
             let mut dst = out_data.clone();
             dst.layout.offset = dst.layout.offset_at(dim, start);
             dst.layout.shape[dim] = n;
-            cpu::copy(&dst, t);
+            backend::copy(&dst, t);
             start += n;
         }
     }
@@ -188,8 +188,8 @@ impl Tensor {
             );
         }
         let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
-        if src.device() == Device::Cpu {
-            cpu::triangle(&out.data(), &src, diagonal, upper);
+        if src.device() != Device::Meta {
+            backend::triangle(&out.data(), &src, diagonal, upper);
         }
         formulas::triangle(self, diagonal, upper, &out);
         out
@@ -254,8 +254,8 @@ impl Tensor {
             dims_mask(&dims, src.layout.shape.len())
         };
         let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
-        if src.device() == Device::Cpu {
-            cpu::flip(&out.data(), &src, &mask);
+        if src.device() != Device::Meta {
+            backend::flip(&out.data(), &src, &mask);
         }
         let flipped = (0..mask.len()).filter(|&d| mask[d]).map(|d| d as i64);
         formulas::flip(self, flipped.collect(), &out);
@@ -266,7 +266,7 @@ impl Tensor {
 /// The gradient of `x.unfold(dim, size, step)` for the upstream gradient `grad`, where `x` has
 /// `input_shape` and `dim` is wrapped (PyTorch's `unfold_backward`): a new tensor of
 /// `input_shape` in which each element of `grad` lands on the element of `x` it views. See
-/// [`cpu::unfold_backward`] for how overlapping windows add up. Recorded as a node of its own,
+/// `cpu::unfold_backward` for how overlapping windows add up. Recorded as a node of its own,
 /// whose derivative unfolds again.
 pub(crate) fn unfold_backward(
     grad: &Tensor,
@@ -277,8 +277,8 @@ pub(crate) fn unfold_backward(
 ) -> Tensor {
     let g = grad.data();
     let out = Tensor::empty_on(input_shape.clone(), g.dtype, g.device());
-    if g.device() == Device::Cpu {
-        cpu::unfold_backward(&out.data(), &g, dim, size, step);
+    if g.device() != Device::Meta {
+        backend::unfold_backward(&out.data(), &g, dim, size, step);
     }
     formulas::unfold_backward(grad, dim, size, step, &out);
     out

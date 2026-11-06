@@ -100,7 +100,7 @@ pub use adam::{Adam, AdamOptions, AdamState, AdamW};
 pub use sgd::{Sgd, SgdOptions, SgdState};
 pub use state_dict::{LoadError, OptimizerStateDict, ParamGroupRecord};
 
-use crate::backend::cpu::{self, Fused};
+use crate::backend::{self, Fused};
 use crate::nn::Parameter;
 use crate::{DType, Device, Scalar, Tensor};
 
@@ -601,14 +601,14 @@ fn addcdiv(a: &Tensor, b: &Tensor, c: &Tensor, value: f64) -> Tensor {
 #[track_caller]
 fn fused(op: Fused, a: &Tensor, b: &Tensor, c: Option<&Tensor>) -> Tensor {
     let out = Tensor::empty_on(a.shape(), a.dtype(), a.device());
-    if a.device() == Device::Cpu {
+    if a.device() != Device::Meta {
         let (value, dtype) = match op {
             Fused::ScaledAdd(alpha) => (alpha, a.dtype()),
             Fused::Lerp(v) | Fused::Addcmul(v) | Fused::Addcdiv(v) => (v, computation(a.dtype())),
         };
         check_coefficient(value, dtype);
         let c = c.map(Tensor::data);
-        cpu::fused(op, &out.data(), &a.data(), &b.data(), c.as_ref());
+        backend::fused(op, &out.data(), &a.data(), &b.data(), c.as_ref());
     }
     out
 }
@@ -636,7 +636,7 @@ fn check_coefficient(value: f64, dtype: DType) {
 /// [`check_coefficient`] for the scalars a step uses with the parameter `p`, on the CPU.
 #[track_caller]
 fn check_coefficients(p: &Tensor, coefficients: impl IntoIterator<Item = (f64, DType)>) {
-    if p.device() == Device::Cpu {
+    if p.device() != Device::Meta {
         for (value, dtype) in coefficients {
             check_coefficient(value, dtype);
         }

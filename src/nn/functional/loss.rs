@@ -199,7 +199,7 @@ pub fn nll_loss(
     let (out, total_weight) = {
         let _guard = no_grad();
         let target = target.to(DType::I64);
-        if target.device() == Device::Cpu {
+        if target.device() != Device::Meta {
             let bad = target
                 .to_vec::<i64>()
                 .into_iter()

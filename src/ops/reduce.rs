@@ -2,7 +2,7 @@
 
 use super::{ReduceOp, reshape_data};
 use crate::autograd::formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::{Dims, IntoShape, dims_mask, normalize_dim};
 use crate::{DType, Device, Shape, Tensor};
 
@@ -83,8 +83,8 @@ fn reduce_op(op: ReduceOp, x: &Tensor, dims: &[i64], keepdim: bool, name: &str) 
         out_dtype,
         src.device(),
     );
-    if src.device() == Device::Cpu {
-        cpu::reduce(op, &out.data(), &src, &mask);
+    if src.device() != Device::Meta {
+        backend::reduce(op, &out.data(), &src, &mask);
     }
     out
 }
@@ -121,9 +121,9 @@ fn arg_op(
     let device = src.device();
     let vals = values.then(|| Tensor::empty_on(shape.clone(), src.dtype, device));
     let indices = Tensor::empty_on(shape, DType::I64, device);
-    if device == Device::Cpu {
+    if device != Device::Meta {
         let vd = vals.as_ref().map(Tensor::data);
-        cpu::arg_reduce(vd.as_ref(), &indices.data(), &src, dim, is_max);
+        backend::arg_reduce(vd.as_ref(), &indices.data(), &src, dim, is_max);
     }
     (vals, indices)
 }
@@ -143,8 +143,8 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
         src.dtype,
         src.device(),
     );
-    if src.device() == Device::Cpu {
-        cpu::var(&out.data(), &src, &mask, correction as f64, take_sqrt);
+    if src.device() != Device::Meta {
+        backend::var(&out.data(), &src, &mask, correction as f64, take_sqrt);
     }
     out
 }
@@ -156,8 +156,8 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
 pub(crate) fn exclusive_cumprod(x: &Tensor, dim: usize, reverse: bool) -> Tensor {
     let src = x.data();
     let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
-    if src.device() == Device::Cpu {
-        cpu::exclusive_cumprod(&out.data(), &src, dim, reverse);
+    if src.device() != Device::Meta {
+        backend::exclusive_cumprod(&out.data(), &src, dim, reverse);
     }
     out
 }

@@ -7,6 +7,7 @@
 use std::sync::Mutex;
 
 use crate::backend::cpu::dispatch_float;
+use crate::backend::locks::{self, Rank};
 use crate::dtype::sealed::Sealed;
 use crate::shape::IntoShape;
 use crate::{DType, Device, Shape, Tensor, TensorOptions};
@@ -51,6 +52,7 @@ fn philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
 /// Seeds the global random number generator.
 #[track_caller]
 pub fn manual_seed(seed: u64) {
+    let _rank = locks::acquire(Rank::Generator);
     let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
     g.seed = seed;
     g.offset = 0;
@@ -59,6 +61,7 @@ pub fn manual_seed(seed: u64) {
 /// Reserves `blocks` Philox blocks and returns a function producing them.
 fn reserve(blocks: u64) -> impl Fn(u64) -> [u32; 4] {
     let (seed, start) = {
+        let _rank = locks::acquire(Rank::Generator);
         let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
         let start = g.offset;
         g.offset += blocks;

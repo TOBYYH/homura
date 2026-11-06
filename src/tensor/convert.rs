@@ -1,7 +1,7 @@
 //! Moving data between tensors, dtypes, devices and the host.
 
 use super::{Tensor, TensorData, TensorOptions};
-use crate::backend::cpu;
+use crate::backend;
 use crate::ops::{cast_data, clone_data};
 use crate::{DType, Device, Element};
 
@@ -28,7 +28,7 @@ impl Tensor {
     /// Panics if `T` doesn't match the dtype; `f16` and `bf16` tensors may also be read as `f32`.
     #[track_caller]
     pub fn to_vec<T: Element>(&self) -> Vec<T> {
-        cpu::read_host(&self.host_data::<T>("to_vec"))
+        backend::read_host(&self.host_data::<T>("to_vec"))
     }
 
     /// The value of a single-element tensor. This is a synchronization point.
@@ -43,7 +43,7 @@ impl Tensor {
         if n != 1 {
             panic!("a Tensor with {n} elements cannot be converted to Scalar");
         }
-        cpu::read_host(&self.host_data::<T>("item"))[0]
+        backend::read_host(&self.host_data::<T>("item"))[0]
     }
 
     /// Converts to another dtype and/or device: `x.to(DType::F16)`, `x.to(Device::Meta)` or

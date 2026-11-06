@@ -12,7 +12,7 @@
 use super::binary::{check_no_overlap, check_writable};
 use super::{clone_data, common_device, reshape_data};
 use crate::autograd::formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::{checked_num_elements, contiguous_strides};
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Shape, Tensor};
@@ -122,7 +122,8 @@ impl AdvancedIndex {
             };
             let data = t.data();
             if t.dtype() != DType::Bool {
-                let values = (data.device() == Device::Cpu).then(|| cpu::read_host::<i64>(&data));
+                let values =
+                    (data.device() != Device::Meta).then(|| backend::read_host::<i64>(&data));
                 slots.push(Some(Coords {
                     shape: data.layout.shape.clone(),
                     values,
@@ -130,7 +131,7 @@ impl AdvancedIndex {
                 continue;
             }
             let mask_shape = &data.layout.shape;
-            if mask_shape.is_empty() || data.device() != Device::Cpu {
+            if mask_shape.is_empty() || data.device() == Device::Meta {
                 panic!("{META_VALUES}");
             }
             let start = slots.len();
@@ -143,7 +144,7 @@ impl AdvancedIndex {
                     );
                 }
             }
-            for values in cpu::mask_coordinates(&data) {
+            for values in backend::mask_coordinates(&data) {
                 slots.push(Some(Coords {
                     shape: Shape::new(&[values.len()]),
                     values: Some(values),
@@ -288,10 +289,10 @@ impl AdvancedIndex {
         }
     }
 
-    /// The indexing result for a CPU target: a new contiguous tensor of `out_shape`.
+    /// The indexing result for a target with data: a new contiguous tensor of `out_shape`.
     #[track_caller]
     fn gather(&self, target: &TensorData) -> Tensor {
-        let out = Tensor::empty_on(self.out_shape.clone(), target.dtype, Device::Cpu);
+        let out = Tensor::empty_on(self.out_shape.clone(), target.dtype, target.device());
         if self.out_shape.num_elements() == 0 {
             self.check_bounds();
             return out;
@@ -308,7 +309,7 @@ impl AdvancedIndex {
             ..o
         };
         let index = Tensor::from_host(&positions, Shape::new(&[positions.len()]), Device::Cpu);
-        cpu::index_select(&folded, &src, 1, &index.data(), false);
+        backend::index_select(&folded, &src, 1, &index.data(), false);
         out
     }
 
@@ -359,9 +360,9 @@ impl AdvancedIndex {
                 Shape::new(&[before, positions.len(), after]),
             );
             if accumulate {
-                cpu::index_add(&folded, 1, &positions, &src);
+                backend::index_add(&folded, 1, &positions, &src);
             } else {
-                cpu::index_overwrite(&folded, 1, &positions, &src);
+                backend::index_overwrite(&folded, 1, &positions, &src);
             }
         }
         let l = &work.layout;
@@ -403,7 +404,7 @@ impl Tensor {
     pub(crate) fn index_tensors(&self, indices: &[Option<Tensor>]) -> Tensor {
         let data = self.data();
         let info = AdvancedIndex::new(&data, indices);
-        let out = if data.device() == Device::Cpu {
+        let out = if data.device() != Device::Meta {
             info.gather(&data)
         } else {
             info.check_bounds();
@@ -426,7 +427,7 @@ impl Tensor {
         let (data, vals) = (self.data(), values.data());
         let info = AdvancedIndex::new(&data, indices);
         info.check_values(&data, &vals);
-        let out = if data.device() == Device::Cpu {
+        let out = if data.device() != Device::Meta {
             info.scatter(&data, &vals, accumulate)
         } else {
             info.check_bounds();

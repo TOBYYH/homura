@@ -308,9 +308,36 @@ fn copying_out_of_meta_panics() {
     homura::zeros_with([2], Device::Meta).to(Device::Cpu);
 }
 
+#[cfg(not(feature = "rocm"))]
 #[test]
-#[should_panic(expected = "the ROCm backend is not implemented yet")]
-fn rocm_is_not_implemented_yet() {
+fn rocm_needs_the_feature() {
+    let message = "homura was built without ROCm support; enable the `rocm` feature";
+    let panics = |f: fn()| {
+        let e = std::panic::catch_unwind(f).unwrap_err();
+        let text = e.downcast_ref::<&str>().copied();
+        assert_eq!(
+            text.or(e.downcast_ref::<String>().map(String::as_str)),
+            Some(message)
+        );
+    };
+    assert_eq!(Device::rocm_count(), 0);
+    panics(|| drop(homura::zeros_with([2], Device::Rocm(0))));
+    panics(|| drop(Device::Rocm(0).properties()));
+    panics(|| {
+        Device::Rocm(0).mem_get_info();
+    });
+    panics(|| Device::Rocm(0).synchronize());
+    // The CPU and meta devices have no GPU properties, with or without the feature.
+    for d in [Device::Cpu, Device::Meta] {
+        assert_eq!((d.properties(), d.mem_get_info()), (None, None));
+        d.synchronize();
+    }
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+#[should_panic(expected = "allocating memory on rocm:0 is not implemented yet")]
+fn rocm_memory_is_not_implemented_yet() {
     homura::zeros_with([2], Device::Rocm(0));
 }
 

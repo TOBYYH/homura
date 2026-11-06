@@ -3,7 +3,7 @@
 //! the functions in `nn::functional` check them.
 
 use crate::autograd::formulas::pool as formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::{DType, Device, Shape, Tensor};
 
 /// The geometry of a 2-D pooling: kernel size, stride, padding and dilation for the height and
@@ -72,8 +72,8 @@ pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Ten
     let shape = g.output_shape(&x.layout.shape);
     let out = Tensor::empty_on(shape.clone(), x.dtype, x.device());
     let indices = Tensor::empty_on(shape, DType::I64, x.device());
-    if x.device() == Device::Cpu {
-        cpu::max_pool2d(&out.data(), &indices.data(), &x, &g);
+    if x.device() != Device::Meta {
+        backend::max_pool2d(&out.data(), &indices.data(), &x, &g);
     }
     formulas::max_pool2d(input, &indices, &out);
     (out, indices)
@@ -85,8 +85,8 @@ pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Ten
 pub(crate) fn max_pool2d_backward(grad: &Tensor, input: &Tensor, indices: &Tensor) -> Tensor {
     let g = grad.data();
     let out = Tensor::empty_on(input.shape(), g.dtype, g.device());
-    if g.device() == Device::Cpu {
-        cpu::max_pool2d_backward(&out.data(), &g, &indices.data());
+    if g.device() != Device::Meta {
+        backend::max_pool2d_backward(&out.data(), &g, &indices.data());
     }
     formulas::max_pool2d_backward(grad, input, indices, &out);
     out
@@ -105,8 +105,8 @@ pub(crate) fn adaptive_avg_pool2d(input: &Tensor, output: [usize; 2]) -> Tensor 
         .chain(output)
         .collect();
     let out = Tensor::empty_on(shape, x.dtype, x.device());
-    if x.device() == Device::Cpu {
-        cpu::adaptive_avg_pool2d(&out.data(), &x);
+    if x.device() != Device::Meta {
+        backend::adaptive_avg_pool2d(&out.data(), &x);
     }
     formulas::adaptive_avg_pool2d(input, &out);
     out
@@ -118,8 +118,8 @@ pub(crate) fn adaptive_avg_pool2d(input: &Tensor, output: [usize; 2]) -> Tensor 
 pub(crate) fn adaptive_avg_pool2d_backward(grad: &Tensor, input: &Tensor) -> Tensor {
     let g = grad.data();
     let out = Tensor::empty_on(input.shape(), g.dtype, g.device());
-    if g.device() == Device::Cpu {
-        cpu::adaptive_avg_pool2d_backward(&out.data(), &g);
+    if g.device() != Device::Meta {
+        backend::adaptive_avg_pool2d_backward(&out.data(), &g);
     }
     formulas::adaptive_avg_pool2d_backward(grad, input, &out);
     out

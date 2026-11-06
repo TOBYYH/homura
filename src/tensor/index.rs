@@ -4,7 +4,7 @@ use std::iter::StepBy;
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
 use super::Tensor;
-use crate::backend::cpu;
+use crate::backend;
 use crate::ops::{META_VALUES, check_index_dtype, check_index_put_target};
 use crate::shape::sealed::Sealed;
 use crate::{DType, Device, DimSize, Shape};
@@ -337,10 +337,10 @@ fn index_dims(t: &Tensor) -> usize {
 #[track_caller]
 fn index_value(t: &Tensor) -> i64 {
     let data = t.data();
-    if data.device() != Device::Cpu {
+    if data.device() == Device::Meta {
         panic!("{META_VALUES}");
     }
-    cpu::read_host::<i64>(&data)[0]
+    backend::read_host::<i64>(&data)[0]
 }
 
 impl Tensor {
@@ -718,8 +718,8 @@ impl Tensor {
         let mut shape = src.layout.shape.clone();
         shape[dim] = idx.layout.num_elements();
         let out = Tensor::empty_on(shape, src.dtype, device);
-        if device == Device::Cpu {
-            cpu::index_select(&out.data(), &src, dim, &idx, allow_negative);
+        if device != Device::Meta {
+            backend::index_select(&out.data(), &src, dim, &idx, allow_negative);
         }
         out
     }

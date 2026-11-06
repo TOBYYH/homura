@@ -5,7 +5,7 @@
 
 use super::{clone_data, common_device};
 use crate::autograd::formulas;
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::normalize_dim;
 use crate::tensor::{Layout, TensorData, select_position, slice_bounds};
 use crate::{DType, Device, Shape, Strides, Tensor};
@@ -27,11 +27,11 @@ fn check_index_dtype(op: &str, index: &TensorData) {
 /// `scatter_add`. The meta device has no values to check: the result is empty there.
 #[track_caller]
 fn positions(index: &TensorData, dim: usize, size: usize) -> Vec<usize> {
-    if index.device() != Device::Cpu {
+    if index.device() == Device::Meta {
         return vec![];
     }
     let mut out = vec![];
-    for i in cpu::read_host::<i64>(index) {
+    for i in backend::read_host::<i64>(index) {
         if !(0..size as i64).contains(&i) {
             panic!("index {i} is out of bounds for dimension {dim} with size {size}");
         }
@@ -121,8 +121,8 @@ impl Tensor {
         }
         let positions = positions(&idx, d, shape[d]);
         let out = Tensor::from_data(clone_data(&data));
-        if device == Device::Cpu {
-            cpu::index_add(&out.data(), d, &positions, &src);
+        if device != Device::Meta {
+            backend::index_add(&out.data(), d, &positions, &src);
         }
         formulas::index_add(self, d, index, source, &out);
         out
@@ -177,8 +177,8 @@ impl Tensor {
         }
         let positions = positions(&idx, d, shape[d]);
         let out = Tensor::empty_on(idx.layout.shape.clone(), data.dtype, device);
-        if device == Device::Cpu {
-            cpu::gather(&at_least_1d(&out.data()), &src, d, &positions);
+        if device != Device::Meta {
+            backend::gather(&at_least_1d(&out.data()), &src, d, &positions);
         }
         formulas::gather(self, d, index, &out);
         out
@@ -233,9 +233,9 @@ impl Tensor {
         }
         let positions = positions(&idx, d, shape[d]);
         let out = Tensor::from_data(clone_data(&data));
-        if device == Device::Cpu {
+        if device != Device::Meta {
             let o = at_least_1d(&out.data());
-            cpu::scatter_add(&o, d, index_shape, &positions, &source_1d);
+            backend::scatter_add(&o, d, index_shape, &positions, &source_1d);
         }
         formulas::scatter_add(self, d, index, src, &out);
         out
@@ -334,13 +334,13 @@ impl Tensor {
             );
         }
         let out = Tensor::from_data(clone_data(&data));
-        if device == Device::Cpu {
+        if device != Device::Meta {
             let o = out.data();
             let target = TensorData {
                 layout: part(&o.layout),
                 ..o
             };
-            cpu::copy(&target, src);
+            backend::copy(&target, src);
         }
         out
     }

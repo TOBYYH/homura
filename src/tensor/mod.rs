@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::autograd::{AutogradMeta, ViewInfo};
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::{contiguous_strides, is_contiguous};
 use crate::storage::Storage;
 use crate::{DType, Device, Element, Shape, Strides};
@@ -461,8 +461,8 @@ impl Tensor {
             shape
         );
         let t = Tensor::empty_on(shape, T::DTYPE, device);
-        if device == Device::Cpu {
-            cpu::write_host(&t.data(), values);
+        if device != Device::Meta {
+            backend::write_host(&t.data(), values);
         }
         t
     }

@@ -100,18 +100,38 @@ impl FileMap {
     }
 }
 
+/// ROCm memory, which isn't implemented yet: panics after checking that the device exists.
+/// Unit tests can make it return a placeholder without data instead ([`fake_rocm`]), to reach the
+/// ROCm arms of the operations.
+#[track_caller]
+fn rocm_buffer(nbytes: usize, index: u32) -> Buffer {
+    #[cfg(test)]
+    if fake_rocm::enabled() {
+        return Buffer::Meta { nbytes };
+    }
+    let _ = nbytes;
+    #[cfg(not(feature = "rocm"))]
+    crate::device::without_rocm(index);
+    #[cfg(feature = "rocm")]
+    {
+        crate::backend::rocm::check_index(index);
+        panic!("allocating memory on rocm:{index} is not implemented yet")
+    }
+}
+
 impl Storage {
     /// Allocates `nbytes` of zeroed memory on `device`.
     ///
     /// # Panics
     ///
-    /// Panics for ROCm devices, which are not implemented yet.
+    /// Panics for ROCm devices: ROCm memory is not implemented yet (and homura may be built
+    /// without the `rocm` feature, or the device may not exist).
     #[track_caller]
     pub fn new(nbytes: usize, device: Device) -> Storage {
         let buffer = match device {
             Device::Cpu => Buffer::Cpu(CpuBuffer::zeroed(nbytes)),
             Device::Meta => Buffer::Meta { nbytes },
-            Device::Rocm(_) => panic!("the ROCm backend is not implemented yet"),
+            Device::Rocm(i) => rocm_buffer(nbytes, i),
         };
         Storage {
             buffer,
@@ -211,5 +231,34 @@ impl Storage {
     /// tensor uses yet: the versions of shared storage only ever grow by one per write.
     pub fn continue_version(&self, previous: u64) {
         self.version.store(previous + 1, Ordering::Relaxed);
+    }
+}
+
+/// Placeholder ROCm storages for unit tests, which have no data: every kernel on them must
+/// panic, which shows that operations reach the ROCm arm of the dispatch layer instead of
+/// treating ROCm like the meta device.
+#[cfg(test)]
+pub(crate) mod fake_rocm {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn enabled() -> bool {
+        ENABLED.get()
+    }
+
+    /// Runs `f` with ROCm allocations on this thread returning placeholders.
+    pub(crate) fn with<R>(f: impl FnOnce() -> R) -> R {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ENABLED.set(false);
+            }
+        }
+        ENABLED.set(true);
+        let _reset = Reset;
+        f()
     }
 }

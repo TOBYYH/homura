@@ -9,7 +9,9 @@ repository = "https://github.com/TOBYYH/homura"
 readme = "README.md"
 keywords = ["deep-learning", "tensor", "pytorch", "gpu", "rocm"]
 categories = ["science", "mathematics"]
-exclude = ["/tools", "/tests"]
+exclude = ["/tools", "/tests", "/csrc/tests"]
+# build.rs passes the ROCm library directory to dependent build scripts as DEP_HOMURA_ROCM_LIB.
+links = "homura_rocm"
 
 [workspace]
 members = ["homura-derive", "homura-models"]
@@ -32,3 +34,7 @@ workspace = true
 half = "2.7"
 homura-derive = { version = "=0.4.0", path = "homura-derive" }
 memmap2 = "0.9.11"
+
+[features]
+# The ROCm backend: builds csrc/ with hipcc and links the HIP runtime (see build.rs).
+rocm = []

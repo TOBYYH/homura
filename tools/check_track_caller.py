@@ -15,12 +15,17 @@ A function must be annotated when it is
   ..., or a trait named by a macro metavariable such as `$Trait`) or of `Sum` / `Product`, whose
   declarations in `std` don't carry the attribute.
 
+The dispatch layer (`src/backend/mod.rs`) and the ROCm backend (`src/backend/rocm/`, including
+code behind `#[cfg(feature = "rocm")]`) are checked more strictly: every `pub(crate) fn` there
+must carry the attribute too, since operations call them on the way to checks that panic for the
+user's arguments (index ranges, missing devices). The generated bindings (`ffi.rs`) are exempt.
+
 Not checked: methods of inherent impls of crate-internal types (declared `pub(crate)` or without
-`pub`, so their `pub fn`s aren't reachable from outside); `src/backend/` (kernels, whose panics
-are homura bugs, except for the few that check user input, such as index ranges, which carry the
-attribute and are covered by the run-time test); unit test files and modules; and the functions
-in `ALLOWED` below, each with its reason. Neither are the internal functions between an entry
-point and a check: the run-time test covers those.
+`pub`, so their `pub fn`s aren't reachable from outside); the rest of `src/backend/` (kernels,
+whose panics are homura bugs, except for the few that check user input, such as index ranges,
+which carry the attribute and are covered by the run-time test); unit test files and modules;
+and the functions in `ALLOWED` below, each with its reason. Neither are the other internal
+functions between an entry point and a check: the run-time test covers those.
 
 The scanner reads rustfmt-formatted source line by line rather than parsing Rust: a function
 starts at a line with `fn` (its name on that line or the next), and only an attribute line
@@ -57,12 +62,19 @@ ALLOWED = {
     ("src/nn/module.rs", "visit_non_persistent"): CALLBACK,
     ("homura-models/src/pretrained.rs", "from_file"): CALLBACK,
     ("homura-models/src/pretrained.rs", "from_config"): CALLBACK,
+    ("src/backend/rocm/context.rs", "try_context"): (
+        "returns failures instead of panicking; its callers check the device index first"
+    ),
 }
 
 # The source directories of the crates whose API is checked (homura-derive's macros don't panic
 # at run time).
 CRATES = ("src", "homura-models/src")
 SKIP_DIRS = ("src/backend/", "src/autograd/test_support/")
+# Checked although under `src/backend/`, with `pub(crate)` functions included.
+STRICT = ("src/backend/mod.rs", "src/backend/rocm/")
+# Generated bindings and unit tests inside STRICT.
+STRICT_EXEMPT = ("src/backend/rocm/ffi.rs", "src/backend/rocm/tests.rs")
 STD_OPS = {
     "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Not",
     "AddAssign", "SubAssign", "MulAssign", "DivAssign", "RemAssign",
@@ -181,11 +193,12 @@ def has_attr(lines, i):
     return False
 
 
-def scan(path, text, internal=frozenset(), used=None):
+def scan(path, text, internal=frozenset(), used=None, strict=False):
     """The `(line number, function name)` of every function that misses the attribute.
 
     `internal` holds the names of crate-internal types, whose inherent impls are skipped. The
-    `ALLOWED` entries that excuse a function are added to `used`.
+    `ALLOWED` entries that excuse a function are added to `used`. `strict` also requires the
+    attribute on `pub(crate)` functions.
     """
     lines = text.splitlines()
     missing = []
@@ -207,7 +220,8 @@ def scan(path, text, internal=frozenset(), used=None):
             top_depth = stack[-1][1] if stack else 0
             directly_inside = top is not None and depth == top_depth
             vis, name = m
-            needs = bool(vis) and vis.strip() == "pub"
+            visibility = vis.strip() if vis else ""
+            needs = visibility == "pub" or (strict and visibility == "pub(crate)")
             if directly_inside and top in ("trait", "stdop"):
                 needs = True
             if needs and (path, name) in ALLOWED:
@@ -261,9 +275,10 @@ def check(root):
         internal = internal_types(p.read_text() for p in paths)
         for path in paths:
             rel = path.relative_to(root).as_posix()
-            if rel.startswith(SKIP_DIRS) or rel.endswith("_tests.rs"):
+            strict = rel.startswith(STRICT) and rel not in STRICT_EXEMPT
+            if not strict and (rel.startswith(SKIP_DIRS) or rel.endswith("_tests.rs")):
                 continue
-            for line, name in scan(rel, path.read_text(), internal, used):
+            for line, name in scan(rel, path.read_text(), internal, used, strict):
                 failures.append(f"{rel}:{line}: `{name}` lacks #[track_caller]")
     for path, name in sorted(set(ALLOWED) - used):
         failures.append(f"{path}: the ALLOWED entry for `{name}` excuses no function; remove it")
@@ -323,14 +338,26 @@ SELF_TESTS = [
 ]
 
 
+# (source, expected missing names) in the strict mode of the dispatch layer and ROCm backend.
+STRICT_SELF_TESTS = [
+    ("#[track_caller]\npub(crate) fn ok() {}\npub(crate) fn bad() {}\nfn private() {}\n", ["bad"]),
+    ("#[cfg(feature = \"rocm\")]\npub(crate) fn gated() {}\n", ["gated"]),
+    ("pub(super) fn sibling() {}\n#[cfg(test)]\nmod tests {\n    pub(crate) fn helper() {}\n}\n", []),
+    ("macro_rules! m {\n    () => {};\n}\n#[track_caller]\npub(crate) fn after_macro() {}\n"
+     "pub fn public() {}\n", ["public"]),
+]
+
+
 def self_test():
     failures = 0
-    for i, (source, expected) in enumerate(SELF_TESTS):
-        got = [name for _, name in scan("self-test.rs", source, internal_types([source]))]
+    cases = [(src, exp, False) for src, exp in SELF_TESTS]
+    cases += [(src, exp, True) for src, exp in STRICT_SELF_TESTS]
+    for i, (source, expected, strict) in enumerate(cases):
+        got = [name for _, name in scan("self-test.rs", source, internal_types([source]), None, strict)]
         if got != expected:
             failures += 1
             print(f"self-test {i} failed: expected {expected}, got {got}\n{source}")
-    print(f"{len(SELF_TESTS) - failures}/{len(SELF_TESTS)} self-tests passed")
+    print(f"{len(cases) - failures}/{len(cases)} self-tests passed")
     return failures == 0
 
 

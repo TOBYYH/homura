@@ -472,6 +472,12 @@ fn shared_tensor_checks() {
     at!(x.uniform_(2.0, 1.0));
     at!(homura::tensor(vec![vec![1.0f32], vec![2.0, 3.0]]));
     at!(homura::zeros_with([2], Device::Rocm(0)));
+    // Without the `rocm` feature these panic because ROCm is missing; with it, because there is
+    // no such device.
+    at!(homura::zeros_with([2], Device::Rocm(99)));
+    at!(Device::Rocm(99).properties());
+    at!(Device::Rocm(99).mem_get_info());
+    at!(Device::Rocm(99).synchronize());
     at!(F::pad(&x, &[1, 1, 1], 0.0));
     finish();
 }

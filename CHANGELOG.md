@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- The `rocm` feature (also on homura-models, forwarded to homura), off by default: builds
+  homura's ROCm layer from `csrc/` with `hipcc` into a static library and links the HIP
+  runtime. GPU architectures are chosen with `HOMURA_OFFLOAD_ARCH` (gfx1201 by default, the only
+  one tested; gfx1200 is compile-only), and `HOMURA_ROCM_CHECK_ONLY=1` skips the native build.
+  See "Building with ROCm" in the README.
+- `Device::rocm_count`, `Device::properties` (`DeviceProperties`: name, architecture, compute
+  units, wave size, memory) and `Device::mem_get_info` (`MemInfo`); `Device::synchronize` waits
+  for a ROCm device's work. On the CPU and meta devices the queries return `None`.
+
+### Changed
+
+- Every operation now goes through a dispatch layer that picks the backend by device. A tensor
+  on a ROCm device still can't be created: the message now says that ROCm memory is not
+  implemented yet, or that homura was built without the `rocm` feature. CPU behaviour is
+  unchanged.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added

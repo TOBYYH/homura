@@ -2,7 +2,9 @@
 
 A tensor computing framework written in Rust that aims to feel as close to PyTorch as possible.
 Each hardware backend is built directly on the vendor's latest official development tools, so that
-it can get the best performance out of the hardware.
+it can get the best performance out of the hardware. All compute kernels are homura's own: GPU
+backends do not call vendor compute libraries such as hipBLASLt, rocBLAS or MIOpen. Performance work
+is ongoing and gives priority to the tensor shapes that are common in machine learning.
 
 The first GPU backend targets AMD ROCm. Backends for other hardware will be added once the ROCm
 backend is stable.
@@ -46,8 +48,12 @@ Implemented so far:
   batch norm statistics) at every step. Their state dicts are PyTorch's, so training resumes
   from a checkpoint written by either library.
 
-Not available yet: GPU backends (ROCm comes first), most neural network layers, autograd hooks,
-and in-place operations on views that require grad.
+- The start of the ROCm backend, behind the `rocm` feature: building homura's ROCm layer and
+  querying devices (`Device::rocm_count`, `properties`, `mem_get_info`, `synchronize`).
+  Tensors can't be placed on ROCm devices yet.
+
+Not available yet: tensors on GPUs (ROCm comes first), most neural network layers, autograd
+hooks, and in-place operations on views that require grad.
 
 ## Example
 
@@ -92,6 +98,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Building with ROCm
+
+The ROCm backend is behind the `rocm` feature, off by default:
+
+```toml
+[dependencies]
+homura = { version = "0.4", features = ["rocm"] }
+# or, with the models: homura-models = { version = "0.4", features = ["rocm"] }
+```
+
+Building it needs ROCm with `hipcc` (it is developed with ROCm 10.1). The build looks for ROCm at
+`ROCM_PATH`, then `hipconfig --rocmpath`, `/opt/rocm` and `/usr`. The supported GPU is gfx1201
+(Radeon AI PRO R9700 and RX 9070 series); `HOMURA_OFFLOAD_ARCH` selects the architectures to
+compile for, `gfx1201` by default. `gfx1200` is accepted too, but has only been compiled for, not
+run: using such a GPU prints a warning. `HOMURA_ROCM_CHECK_ONLY=1` skips the native build, for
+`cargo check`, `clippy` and documentation on machines without ROCm (nothing can be linked then).
+
+Programs that use homura with ROCm load the HIP runtime (`libamdhip64.so`) when they start, so
+the ROCm library directory must be on the dynamic linker's path, for example with
+`/etc/ld.so.conf.d/rocm.conf` (as AMD's installation guide sets up) or `LD_LIBRARY_PATH`.
+Otherwise the program fails to start with "error while loading shared libraries:
+libamdhip64.so.7". The tests and examples of homura and homura-models find the library without
+it; build scripts of other crates that depend on homura can read the directory from
+`DEP_HOMURA_ROCM_LIB`.
 
 ## Minimum supported Rust version
 

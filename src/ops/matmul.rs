@@ -1,7 +1,7 @@
 //! Matrix multiplication.
 
 use super::{common_device, reshape_data};
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::broadcast_shapes;
 use crate::tensor::{Layout, TensorData};
 use crate::{Device, Shape, Tensor};
@@ -67,8 +67,8 @@ impl Tensor {
         let a3 = batched(&a, &a2, m, k);
         let b3 = batched(&b, &b2, k, n);
         let out = Tensor::empty_on(Shape::new(&[batch_size, m, n]), a.dtype, device).data();
-        if device == Device::Cpu {
-            cpu::matmul(&out, &a3, &b3);
+        if device != Device::Meta {
+            backend::matmul(&out, &a3, &b3);
         }
         let mut shape = batch.to_vec();
         if da > 1 {

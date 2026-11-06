@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::Tensor;
-use crate::backend::cpu;
+use crate::backend;
 use crate::shape::contiguous_strides;
 use crate::{DType, Device};
 
@@ -239,11 +239,11 @@ impl fmt::Debug for Tensor {
                 suffixes.push(format!("dtype={dtype}"));
             }
             let values = if dtype.is_floating_point() {
-                Values::Float(cpu::read_host(&data))
+                Values::Float(backend::read_host(&data))
             } else if dtype == DType::Bool {
-                Values::Bool(cpu::read_host(&data))
+                Values::Bool(backend::read_host(&data))
             } else {
-                Values::Int(cpu::read_host(&data))
+                Values::Int(backend::read_host(&data))
             };
             let strides = contiguous_strides(&shape);
             let summarize = shape.num_elements() > THRESHOLD;

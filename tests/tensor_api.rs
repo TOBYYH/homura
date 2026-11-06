@@ -327,6 +327,11 @@ fn rocm_needs_the_feature() {
         Device::Rocm(0).mem_get_info();
     });
     panics(|| Device::Rocm(0).synchronize());
+    panics(|| {
+        Device::Rocm(0).memory_stats();
+    });
+    panics(|| Device::Rocm(0).reset_peak_memory_stats());
+    panics(|| Device::Rocm(0).empty_cache());
     // The CPU and meta devices have no GPU properties, with or without the feature.
     for d in [Device::Cpu, Device::Meta] {
         assert_eq!((d.properties(), d.mem_get_info()), (None, None));
@@ -334,11 +339,33 @@ fn rocm_needs_the_feature() {
     }
 }
 
+/// The memory methods work on the CPU and meta devices with or without the feature; the meta
+/// device has no memory. (The CPU's numbers are checked in tests/memory_stats.rs, alone in its
+/// test binary.)
+#[test]
+fn memory_methods_on_the_cpu_and_meta_devices() {
+    let _meta = homura::zeros_with([1000], Device::Meta);
+    assert_eq!(Device::Meta.memory_stats(), homura::MemoryStats::default());
+    for d in [Device::Cpu, Device::Meta] {
+        d.reset_peak_memory_stats();
+        d.empty_cache();
+    }
+    assert_eq!(Device::Meta.memory_stats(), homura::MemoryStats::default());
+}
+
+/// ROCm tensors can be created (zeros needs no kernel: new memory is zero), but the kernels of
+/// other operations come in later steps.
 #[cfg(feature = "rocm")]
 #[test]
-#[should_panic(expected = "allocating memory on rocm:0 is not implemented yet")]
-fn rocm_memory_is_not_implemented_yet() {
-    homura::zeros_with([2], Device::Rocm(0));
+fn rocm_tensors_are_allocated_but_their_kernels_are_not_implemented_yet() {
+    let x = homura::zeros_with([2, 3], Device::Rocm(0));
+    assert_eq!(x.device(), Device::Rocm(0));
+    assert_eq!(x.shape(), homura::zeros([2, 3]).shape());
+    let e = std::panic::catch_unwind(|| homura::ones_with([2], Device::Rocm(0))).unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<String>().map(String::as_str),
+        Some("fill is not implemented on ROCm yet (rocm:0)")
+    );
 }
 
 #[test]

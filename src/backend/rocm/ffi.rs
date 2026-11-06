@@ -46,6 +46,25 @@ unsafe extern "C" {
     pub fn hmr_context_create(device: i32, out: *mut hmr_context_t) -> hmr_status;
     pub fn hmr_context_destroy(ctx: hmr_context_t) -> hmr_status;
     pub fn hmr_context_synchronize(ctx: hmr_context_t) -> hmr_status;
+    pub fn hmr_malloc(device: i32, nbytes: u64, out: *mut *mut ::core::ffi::c_void) -> hmr_status;
+    pub fn hmr_free(device: i32, ptr: *mut ::core::ffi::c_void) -> hmr_status;
+    pub fn hmr_memset_zero(
+        ctx: hmr_context_t,
+        ptr: *mut ::core::ffi::c_void,
+        nbytes: u64,
+    ) -> hmr_status;
+    pub fn hmr_copy_to_host(
+        ctx: hmr_context_t,
+        dst: *mut ::core::ffi::c_void,
+        src: *const ::core::ffi::c_void,
+        nbytes: u64,
+    ) -> hmr_status;
+    pub fn hmr_copy_from_host(
+        ctx: hmr_context_t,
+        dst: *mut ::core::ffi::c_void,
+        src: *const ::core::ffi::c_void,
+        nbytes: u64,
+    ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);
     pub fn hmr_test_fail_stream_create(n: i32);

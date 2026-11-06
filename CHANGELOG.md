@@ -16,13 +16,21 @@ All notable changes to this project are documented in this file. The format is b
 - `Device::rocm_count`, `Device::properties` (`DeviceProperties`: name, architecture, compute
   units, wave size, memory) and `Device::mem_get_info` (`MemInfo`); `Device::synchronize` waits
   for a ROCm device's work. On the CPU and meta devices the queries return `None`.
+- ROCm device memory, from a caching allocator in the style of PyTorch's: requests up to 1 MiB
+  round up to 512 bytes and share 2 MiB segments, larger ones round up to 2 MiB; freed memory
+  is cached for reuse, and released (then tried again) when the GPU runs out. New memory is
+  zero, as on the CPU, so `zeros_with(.., Device::Rocm(0))` and other tensors without data
+  work; operations on them don't yet. A request the GPU can't hold panics with a message like
+  PyTorch's ("ROCm out of memory. Tried to allocate ...").
+- `Device::memory_stats` (`MemoryStats`: allocated, reserved and peak bytes),
+  `Device::reset_peak_memory_stats` and `Device::empty_cache`. The CPU counts the buffers homura
+  allocates (not file mappings); the meta device reports zeros.
 
 ### Changed
 
-- Every operation now goes through a dispatch layer that picks the backend by device. A tensor
-  on a ROCm device still can't be created: the message now says that ROCm memory is not
-  implemented yet, or that homura was built without the `rocm` feature. CPU behaviour is
-  unchanged.
+- Every operation now goes through a dispatch layer that picks the backend by device. An
+  operation on a ROCm tensor panics with "... is not implemented on ROCm yet", or says that
+  homura was built without the `rocm` feature. CPU behaviour is unchanged.
 
 ## [0.4.0] - 2026-10-27
 

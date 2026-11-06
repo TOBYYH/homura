@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Runs csrc/tests/host_failures.cpp: the ROCm layer's host failure paths (cleanup that fails,
-host memory that runs out for good) against a stand-in HIP, so no ROCm or GPU is needed.
+device memory that runs out, the HIP errors failures leave behind, host memory that runs out for
+good) against a stand-in HIP, so no ROCm or GPU is needed.
 
-Compiles csrc/runtime.hip with the host C++ compiler ($CXX, else c++) and runs every mode in its
-own process: an abort fails that mode only. Exit status 0 if all pass.
+Compiles csrc/runtime.hip and csrc/memory.hip with the host C++ compiler ($CXX, else c++) and
+runs every mode in its own process: an abort fails that mode only. Exit status 0 if all pass.
 """
 
 import os

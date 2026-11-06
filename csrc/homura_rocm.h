@@ -78,6 +78,27 @@ hmr_status hmr_context_destroy(hmr_context_t ctx);
 /* Waits until all work queued on the context's stream has finished. */
 hmr_status hmr_context_synchronize(hmr_context_t ctx);
 
+/*
+ * Device memory, which the Rust side's caching allocator (src/backend/caching.rs) requests in
+ * segments and hands out in blocks.
+ *
+ * hmr_malloc: hipMalloc of `nbytes` on `device`; HMR_OUT_OF_MEMORY when the device has no
+ * memory left (the failure doesn't linger as HIP's last error).
+ * hmr_free: hipFree of a pointer from hmr_malloc.
+ */
+hmr_status hmr_malloc(int32_t device, uint64_t nbytes, void **out);
+hmr_status hmr_free(int32_t device, void *ptr);
+
+/* Queues the zeroing of `nbytes` at `ptr` on the context's stream (hipMemsetAsync). */
+hmr_status hmr_memset_zero(hmr_context_t ctx, void *ptr, uint64_t nbytes);
+
+/*
+ * Copies `nbytes` between pageable host memory and the device, in the context's stream order,
+ * and returns when the copy is complete.
+ */
+hmr_status hmr_copy_to_host(hmr_context_t ctx, void *dst, const void *src, uint64_t nbytes);
+hmr_status hmr_copy_from_host(hmr_context_t ctx, void *dst, const void *src, uint64_t nbytes);
+
 /* The architectures this library was built for, separated by ';' (HOMURA_OFFLOAD_ARCH). */
 const char *hmr_built_archs(void);
 

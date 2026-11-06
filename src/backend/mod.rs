@@ -5,6 +5,8 @@
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
 //! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics.
 
+#[cfg(any(feature = "rocm", test))]
+pub(crate) mod caching;
 pub(crate) mod cpu;
 pub(crate) mod locks;
 #[cfg(feature = "rocm")]

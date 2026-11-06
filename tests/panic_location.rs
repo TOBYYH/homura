@@ -471,13 +471,18 @@ fn shared_tensor_checks() {
     at!(x.normal_(0.0, -1.0));
     at!(x.uniform_(2.0, 1.0));
     at!(homura::tensor(vec![vec![1.0f32], vec![2.0, 3.0]]));
-    at!(homura::zeros_with([2], Device::Rocm(0)));
+    // Without the `rocm` feature this panics because ROCm is missing; with it, because 4 TiB
+    // don't fit the GPU.
+    at!(homura::zeros_with([1usize << 40], Device::Rocm(0)));
     // Without the `rocm` feature these panic because ROCm is missing; with it, because there is
     // no such device.
     at!(homura::zeros_with([2], Device::Rocm(99)));
     at!(Device::Rocm(99).properties());
     at!(Device::Rocm(99).mem_get_info());
     at!(Device::Rocm(99).synchronize());
+    at!(Device::Rocm(99).memory_stats());
+    at!(Device::Rocm(99).reset_peak_memory_stats());
+    at!(Device::Rocm(99).empty_cache());
     at!(F::pad(&x, &[1, 1, 1], 0.0));
     finish();
 }

@@ -1,8 +1,10 @@
 // Failure paths of the ROCm layer's host code that a real GPU can't produce on demand: HIP calls
-// failing during cleanup, and host memory running out for good (review round 119, R139 and R140).
-// runtime.hip is compiled against the stand-in HIP of fake_hip/, and operator new is replaced
-// so that a test can make every host allocation fail. Each mode runs in its own process, so that
-// an abort (a C++ exception escaping a noexcept function) fails only that mode.
+// failing during cleanup or for lack of device memory, the thread's last HIP error that failures
+// leave, and host memory running out for good (review rounds 119, R139 and R140, and 122, R145
+// and R146). runtime.hip and memory.hip are compiled against the stand-in HIP of fake_hip/, and
+// operator new is replaced so that a test can make every host allocation fail. Each mode runs in
+// its own process, so that an abort (a C++ exception escaping a noexcept function) fails only that
+// mode.
 //
 // Built and run by tools/check_rocm_host_failures.py; not part of the library.
 
@@ -18,6 +20,7 @@
 #include <stdexcept>
 
 #include "../runtime.hip"
+#include "../memory.hip"
 
 void *operator new(std::size_t n) {
     if (fake::deny_new) throw std::bad_alloc();
@@ -62,6 +65,8 @@ int failures = 0;
 
 // A context can still be created and destroyed, leaving the thread on its device.
 void create_and_destroy() {
+    // The failures before left nothing as the thread's last HIP error (review round 122, R145).
+    CHECK(fake::last_error == hipSuccess);
     fake::launch_error = hipSuccess;
     fake::destroy_error = hipSuccess;
     int before = fake::live_streams;
@@ -205,6 +210,65 @@ void exception_without_memory() {
     fake::deny_new = false;
 }
 
+// The probe's own hipMalloc fails: out of memory, and the retry right after it on this thread
+// succeeds, since the failure doesn't stay as the last error that the next probe's launch check
+// reads (review round 122, R145).
+void probe_malloc_failure_then_retry() {
+    fake::malloc_failures = 1;
+    hmr_context_t ctx = nullptr;
+    CHECK(hmr_context_create(0, &ctx) == HMR_OUT_OF_MEMORY);
+    CHECK(ctx == nullptr);
+    CHECK_ERROR("rocm:0: hipMalloc(&d, sizeof(uint32_t)): out of memory");
+    CHECK_STREAMS(0);
+    create_and_destroy();
+}
+
+// An error that the caller's own HIP calls left on this thread doesn't fail the probe's launch
+// check (R145).
+void earlier_error_before_the_probe() {
+    fake::last_error = hipErrorInvalidHandle;
+    hmr_context_t ctx = nullptr;
+    CHECK(hmr_context_create(0, &ctx) == HMR_OK);
+    CHECK(hmr_context_destroy(ctx) == HMR_OK);
+    create_and_destroy();
+}
+
+void malloc_failure() {
+    fake::malloc_failures = 1;
+    void *p = reinterpret_cast<void *>(1);
+    CHECK(hmr_malloc(0, 4096, &p) == HMR_OUT_OF_MEMORY);
+    CHECK(p == nullptr);
+    CHECK_ERROR("hipMalloc(&ptr, nbytes): out of memory");
+    CHECK(fake::current_device == 1);
+    CHECK(fake::last_error == hipSuccess);
+    CHECK(hmr_malloc(0, 4096, &p) == HMR_OK);
+    CHECK(p != nullptr);
+    CHECK(hmr_free(0, p) == HMR_OK);
+    create_and_destroy();
+}
+
+// Queuing the zeroing fails for lack of memory: HMR_OUT_OF_MEMORY, nothing left as the last
+// error, and the next submission works (review round 122, R146).
+void memset_failure() {
+    hmr_context_t ctx = nullptr;
+    CHECK(hmr_context_create(0, &ctx) == HMR_OK);
+    void *p = nullptr;
+    CHECK(hmr_malloc(0, 64, &p) == HMR_OK);
+    std::memset(p, 0xab, 64);
+    fake::memset_error = hipErrorOutOfMemory;
+    CHECK(hmr_memset_zero(ctx, p, 64) == HMR_OUT_OF_MEMORY);
+    CHECK_ERROR("hipMemsetAsync(ptr, 0, nbytes, ctx->stream): out of memory");
+    CHECK(fake::last_error == hipSuccess);
+    CHECK(fake::current_device == 1);
+    fake::memset_error = hipSuccess;
+    CHECK(hmr_memset_zero(ctx, p, 64) == HMR_OK);
+    const unsigned char zeros[64] = {};
+    CHECK(std::memcmp(p, zeros, 64) == 0);
+    CHECK(hmr_free(0, p) == HMR_OK);
+    CHECK(hmr_context_destroy(ctx) == HMR_OK);
+    create_and_destroy();
+}
+
 struct Mode {
     const char *name;
     void (*run)();
@@ -220,6 +284,10 @@ const Mode modes[] = {
     {"probe-failure-without-memory", probe_failure_without_memory},
     {"persistent-oom", persistent_oom},
     {"exception-without-memory", exception_without_memory},
+    {"probe-malloc-failure-then-retry", probe_malloc_failure_then_retry},
+    {"earlier-error-before-the-probe", earlier_error_before_the_probe},
+    {"malloc-failure", malloc_failure},
+    {"memset-failure", memset_failure},
 };
 
 }  // namespace

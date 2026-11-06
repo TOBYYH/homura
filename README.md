@@ -48,9 +48,11 @@ Implemented so far:
   batch norm statistics) at every step. Their state dicts are PyTorch's, so training resumes
   from a checkpoint written by either library.
 
-- The start of the ROCm backend, behind the `rocm` feature: building homura's ROCm layer and
-  querying devices (`Device::rocm_count`, `properties`, `mem_get_info`, `synchronize`).
-  Tensors can't be placed on ROCm devices yet.
+- The start of the ROCm backend, behind the `rocm` feature: building homura's ROCm layer,
+  querying devices (`Device::rocm_count`, `properties`, `mem_get_info`, `synchronize`) and
+  device memory from a caching allocator (`memory_stats`, `reset_peak_memory_stats`,
+  `empty_cache`, which the CPU reports too). Zero-filled tensors can be created on a ROCm device,
+  but no operation runs on them yet.
 
 Not available yet: tensors on GPUs (ROCm comes first), most neural network layers, autograd
 hooks, and in-place operations on views that require grad.

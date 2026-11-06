@@ -240,3 +240,147 @@ fn taking_the_cpu_lock_inside_a_rocm_lock_is_a_lock_order_violation() {
     exec(0, || ());
     crate::backend::cpu::exec(|| ());
 }
+
+/// The memory tests share rocm:0's allocator; they run one at a time so that each sees its own
+/// effect on the statistics and the cache.
+static MEMORY: Mutex<()> = Mutex::new(());
+
+fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn rocm_storage(nbytes: usize) -> crate::storage::Storage {
+    crate::storage::Storage::new(nbytes, crate::Device::Rocm(0))
+}
+
+fn read_back(s: &crate::storage::Storage) -> Vec<u8> {
+    let b = s.rocm_buffer();
+    let mut out = vec![0x5a; b.nbytes()];
+    b.context().copy_to_host(&mut out, b.ptr()).unwrap();
+    out
+}
+
+/// New storage reads as zero, also when its block is one that earlier data was written to.
+#[test]
+fn rocm_storage_is_zeroed_also_when_its_block_is_reused() {
+    let _lock = memory_lock();
+    let first = rocm_storage(4096);
+    let (ptr, size) = (first.rocm_buffer().ptr(), first.rocm_buffer().block_size());
+    assert_eq!(size, 4096);
+    assert_eq!(read_back(&first), vec![0; 4096]);
+    let b = first.rocm_buffer();
+    b.context().copy_from_host(b.ptr(), &[0xab; 4096]).unwrap();
+    assert_eq!(read_back(&first), vec![0xab; 4096]);
+    drop(first);
+    // 4000 bytes round to the same 4 KiB, which the freed block fits best.
+    let second = rocm_storage(4000);
+    assert_eq!(second.rocm_buffer().ptr(), ptr);
+    assert_eq!(read_back(&second), vec![0; 4000]);
+}
+
+#[test]
+fn zero_bytes_take_no_block() {
+    let _lock = memory_lock();
+    let before = memory_stats(0);
+    let s = rocm_storage(0);
+    assert_eq!((s.nbytes(), s.rocm_buffer().block_size()), (0, 0));
+    assert!(s.rocm_buffer().ptr().is_null());
+    assert_eq!(memory_stats(0), before);
+}
+
+/// When `hipMalloc` reports no memory, the cached segments are freed and the request is tried
+/// again.
+#[test]
+fn a_refused_segment_releases_the_cache_and_retries() {
+    let _lock = memory_lock();
+    empty_cache(0);
+    let base = memory_stats(0).reserved;
+    drop(rocm_storage(64 << 20));
+    assert_eq!(memory_stats(0).reserved, base + (64 << 20));
+    // 128 MiB don't fit the cached 64 MiB block: a new segment is needed, whose first hipMalloc
+    // fails. The cached segment is freed, and the second hipMalloc succeeds.
+    memory::inject_malloc_failures(1);
+    let s = rocm_storage(128 << 20);
+    assert_eq!(memory_stats(0).reserved, base + (128 << 20));
+    assert!(memory_stats(0).allocated >= 128 << 20);
+    drop(s);
+    empty_cache(0);
+    assert_eq!(memory_stats(0).reserved, base);
+}
+
+/// A request larger than the device is refused (not a panic from `try_new`), and leaves the
+/// device usable and the statistics as they were.
+#[test]
+fn a_request_larger_than_the_device_is_out_of_memory() {
+    let _lock = memory_lock();
+    let total = properties(0).total_memory as usize;
+    let before = memory_stats(0);
+    let r = crate::storage::Storage::try_new(2 * total, crate::Device::Rocm(0));
+    assert_eq!(
+        r.map(drop),
+        Err(crate::storage::AllocError::OutOfMemory {
+            device: crate::Device::Rocm(0),
+            requested: 2 * total
+        })
+    );
+    let after = memory_stats(0);
+    assert_eq!(
+        (after.allocated, after.peak),
+        (before.allocated, before.peak)
+    );
+    assert_eq!(read_back(&rocm_storage(512)), vec![0; 512]);
+    // The refused hipMalloc doesn't linger as this thread's last HIP error, which the probe of a
+    // new context (a kernel launch, checked with hipGetLastError) would otherwise report.
+    let _ = crate::storage::Storage::try_new(2 * total, crate::Device::Rocm(0));
+    let slot: TestSlot = Mutex::new(None);
+    let ctx = create_in(&slot, 0).unwrap();
+    ctx.synchronize();
+}
+
+/// Queuing the zeroing of a new buffer can run out of memory too: the allocation reports it like
+/// any other, the block goes back to the cache, and the next allocation works (review round 122,
+/// R146).
+#[test]
+fn a_zeroing_that_runs_out_of_memory_is_out_of_memory() {
+    let _lock = memory_lock();
+    drop(rocm_storage(8192));
+    let before = memory_stats(0);
+    memory::inject_memset_failures(1);
+    let r = crate::storage::Storage::try_new(8192, crate::Device::Rocm(0));
+    assert_eq!(
+        r.map(drop),
+        Err(crate::storage::AllocError::OutOfMemory {
+            device: crate::Device::Rocm(0),
+            requested: 8192
+        })
+    );
+    assert_eq!(memory_stats(0).allocated, before.allocated);
+    assert_eq!(memory_stats(0).reserved, before.reserved);
+    let s = rocm_storage(8192);
+    assert_eq!(memory_stats(0).reserved, before.reserved);
+    assert_eq!(read_back(&s), vec![0; 8192]);
+}
+
+/// The injected failures of `alloc_faults` apply to real ROCm allocations too.
+#[test]
+fn injected_allocation_failures_reach_rocm() {
+    let _lock = memory_lock();
+    crate::storage::alloc_faults::fail_nth(crate::Device::Rocm(0), 2);
+    let first = crate::storage::Storage::try_new(512, crate::Device::Rocm(0));
+    let second = crate::storage::Storage::try_new(512, crate::Device::Rocm(0));
+    assert!(first.is_ok());
+    assert!(matches!(
+        second,
+        Err(crate::storage::AllocError::OutOfMemory { requested: 512, .. })
+    ));
+}
+
+/// Allocating zeroes the memory inside the device's execution lock, which may already be held
+/// by this thread (reentrant), and after the CPU lock (the lock order).
+#[test]
+fn allocation_follows_the_lock_order() {
+    let _lock = memory_lock();
+    let a = exec(0, || rocm_storage(512));
+    let b = crate::backend::cpu::exec(|| rocm_storage(512));
+    assert_eq!((read_back(&a), read_back(&b)), (vec![0; 512], vec![0; 512]));
+}

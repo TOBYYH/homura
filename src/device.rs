@@ -95,6 +95,75 @@ impl Device {
         #[cfg(not(feature = "rocm"))]
         without_rocm(i)
     }
+
+    /// The memory statistics of this device: bytes allocated to tensors (and homura's temporary
+    /// buffers), bytes homura holds from the device, and the peak of the allocated bytes since
+    /// the start or the last [`reset_peak_memory_stats`](Device::reset_peak_memory_stats).
+    ///
+    /// On a ROCm device, allocations are rounded up (to 512 bytes, or 2 MiB above 1 MiB) and
+    /// freed memory stays reserved in homura's cache for reuse until
+    /// [`empty_cache`](Device::empty_cache). On the CPU, every buffer homura allocates counts,
+    /// unrounded, and is returned when freed (reserved equals allocated); data mapped from a file
+    /// doesn't count. The meta device has no memory: all zero.
+    ///
+    /// ```
+    /// # use homura::Device;
+    /// let x = homura::zeros([1024, 1024]);
+    /// let stats = Device::Cpu.memory_stats();
+    /// println!("{} MiB allocated, peak {} MiB", stats.allocated >> 20, stats.peak >> 20);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics for a ROCm device that doesn't exist, and if homura was built without the `rocm`
+    /// feature.
+    #[track_caller]
+    pub fn memory_stats(self) -> MemoryStats {
+        match self {
+            Device::Cpu => crate::storage::cpu_memory_counters().stats(),
+            Device::Meta => MemoryStats::default(),
+            #[cfg(feature = "rocm")]
+            Device::Rocm(i) => crate::backend::rocm::memory_stats(i),
+            #[cfg(not(feature = "rocm"))]
+            Device::Rocm(i) => without_rocm(i),
+        }
+    }
+
+    /// Resets the peak of [`memory_stats`](Device::memory_stats) to the bytes allocated now.
+    ///
+    /// # Panics
+    ///
+    /// Like [`memory_stats`](Device::memory_stats).
+    #[track_caller]
+    pub fn reset_peak_memory_stats(self) {
+        match self {
+            Device::Cpu => crate::storage::cpu_memory_counters().reset_peak(),
+            Device::Meta => {}
+            #[cfg(feature = "rocm")]
+            Device::Rocm(i) => crate::backend::rocm::reset_peak_memory_stats(i),
+            #[cfg(not(feature = "rocm"))]
+            Device::Rocm(i) => without_rocm(i),
+        }
+    }
+
+    /// Returns the memory that homura's cache holds on a ROCm device but no tensor uses to the
+    /// device, after waiting for its queued work, so that other processes (or libraries) can use
+    /// it. Memory still partly in use stays. A no-op on the CPU and meta devices, which have no
+    /// cache.
+    ///
+    /// # Panics
+    ///
+    /// Like [`memory_stats`](Device::memory_stats), and if the device fails while waiting or
+    /// freeing.
+    #[track_caller]
+    pub fn empty_cache(self) {
+        if let Device::Rocm(i) = self {
+            #[cfg(feature = "rocm")]
+            crate::backend::rocm::empty_cache(i);
+            #[cfg(not(feature = "rocm"))]
+            without_rocm(i);
+        }
+    }
 }
 
 /// Panics for an operation on a ROCm device in a build without the `rocm` feature.
@@ -119,6 +188,18 @@ pub struct DeviceProperties {
     pub warp_size: u32,
     /// Device memory in bytes.
     pub total_memory: u64,
+}
+
+/// Memory statistics in bytes, from [`Device::memory_stats`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+pub struct MemoryStats {
+    /// Bytes allocated to tensors and homura's temporary buffers.
+    pub allocated: u64,
+    /// Bytes homura holds from the device: allocated, or cached for reuse.
+    pub reserved: u64,
+    /// The largest `allocated` since the start or the last reset.
+    pub peak: u64,
 }
 
 /// Free and total device memory in bytes, from [`Device::mem_get_info`].

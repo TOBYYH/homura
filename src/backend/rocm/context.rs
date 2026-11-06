@@ -29,8 +29,45 @@ impl Context {
     /// Waits until all work queued on the stream has finished.
     #[track_caller]
     pub fn synchronize(&self) {
+        expect(self.try_synchronize());
+    }
+
+    /// Like [`synchronize`](Context::synchronize), reporting a failure instead of panicking.
+    pub fn try_synchronize(&self) -> Result<(), Failure> {
         // SAFETY: `raw` is a live context.
-        expect(call(unsafe { ffi::hmr_context_synchronize(self.raw) }));
+        call(unsafe { ffi::hmr_context_synchronize(self.raw) })
+    }
+
+    /// Queues the zeroing of `nbytes` of device memory at `ptr` on the stream. Call it inside
+    /// the device's execution lock.
+    pub(super) fn memset_zero(&self, ptr: *mut u8, nbytes: usize) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context, and the caller passes device memory of this device
+        // that the bytes fit in.
+        call(unsafe { ffi::hmr_memset_zero(self.raw, ptr.cast(), nbytes as u64) })
+    }
+
+    /// Copies `dst.len()` bytes of device memory at `src` into `dst`, after the work queued
+    /// before.
+    #[cfg(test)]
+    pub(super) fn copy_to_host(&self, dst: &mut [u8], src: *const u8) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context; `src` holds `dst.len()` bytes of this device.
+        call(unsafe {
+            ffi::hmr_copy_to_host(
+                self.raw,
+                dst.as_mut_ptr().cast(),
+                src.cast(),
+                dst.len() as u64,
+            )
+        })
+    }
+
+    /// Copies `src` into device memory at `dst`, after the work queued before.
+    #[cfg(test)]
+    pub(super) fn copy_from_host(&self, dst: *mut u8, src: &[u8]) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context; `dst` holds `src.len()` bytes of this device.
+        call(unsafe {
+            ffi::hmr_copy_from_host(self.raw, dst.cast(), src.as_ptr().cast(), src.len() as u64)
+        })
     }
 
     #[cfg(test)]

@@ -6,7 +6,9 @@
 //! 2. the CPU execution lock (`cpu::exec`);
 //! 3. one ROCm device's execution lock (`rocm::exec`), never two at a time: copies between ROCm
 //!    devices go through host memory, holding one device's lock and then the other's;
-//! 4. allocator locks, which are leaves: nothing is locked while holding one.
+//! 4. allocator locks: nothing but the memory counters is locked while holding one;
+//! 5. the memory counters of a device (`storage::MemoryCounters`), leaves held only for their
+//!    arithmetic.
 //!
 //! Every acquisition (not the reentrant ones) calls [`acquire`] first, which panics in debug
 //! builds if the calling thread holds a lock that comes later in the order, before the
@@ -22,8 +24,9 @@ pub(crate) enum Rank {
     CpuExec,
     #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
     RocmExec(u32),
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(feature = "rocm", test)), allow(dead_code))]
     Allocator,
+    MemoryCounters,
 }
 
 impl Rank {
@@ -34,6 +37,7 @@ impl Rank {
             Rank::CpuExec => 1,
             Rank::RocmExec(_) => 2,
             Rank::Allocator => 3,
+            Rank::MemoryCounters => 4,
         }
     }
 }
@@ -110,6 +114,10 @@ mod tests {
         assert!(violation(RocmExec(0), RocmExec(1)));
         assert!(violation(Allocator, Allocator));
         assert!(violation(Allocator, CpuExec));
+        assert!(!violation(Allocator, MemoryCounters));
+        assert!(!violation(CpuExec, MemoryCounters));
+        assert!(violation(MemoryCounters, Allocator));
+        assert!(violation(MemoryCounters, MemoryCounters));
         // A failed acquisition leaves nothing behind.
         HELD.with_borrow(|held| assert!(held.is_empty()));
     }

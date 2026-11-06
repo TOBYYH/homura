@@ -11,11 +11,6 @@
 #error "build.rs defines HMR_OFFLOAD_ARCHS as the list of target architectures"
 #endif
 
-struct hmr_context {
-    int device;
-    hipStream_t stream;
-};
-
 namespace hmr {
 namespace {
 
@@ -35,7 +30,12 @@ thread_local int live_streams = 0;
 // only goes down if HIP did destroy it (review round 119, R139).
 hipError_t destroy_stream(hipStream_t stream) noexcept {
     hipError_t e = hipStreamDestroy(stream);
-    if (e == hipSuccess) --live_streams;
+    if (e == hipSuccess) {
+        --live_streams;
+    } else {
+        // Like hip_fail: the failure doesn't stay as the thread's last HIP error.
+        (void)hipGetLastError();
+    }
     return e;
 }
 
@@ -110,6 +110,9 @@ hmr_status probe(hipStream_t stream) {
     uint32_t *d = nullptr;
     HMR_HIP(hipMalloc(&d, sizeof(uint32_t)));
     uint32_t value = 0;
+    // The launch is checked with hipGetLastError, which must report this launch only: nothing
+    // is left from before (review round 122, R145).
+    (void)hipGetLastError();
     hipError_t e = hipSuccess;
     hipLaunchKernelGGL(probe_kernel, dim3(1), dim3(1), 0, stream, d);
     e = hipGetLastError();
@@ -144,6 +147,10 @@ hmr_status hip_status(hipError_t error) {
 }
 
 hmr_status hip_fail(hipError_t error, const char *call) noexcept {
+    // HIP also keeps a failure as the calling thread's last error, which a later hipGetLastError
+    // (the check of a kernel launch, ours or the caller's) would report as its own. The failure
+    // is reported here instead (review round 122, R145).
+    (void)hipGetLastError();
     try {
         return fail(hip_status(error), std::string(call) + ": " + hipGetErrorString(error));
     } catch (...) {

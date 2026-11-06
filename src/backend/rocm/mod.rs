@@ -7,11 +7,16 @@
 mod context;
 #[allow(clippy::all, unsafe_op_in_unsafe_fn)]
 mod ffi;
+mod memory;
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
 
 pub(crate) use context::{context, exec};
+pub(crate) use memory::{
+    DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
+    reset_peak_memory_stats,
+};
 
 use crate::device::{DeviceProperties, MemInfo};
 
@@ -19,7 +24,6 @@ use crate::device::{DeviceProperties, MemInfo};
 #[derive(Debug)]
 pub(crate) struct Failure {
     /// The `HMR_*` status; distinguishes running out of memory from other failures.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub status: ffi::hmr_status,
     pub message: String,
 }

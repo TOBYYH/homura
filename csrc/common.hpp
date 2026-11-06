@@ -9,6 +9,12 @@
 
 #include "homura_rocm.h"
 
+// A device's execution context (hmr_context_t): its stream.
+struct hmr_context {
+    int device;
+    hipStream_t stream;
+};
+
 namespace hmr {
 
 // Records `message` as the calling thread's last error and returns `status`.
@@ -24,9 +30,10 @@ const char *last_error_text() noexcept;
 // The status for a failed HIP call: out of memory or a generic HIP error.
 hmr_status hip_status(hipError_t error);
 
-// Fails with `error`, the result of the HIP call `call` (its text). Doesn't throw: if the message
-// can't be stored, the status stays the HIP error's, with HIP's own (static) text for it
-// (review round 120, R143).
+// Fails with `error`, the result of the HIP call `call` (its text), and clears the calling
+// thread's last HIP error, which holds the same failure (review round 122, R145). Doesn't throw:
+// if the message can't be stored, the status stays the HIP error's, with HIP's own (static) text
+// for it (review round 120, R143).
 hmr_status hip_fail(hipError_t error, const char *call) noexcept;
 
 // Fails with the HIP error of `expr` (text of the call) unless it is hipSuccess.

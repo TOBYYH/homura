@@ -219,8 +219,14 @@
 //!
 //! The CPU reference backend accumulates floating point reductions and matrix inner products
 //! in f64. This differs from some PyTorch kernels: extreme cancellation can change finite,
-//! infinity and NaN results, even for finite inputs. Scaled matrix products also use rules
-//! independent of size and layout; see [`Tensor::addmm`]. The sums at repeated positions of
+//! infinity and NaN results, even for finite inputs. The ROCm backend accumulates reductions
+//! and softmax in f64 too, where PyTorch's GPU kernels use f32. Its sums, means, products,
+//! variances and standard deviations differ from the CPU's only in the order of the additions
+//! and multiplications; softmax and log-softmax also take `exp` and `log` from the GPU's math
+//! library, which may differ from the CPU's in the last place. Either way the order depends on
+//! the shape and strides alone, so the same reduction of the same tensor gives the same bits
+//! every time it runs. Scaled matrix products also use rules independent of size and layout;
+//! see [`Tensor::addmm`]. The sums at repeated positions of
 //! advanced indexing's backward pass and of [`Tensor::index_put_accumulate`] are computed the same
 //! way, so they can differ from PyTorch's, which round after each addition, by more than the
 //! last bit.

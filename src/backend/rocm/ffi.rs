@@ -60,6 +60,13 @@ pub const HMR_FUSED_LERP: i32 = 1;
 pub const HMR_FUSED_ADDCMUL: i32 = 2;
 pub const HMR_FUSED_ADDCDIV: i32 = 3;
 pub const HMR_RANDOM_INT_TILE: i32 = 256;
+pub const HMR_REDUCE_SUM: i32 = 0;
+pub const HMR_REDUCE_PROD: i32 = 1;
+pub const HMR_REDUCE_MEAN: i32 = 2;
+pub const HMR_REDUCE_MAX: i32 = 3;
+pub const HMR_REDUCE_MIN: i32 = 4;
+pub const HMR_REDUCE_ALL: i32 = 5;
+pub const HMR_REDUCE_ANY: i32 = 6;
 pub type hmr_status = i32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -219,12 +226,88 @@ unsafe extern "C" {
         threshold: u64,
         workspace: *mut ::core::ffi::c_void,
     ) -> hmr_status;
+    pub fn hmr_reduce_workspace(
+        kept: *const hmr_tensor_desc,
+        red: *const hmr_tensor_desc,
+        var: i32,
+        bytes: *mut i64,
+    ) -> hmr_status;
+    pub fn hmr_reduce(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        kept: *const hmr_tensor_desc,
+        red: *const hmr_tensor_desc,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_var(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        kept: *const hmr_tensor_desc,
+        red: *const hmr_tensor_desc,
+        correction: f64,
+        take_sqrt: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_arg_reduce(
+        ctx: hmr_context_t,
+        values: *const hmr_tensor_desc,
+        indices: *const hmr_tensor_desc,
+        kept: *const hmr_tensor_desc,
+        red: *const hmr_tensor_desc,
+        is_max: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_softmax_workspace(
+        src_rows: *const hmr_tensor_desc,
+        n: i64,
+        src_stride: i64,
+        bytes: *mut i64,
+    ) -> hmr_status;
+    pub fn hmr_softmax(
+        ctx: hmr_context_t,
+        out_rows: *const hmr_tensor_desc,
+        src_rows: *const hmr_tensor_desc,
+        n: i64,
+        out_stride: i64,
+        src_stride: i64,
+        log: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_exclusive_cumprod(
+        ctx: hmr_context_t,
+        out_lines: *const hmr_tensor_desc,
+        src_lines: *const hmr_tensor_desc,
+        n: i64,
+        out_stride: i64,
+        src_stride: i64,
+        reverse: i32,
+    ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);
     pub fn hmr_test_fail_stream_create(n: i32);
     pub fn hmr_test_fail_after_probe(n: i32);
     pub fn hmr_test_fail_properties(n: i32);
     pub fn hmr_test_fail_data(n: i32, out_of_memory: i32);
+    pub fn hmr_test_reduce_plan(
+        kept: *const hmr_tensor_desc,
+        red: *const hmr_tensor_desc,
+        group: *mut i64,
+        splits: *mut i64,
+        chunk: *mut i64,
+    ) -> hmr_status;
+    pub fn hmr_test_softmax_plan(
+        src_rows: *const hmr_tensor_desc,
+        n: i64,
+        src_stride: i64,
+        split: *mut i32,
+        group: *mut i32,
+        cache: *mut i32,
+    ) -> hmr_status;
     pub fn hmr_test_live_streams() -> i32;
     pub fn hmr_test_current_device(device: *mut i32) -> hmr_status;
     pub fn hmr_test_set_current_device(device: i32) -> hmr_status;

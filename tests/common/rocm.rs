@@ -479,6 +479,15 @@ pub fn check_transcendental_in(
     k: f64,
     u_comp: f64,
 ) -> Result<UlpStats, String> {
+    let extra: Vec<f64> = m.iter().map(|&m| k * u_comp * m).collect();
+    check_within(gpu, cpu, &extra).map_err(|e| format!("{e} (k = {k}, u_comp = {u_comp:e})"))
+}
+
+/// The general form of the tolerance classes of the M4 plan (M4.12): both results rounded to
+/// the output dtype, `|gpu - cpu| <= extra[i] + ulp_out(max(|gpu|, |cpu|))`, where `extra[i]` is
+/// the class's bound before the output's rounding at element `i`. A NaN must meet a NaN and an
+/// infinity the same infinity. Returns the statistics, or the first violation.
+pub fn check_within(gpu: &Tensor, cpu: &Tensor, extra: &[f64]) -> Result<UlpStats, String> {
     if gpu.device() != GPU || gpu.shape() != cpu.shape() || gpu.dtype() != cpu.dtype() {
         return Err(format!(
             "gpu {:?} {} {} vs cpu {:?} {}",
@@ -491,8 +500,7 @@ pub fn check_transcendental_in(
     }
     let dtype = cpu.dtype();
     let (g, c) = (floats(gpu), floats(cpu));
-    assert_eq!(m.len(), c.len());
-    let u = u_comp;
+    assert_eq!(extra.len(), c.len());
     let mut stats = UlpStats {
         elements: c.len(),
         ..UlpStats::default()
@@ -510,12 +518,16 @@ pub fn check_transcendental_in(
         if x == y {
             continue;
         }
-        let bound = k * u * m[i] + ulp(dtype, x.abs().max(y.abs()));
-        if (x - y).abs() > bound {
+        let bound = extra[i] + ulp(dtype, x.abs().max(y.abs()));
+        // A NaN bound rejects too.
+        let within = matches!(
+            (x - y).abs().partial_cmp(&bound),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        );
+        if !within {
             return Err(format!(
-                "element {i}: gpu {x:e}, cpu {y:e}: |diff| {:e} > bound {bound:e} (m = {:e})",
-                (x - y).abs(),
-                m[i]
+                "element {i}: gpu {x:e}, cpu {y:e}: |diff| {:e} > bound {bound:e}",
+                (x - y).abs()
             ));
         }
         stats.differ += 1;

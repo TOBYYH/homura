@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
 #include "common.hpp"
 
@@ -97,6 +98,24 @@ hmr_status check_operands(const Operands<N> &ops, int64_t &n, bool negative_inpu
     }
     return HMR_OK;
 }
+
+template <int V>
+struct Tag {
+    static constexpr int v = V;
+};
+
+// Calls body(Tag<V>{}) for the V of `Vs` equal to `value`; false if there is none.
+template <int... Vs, class B>
+bool select(int value, std::integer_sequence<int, Vs...>, B &&body) {
+    bool result = false;
+    (void)((value == Vs ? (result = body(Tag<Vs>{}), true) : false) || ...);
+    return result;
+}
+
+using AllDtypes = std::integer_sequence<int, HMR_BOOL, HMR_U8, HMR_I8, HMR_I16, HMR_I32, HMR_I64,
+                                        HMR_F16, HMR_BF16, HMR_F32, HMR_F64>;
+using IntDtypes = std::integer_sequence<int, HMR_U8, HMR_I8, HMR_I16, HMR_I32, HMR_I64>;
+using FloatDtypes = std::integer_sequence<int, HMR_F16, HMR_BF16, HMR_F32, HMR_F64>;
 
 // Queues the kernels that `body` launches on the context's stream, on its device, and checks
 // the launches. `body` returns false (and queues nothing) for an op the dtypes don't support.

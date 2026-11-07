@@ -266,6 +266,62 @@ hmr_status hmr_random_int(hmr_context_t ctx, const hmr_tensor_desc *out, uint64_
                           uint64_t offset, uint64_t blocks, int64_t low, uint64_t range,
                           uint64_t threshold, void *workspace);
 
+/*
+ * Reductions (csrc/reduce.hip, the plans in csrc/reduce.hpp). A reduction is described by:
+ * - `kept`: the kept dimensions with the source's strides, data, offset and dtype;
+ * - `red`: the reduced dimensions with the source's strides (and dtype);
+ * - the outputs: contiguous with the kept sizes.
+ * The reduced elements of an output are folded in an order that depends only on these sizes
+ * and strides. Some plans need device memory: hmr_reduce_workspace gives its size in bytes for
+ * hmr_reduce and hmr_arg_reduce (var = 0) or hmr_var (var = 1), and `workspace` must hold at
+ * least that many bytes (it may be NULL when it is 0).
+ */
+#define HMR_REDUCE_SUM 0
+#define HMR_REDUCE_PROD 1
+#define HMR_REDUCE_MEAN 2
+#define HMR_REDUCE_MAX 3
+#define HMR_REDUCE_MIN 4
+#define HMR_REDUCE_ALL 5
+#define HMR_REDUCE_ANY 6
+
+hmr_status hmr_reduce_workspace(const hmr_tensor_desc *kept, const hmr_tensor_desc *red,
+                                int32_t var, int64_t *bytes);
+
+/* cpu::reduce: floats sum, multiply and average in f64; integers and bools sum and multiply
+ * into I64 (wrapping); max and min keep the dtype (the first NaN wins, then the first of equal
+ * values); all and any give BOOL (U8 for U8). Max and min need a nonempty reduction. */
+hmr_status hmr_reduce(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
+                      const hmr_tensor_desc *kept, const hmr_tensor_desc *red, void *workspace,
+                      int64_t workspace_bytes);
+
+/* cpu::var: the variance of float elements in f64 with two passes, divided by
+ * max(0, n - correction) (NaN for n = 0), and its square root with take_sqrt. */
+hmr_status hmr_var(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *kept,
+                   const hmr_tensor_desc *red, double correction, int32_t take_sqrt,
+                   void *workspace, int64_t workspace_bytes);
+
+/* cpu::arg_reduce: the index (I64) along the one reduced dimension of the maximum (or minimum)
+ * and, if `values` is not NULL, the value; the first NaN wins, then the first of equal values. */
+hmr_status hmr_arg_reduce(hmr_context_t ctx, const hmr_tensor_desc *values,
+                          const hmr_tensor_desc *indices, const hmr_tensor_desc *kept,
+                          const hmr_tensor_desc *red, int32_t is_max, void *workspace,
+                          int64_t workspace_bytes);
+
+/* cpu::softmax along rows of `n` elements: `out_rows` and `src_rows` describe the other
+ * dimensions (same sizes), the row elements are `out_stride` / `src_stride` apart. Few long rows
+ * need a workspace of hmr_softmax_workspace bytes (NULL when it is 0). */
+hmr_status hmr_softmax_workspace(const hmr_tensor_desc *src_rows, int64_t n, int64_t src_stride,
+                                 int64_t *bytes);
+hmr_status hmr_softmax(hmr_context_t ctx, const hmr_tensor_desc *out_rows,
+                       const hmr_tensor_desc *src_rows, int64_t n, int64_t out_stride,
+                       int64_t src_stride, int32_t log, void *workspace,
+                       int64_t workspace_bytes);
+
+/* cpu::exclusive_cumprod along lines of `n` elements, described as for hmr_softmax. */
+hmr_status hmr_exclusive_cumprod(hmr_context_t ctx, const hmr_tensor_desc *out_lines,
+                                 const hmr_tensor_desc *src_lines, int64_t n, int64_t out_stride,
+                                 int64_t src_stride, int32_t reverse);
+
 /* The architectures this library was built for, separated by ';' (HOMURA_OFFLOAD_ARCH). */
 const char *hmr_built_archs(void);
 
@@ -298,9 +354,14 @@ void hmr_abi_check(hmr_abi_info *out);
  * hmr_test_fail_properties(n): the calling thread's next n hmr_device_properties_get calls fail
  * with HMR_HIP_ERROR, to test that a context created before such a failure is destroyed.
  * hmr_test_fail_data(n, out_of_memory): the calling thread's next n data operations (hmr_copy,
- * hmr_fill, hmr_copy_device, hmr_copy_to_host, hmr_copy_from_host, and the kernels and samplers
- * above) fail before queueing any work, as their HIP call would: with hipErrorOutOfMemory if
- * out_of_memory is nonzero, else with hipErrorInvalidHandle (review round 124, R148 and R149).
+ * hmr_fill, hmr_copy_device, hmr_copy_to_host, hmr_copy_from_host, and the kernels, samplers
+ * and reductions above) fail before queueing any work, as their HIP call would: with
+ * hipErrorOutOfMemory if out_of_memory is nonzero, else with hipErrorInvalidHandle (review round
+ * 124, R148 and R149).
+ * hmr_test_reduce_plan(): the plan hmr_reduce chooses for a reduction (csrc/reduce.hpp): the
+ * lanes per output, the number of chunks of the reduced range and their size, to test that the
+ * tests reach every path. hmr_test_softmax_plan(): the same for hmr_softmax: whether it splits
+ * its rows, the lanes per row and the elements a lane keeps in registers (0: none).
  * hmr_test_live_streams(): the number of streams the calling thread created and hasn't destroyed.
  * hmr_test_current_device(): the calling thread's current HIP device (hipGetDevice).
  * hmr_test_set_current_device(): hipSetDevice for the calling thread.
@@ -310,6 +371,10 @@ void hmr_test_fail_stream_create(int32_t n);
 void hmr_test_fail_after_probe(int32_t n);
 void hmr_test_fail_properties(int32_t n);
 void hmr_test_fail_data(int32_t n, int32_t out_of_memory);
+hmr_status hmr_test_reduce_plan(const hmr_tensor_desc *kept, const hmr_tensor_desc *red,
+                                int64_t *group, int64_t *splits, int64_t *chunk);
+hmr_status hmr_test_softmax_plan(const hmr_tensor_desc *src_rows, int64_t n, int64_t src_stride,
+                                 int32_t *split, int32_t *group, int32_t *cache);
 int32_t hmr_test_live_streams(void);
 hmr_status hmr_test_current_device(int32_t *device);
 hmr_status hmr_test_set_current_device(int32_t device);

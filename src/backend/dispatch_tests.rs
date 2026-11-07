@@ -23,7 +23,7 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 16] = [
+const IMPLEMENTED: [&str; 21] = [
     "write_host",
     "read_host",
     "copy",
@@ -40,6 +40,11 @@ const IMPLEMENTED: [&str; 16] = [
     "uniform",
     "normal",
     "randint",
+    "reduce",
+    "var",
+    "arg_reduce",
+    "softmax",
+    "exclusive_cumprod",
 ];
 
 /// Asserts that `f` panics in the ROCm arm of the dispatch layer, in `kernel`.
@@ -139,6 +144,9 @@ fn reductions_and_matmul() {
     reaches("arg_reduce", || gpu(&[2, 3]).argmax_dim(1, false));
     reaches("var", || gpu(&[2, 3]).var(1));
     reaches("softmax", || gpu(&[2, 3]).softmax(1));
+    reaches("exclusive_cumprod", || {
+        crate::ops::exclusive_cumprod(&gpu(&[2, 3]), 1, false)
+    });
     reaches("matmul", || gpu(&[2, 3]).matmul(&gpu(&[3, 4])));
 }
 

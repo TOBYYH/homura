@@ -40,8 +40,16 @@ All notable changes to this project are documented in this file. The format is b
   parameters give the CPU's (and PyTorch's) bits, with the coefficient checks of the CPU.
 - Random sampling on ROCm GPUs runs there with the same generator: `rand`, `uniform_`,
   `randint` and `dropout` give the CPU's samples bit for bit for the same seed, also when calls
-  on both devices alternate; `randn` and `normal_` use the GPU's log, cos and sin. Reductions,
-  matrix products, indexing, pooling and convolutions don't run on the GPU yet.
+  on both devices alternate; `randn` and `normal_` use the GPU's log, cos and sin.
+- Reductions on ROCm GPUs: `sum`, `mean`, `prod`, `max`, `min`, `all`, `any`, `var`, `std`
+  (over all elements and over dimensions), the arg reductions, `max_dim` / `min_dim`,
+  `softmax` and `log_softmax`, and the gradients built from them (except those of `max_dim` and
+  `min_dim`, which scatter). Integer sums and products, `all`, `any`, `max`, `min` and the
+  indices give the CPU's bits (the first of equal values, or the first NaN, wins). Float sums,
+  products, variances and softmax accumulate in f64 like the CPU's, where PyTorch's GPU kernels
+  use f32, in an order that depends only on the shape and strides: the same bits on every run,
+  and the CPU's up to that order (and the GPU's exp and log in softmax). Matrix products,
+  indexing, pooling and convolutions don't run on the GPU yet.
 - `Tensor::try_to`, `try_zeros_with`, `try_ones_with` and `try_full_with` return
   `Error::OutOfMemory` (`OutOfMemoryError`: the device, the requested bytes and a message like
   PyTorch's) when a device refuses memory, including the staging of a transfer and a GPU's first

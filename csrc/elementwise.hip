@@ -109,11 +109,6 @@ __device__ inline double erf_f64(double x) {
 __device__ inline float m_erf(float x) { return static_cast<float>(erf_f64(x)); }
 __device__ inline double m_erf(double x) { return erf_f64(x); }
 
-template <int V>
-struct Tag {
-    static constexpr int v = V;
-};
-
 template <int>
 constexpr bool kNever = false;
 
@@ -537,19 +532,6 @@ __global__ void triangle_kernel(Operands<2> ops, int64_t n, int64_t diagonal, in
             keep ? static_cast<const T *>(ops.d[1].data)[o[1]] : T{};
     }
 }
-
-// Calls body(Tag<V>{}) for the V of `Vs` equal to `value`; false if there is none.
-template <int... Vs, class B>
-bool select(int value, std::integer_sequence<int, Vs...>, B &&body) {
-    bool result = false;
-    (void)((value == Vs ? (result = body(Tag<Vs>{}), true) : false) || ...);
-    return result;
-}
-
-using AllDtypes = std::integer_sequence<int, HMR_BOOL, HMR_U8, HMR_I8, HMR_I16, HMR_I32, HMR_I64,
-                                        HMR_F16, HMR_BF16, HMR_F32, HMR_F64>;
-using IntDtypes = std::integer_sequence<int, HMR_U8, HMR_I8, HMR_I16, HMR_I32, HMR_I64>;
-using FloatDtypes = std::integer_sequence<int, HMR_F16, HMR_BF16, HMR_F32, HMR_F64>;
 
 // The unsigned type of an element size, for kernels that only move elements.
 template <int SIZE>

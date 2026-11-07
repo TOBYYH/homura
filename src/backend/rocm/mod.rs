@@ -11,6 +11,7 @@ mod elementwise;
 mod ffi;
 mod memory;
 pub(crate) mod random;
+mod reduce;
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -22,6 +23,7 @@ pub(crate) use memory::{
     DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
     reset_peak_memory_stats,
 };
+pub(crate) use reduce::{arg_reduce, exclusive_cumprod, reduce, softmax, var};
 
 use crate::device::{DeviceProperties, MemInfo};
 

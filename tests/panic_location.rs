@@ -300,6 +300,8 @@ fn rocm_kernel_failures() {
     let half = homura::ones_with([6], (DType::F16, gpu));
     let cond = homura::ones_with([6], (DType::Bool, gpu));
     let m = homura::ones_with([2, 3], gpu);
+    // Reduced in chunks, with a workspace.
+    let wide = homura::ones_with([1, 70000], gpu);
     let p = nn::Parameter::new(homura::ones_with([6], gpu));
     p.set_grad(Some(homura::ones_with([6], gpu)));
     let mut sgd = Sgd::new([p.clone()], 0.1);
@@ -317,6 +319,13 @@ fn rocm_kernel_failures() {
         at!(homura::randn_with([5], failing_gpu(oom)));
         at!(homura::randint_with(0, 3, [5], failing_gpu(oom)));
         at!(homura::randint_with(0, 4, [5], failing_gpu(oom)));
+        at!(failing(&m, oom).sum_dim(1, false));
+        at!(failing(&wide, oom).sum());
+        at!(failing(&m, oom).var_dim(1, 1, false));
+        at!(failing(&m, oom).max_dim(1, false));
+        at!(failing(&m, oom).argmin());
+        at!(failing(&m, oom).softmax(1));
+        at!(failing(&m, oom).log_softmax(0));
     }
     // More dimensions than the kernels take.
     let deep = homura::zeros_with(vec![2usize; 26], (DType::F32, gpu))
@@ -325,6 +334,9 @@ fn rocm_kernel_failures() {
     at!(deep.add(&deep));
     at!(deep.flip([0]));
     at!(deep.triu(0));
+    at!(deep.sum());
+    at!(deep.var(1));
+    at!(deep.max());
     drop(deep);
     // SAFETY: a testing hook without preconditions.
     unsafe { hmr_test_fail_data(0, 0) };

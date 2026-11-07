@@ -819,3 +819,132 @@ fn in_place_elementwise_versions_match_the_cpu() {
     assert_eq!(t.data().storage.version(), v0);
     assert_eq!(t.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 }
+
+/// The shapes of `PLAN_SHAPES` in `tests/rocm_reduce.rs` reach the plans they are meant to:
+/// lanes per output, chunks, and grids of more than one round (65536 blocks).
+#[test]
+fn reduction_plans_cover_every_path() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let rounds = |shape: &[usize], group: i64, dims: &[i64]| {
+        let nout: usize = shape
+            .iter()
+            .enumerate()
+            .filter(|(d, _)| !dims.contains(&(*d as i64)))
+            .map(|(_, &n)| n)
+            .product();
+        nout.div_ceil(256 / group as usize) > 1 << 16
+    };
+    // (shape, reduced dimensions, lanes per output, chunks, more than one round of the grid)
+    type Case = (&'static [usize], &'static [i64], i64, i64, bool);
+    let cases: [Case; 11] = [
+        (&[300, 512], &[1], 256, 1, false),
+        (&[4, 100000], &[1], 256, 24, false),
+        (&[9, 2, 3000], &[0, 2], 256, 6, false),
+        (&[5000, 100], &[1], 32, 1, false),
+        (&[64, 3, 100], &[0, 2], 32, 12, false),
+        (&[200000, 2], &[1], 1, 1, false),
+        (&[100000, 3], &[0], 1, 4000, false),
+        (&[7, 9, 11], &[0, 2], 1, 4, false),
+        (&[70000, 256], &[1], 256, 1, true),
+        (&[(1 << 24) + 1000, 2], &[1], 1, 1, true),
+        (&[5, 1], &[1], 1, 1, false),
+    ];
+    for (shape, dims, group, splits, many_rounds) in cases {
+        let t = crate::Tensor::empty_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
+        let mask: Vec<bool> = (0..shape.len())
+            .map(|d| dims.contains(&(d as i64)))
+            .collect();
+        let r = super::reduce::describe("test", &t.data(), &mask).expect("outputs");
+        let (g, s, chunk) = super::reduce::plan(&r);
+        assert_eq!((g, s), (group, splits), "{shape:?} {dims:?}");
+        let nred: usize = shape
+            .iter()
+            .enumerate()
+            .filter(|(d, _)| dims.contains(&(*d as i64)))
+            .map(|(_, &n)| n)
+            .product();
+        assert!(
+            chunk * s >= nred as i64 && chunk * (s - 1) < nred as i64,
+            "{shape:?}"
+        );
+        assert_eq!(rounds(shape, group, dims), many_rounds, "{shape:?}");
+    }
+    // Chunks that cut rows: [9, 2, 3000] folds rows of 3000 in chunks of 4500, [64, 3, 100] rows
+    // of 100 in chunks of 534.
+    let t = crate::Tensor::empty_on(
+        crate::Shape::new(&[64, 3, 100]),
+        DType::F32,
+        Device::Rocm(0),
+    );
+    let r = super::reduce::describe("test", &t.data(), &[true, false, true]).unwrap();
+    assert_eq!(super::reduce::plan(&r).2, 534);
+}
+
+/// The exclusive cumulative product (only the gradient of `prod` uses it) multiplies each line
+/// in the CPU's order: the same bits on every float dtype, layout and direction.
+#[test]
+fn exclusive_cumprod_matches_the_cpu() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let base = mixed_floats(dtype, 2 * 3 * 50, 7).mul(3.0);
+        let views = [
+            base.reshape([6, 50]),
+            base.reshape([50, 6]).transpose(0, 1),
+            base.reshape([2, 3, 50]).narrow(2, 1, 40),
+            base.narrow(0, 0, 1),
+        ];
+        for x in views {
+            let xg = x.to(gpu);
+            for dim in 0..x.num_dims() {
+                for reverse in [false, true] {
+                    let (c, g) = (
+                        crate::ops::exclusive_cumprod(&x, dim, reverse),
+                        crate::ops::exclusive_cumprod(&xg, dim, reverse),
+                    );
+                    assert_eq!(g.device(), gpu);
+                    assert_same_bits(
+                        &g,
+                        &c,
+                        &format!("{dtype} {:?} dim {dim} {reverse}", x.shape()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The shapes of `SOFTMAX_PLAN_SHAPES` in `tests/rocm_reduce.rs` reach the softmax plans they
+/// are meant to: rows kept in registers (up to 16 elements per lane) or not, for 256, 32 and 1
+/// lanes per row, and rows split across blocks.
+#[test]
+fn softmax_plans_cover_every_path() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    // (shape, dimension, split, lanes per row, elements per lane in registers)
+    type Case = (&'static [usize], usize, bool, i32, i32);
+    let cases: [Case; 11] = [
+        (&[300, 4096], 1, false, 256, 16),
+        (&[300, 4097], 1, false, 256, 0),
+        (&[3000, 1000], 1, false, 256, 4),
+        (&[5000, 100], 1, false, 32, 4),
+        (&[5000, 255], 1, false, 32, 8),
+        (&[100000, 16], 1, false, 1, 16),
+        (&[20, 7], 0, false, 1, 0),
+        (&[4, 100000], 1, true, 256, 0),
+        (&[100000, 3], 0, true, 1, 0),
+        (&[1, 8192], 1, true, 256, 0),
+        (&[], 0, false, 1, 1),
+    ];
+    for (shape, dim, split, group, cache) in cases {
+        let t = crate::Tensor::empty_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
+        let (s, g, c) = super::reduce::softmax_plan(&t.data(), dim);
+        assert_eq!(s, split, "{shape:?} {dim}");
+        assert_eq!(g, group, "{shape:?} {dim}");
+        if !split {
+            assert_eq!(c, cache, "{shape:?} {dim}");
+        }
+    }
+}

@@ -349,7 +349,7 @@ pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &Te
 
 #[track_caller]
 pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool) {
-    dispatch!(out, softmax(out, src, dim, log))
+    dispatch_rocm!(out, softmax(out, src, dim, log))
 }
 
 #[track_caller]
@@ -437,7 +437,7 @@ pub(crate) fn adaptive_avg_pool2d_backward(out: &TensorData, grad: &TensorData) 
 
 #[track_caller]
 pub(crate) fn reduce(op: ReduceOp, out: &TensorData, src: &TensorData, mask: &[bool]) {
-    dispatch!(out, reduce(op, out, src, mask))
+    dispatch_rocm!(out, reduce(op, out, src, mask))
 }
 
 #[track_caller]
@@ -448,7 +448,7 @@ pub(crate) fn var(
     correction: f64,
     take_sqrt: bool,
 ) {
-    dispatch!(out, var(out, src, mask, correction, take_sqrt))
+    dispatch_rocm!(out, var(out, src, mask, correction, take_sqrt))
 }
 
 #[track_caller]
@@ -459,12 +459,12 @@ pub(crate) fn arg_reduce(
     dim: usize,
     is_max: bool,
 ) {
-    dispatch!(indices, arg_reduce(values, indices, src, dim, is_max))
+    dispatch_rocm!(indices, arg_reduce(values, indices, src, dim, is_max))
 }
 
 #[track_caller]
 pub(crate) fn exclusive_cumprod(out: &TensorData, src: &TensorData, dim: usize, reverse: bool) {
-    dispatch!(out, exclusive_cumprod(out, src, dim, reverse))
+    dispatch_rocm!(out, exclusive_cumprod(out, src, dim, reverse))
 }
 
 #[track_caller]

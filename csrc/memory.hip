@@ -42,6 +42,7 @@ hmr_status hmr_copy_to_host(hmr_context_t ctx, void *dst, const void *src, uint6
     return guarded([&] {
         hmr::DeviceGuard guard;
         if (hmr_status s = guard.enter(ctx->device)) return s;
+        if (hmr_status s = hmr::injected_data_failure("hipMemcpyAsync(DeviceToHost)")) return s;
         HMR_HIP(hipMemcpyAsync(dst, src, nbytes, hipMemcpyDeviceToHost, ctx->stream));
         HMR_HIP(hipStreamSynchronize(ctx->stream));
         return HMR_OK;
@@ -52,6 +53,7 @@ hmr_status hmr_copy_from_host(hmr_context_t ctx, void *dst, const void *src, uin
     return guarded([&] {
         hmr::DeviceGuard guard;
         if (hmr_status s = guard.enter(ctx->device)) return s;
+        if (hmr_status s = hmr::injected_data_failure("hipMemcpyAsync(HostToDevice)")) return s;
         HMR_HIP(hipMemcpyAsync(dst, src, nbytes, hipMemcpyHostToDevice, ctx->stream));
         HMR_HIP(hipStreamSynchronize(ctx->stream));
         return HMR_OK;

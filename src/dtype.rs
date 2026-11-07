@@ -171,8 +171,10 @@ pub trait Element:
 
     /// Converts to another element type.
     ///
-    /// Integers wrap (two's complement truncation) and any nonzero value becomes `true`. Floats
-    /// cast to an integer type are first truncated toward zero to `i64`, saturating at its limits
+    /// Integers wrap (two's complement truncation) and any nonzero value becomes `true`.
+    /// Converting to `f16` or `bf16` first rounds to `f32` and then to the half type, as PyTorch
+    /// does: `1 + 2⁻¹¹ + 2⁻⁴⁰` as `f64` becomes `1.0f16` (a tie once in `f32`), not the nearest
+    /// `f16`. Floats cast to an integer type are first truncated toward zero to `i64`, saturating at its limits
     /// (NaN becomes 0), and then wrapped to the target type, so unlike C++ `static_cast` the
     /// result is defined for every input.
     ///
@@ -233,8 +235,12 @@ macro_rules! impl_half_element {
             fn to_f64(self) -> f64 { self.to_f64() }
             fn to_i64(self) -> i64 { self.to_f32() as i64 }
             fn to_bool(self) -> bool { self.to_f32() != 0.0 }
-            fn from_f64(v: f64) -> Self { <$t>::from_f64(v) }
-            fn from_i64(v: i64) -> Self { <$t>::from_f64(v as f64) }
+            // Through `f32`, as PyTorch converts a double or an integer to a half type: two
+            // roundings, the same on every host. (`from_f64` of `half` is host dependent for
+            // `f16`: through `f32` with F16C, directly otherwise; and both its direct conversions
+            // ignore the last 32 mantissa bits of the `f64` when rounding.)
+            fn from_f64(v: f64) -> Self { <$t>::from_f32(v as f32) }
+            fn from_i64(v: i64) -> Self { <$t>::from_f32(v as f32) }
             fn from_bool(v: bool) -> Self { if v { <$t>::ONE } else { <$t>::ZERO } }
         }
         impl Element for $t {
@@ -616,5 +622,34 @@ mod tests {
         assert!(0.1f64.cast::<bool>());
         assert_eq!(true.cast::<f16>(), f16::ONE);
         assert_eq!(f16::from_f32(2.5).cast::<f32>(), 2.5);
+    }
+
+    /// Half types are rounded through `f32`, matching PyTorch (golden venv, torch 2.14.1) on
+    /// every host, rather than `half`'s `from_f64`.
+    #[test]
+    fn half_casts_round_through_f32() {
+        let p = |e: i32| 2f64.powi(e);
+        // F32 -> BF16 above a tie only in the last three bits of the f32 mantissa: torch 0x3f81
+        // (`half::bf16::from_f64` gives 0x3f80).
+        assert_eq!(
+            ((1.0 + p(-8) + p(-21)) as f32).cast::<bf16>().to_bits(),
+            0x3f81
+        );
+        assert_eq!((1.0 + p(-8) + p(-21)).cast::<bf16>().to_bits(), 0x3f81);
+        // F64 -> half just above a tie that F32 rounds away: torch rounds to even (down).
+        assert_eq!((1.0 + p(-8) + p(-40)).cast::<bf16>().to_bits(), 0x3f80);
+        assert_eq!((1.0 + p(-11) + p(-40)).cast::<f16>().to_bits(), 0x3c00);
+        // Integers go to f32 first: 2^24 + 1 rounds to 2^24 in f32, then is exact in bf16.
+        assert_eq!(((1i64 << 24) + 1).cast::<bf16>().to_f64(), p(24));
+        // 2^24 + 2^16 + 1: f32 rounds it to the bf16 tie 2^24 + 2^16, which rounds to even.
+        assert_eq!(
+            ((1i64 << 24) + (1 << 16) + 1).cast::<bf16>().to_f64(),
+            p(24)
+        );
+        assert_eq!(i64::MAX.cast::<bf16>().to_f64(), p(63));
+        assert_eq!(70000i64.cast::<f16>(), f16::INFINITY);
+        // NaN stays NaN (quiet) with its sign.
+        assert!(f64::NAN.cast::<f16>().is_nan());
+        assert!((-f64::NAN).cast::<bf16>().is_sign_negative());
     }
 }

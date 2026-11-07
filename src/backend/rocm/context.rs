@@ -47,8 +47,7 @@ impl Context {
     }
 
     /// Copies `dst.len()` bytes of device memory at `src` into `dst`, after the work queued
-    /// before.
-    #[cfg(test)]
+    /// before, and returns when they are there.
     pub(super) fn copy_to_host(&self, dst: &mut [u8], src: *const u8) -> Result<(), Failure> {
         // SAFETY: `raw` is a live context; `src` holds `dst.len()` bytes of this device.
         call(unsafe {
@@ -61,13 +60,44 @@ impl Context {
         })
     }
 
-    /// Copies `src` into device memory at `dst`, after the work queued before.
-    #[cfg(test)]
+    /// Copies `src` into device memory at `dst`, after the work queued before, and returns when
+    /// the copy is complete.
     pub(super) fn copy_from_host(&self, dst: *mut u8, src: &[u8]) -> Result<(), Failure> {
         // SAFETY: `raw` is a live context; `dst` holds `src.len()` bytes of this device.
         call(unsafe {
             ffi::hmr_copy_from_host(self.raw, dst.cast(), src.as_ptr().cast(), src.len() as u64)
         })
+    }
+
+    /// Queues `hmr_copy` (a strided copy with conversion). Call it inside the device's execution
+    /// lock, with descriptions of this device's memory.
+    pub(super) fn copy(
+        &self,
+        dst: &ffi::hmr_tensor_desc,
+        src: &ffi::hmr_tensor_desc,
+    ) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context; the descriptions lie inside device memory of this
+        // device, and `dst`'s elements are distinct and don't partially overlap `src`'s.
+        call(unsafe { ffi::hmr_copy(self.raw, dst, src) })
+    }
+
+    /// Queues `hmr_fill`. Call it inside the device's execution lock.
+    pub(super) fn fill(&self, dst: &ffi::hmr_tensor_desc, bits: u64) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context; the description lies inside device memory of this
+        // device, with distinct elements.
+        call(unsafe { ffi::hmr_fill(self.raw, dst, bits) })
+    }
+
+    /// Queues copying `nbytes` from `src` to `dst`, device memory of this device that doesn't
+    /// overlap. Call it inside the device's execution lock.
+    pub(super) fn copy_device(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        nbytes: usize,
+    ) -> Result<(), Failure> {
+        // SAFETY: `raw` is a live context; both ranges are device memory of this device.
+        call(unsafe { ffi::hmr_copy_device(self.raw, dst.cast(), src.cast(), nbytes as u64) })
     }
 
     #[cfg(test)]

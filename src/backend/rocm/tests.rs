@@ -37,6 +37,22 @@ fn the_abi_matches_the_library() {
         (abi.name_len, abi.arch_len),
         (ffi::HMR_NAME_LEN, ffi::HMR_ARCH_LEN)
     );
+    type D = ffi::hmr_tensor_desc;
+    assert_eq!(abi.desc_size as usize, size_of::<D>());
+    assert_eq!(abi.desc_align as usize, align_of::<D>());
+    let offsets = [
+        offset_of!(D, data),
+        offset_of!(D, offset),
+        offset_of!(D, dtype),
+        offset_of!(D, ndim),
+        offset_of!(D, sizes),
+        offset_of!(D, strides),
+    ];
+    assert_eq!(abi.desc_offsets.map(|o| o as usize), offsets);
+    // The dtype codes are homura's DType order.
+    let codes: Vec<i32> = crate::DType::ALL.iter().map(|&d| d as i32).collect();
+    assert_eq!(abi.dtype_values.to_vec(), codes);
+    assert_eq!(abi.max_dims, ffi::HMR_MAX_DIMS);
 }
 
 #[test]
@@ -383,4 +399,268 @@ fn allocation_follows_the_lock_order() {
     let a = exec(0, || rocm_storage(512));
     let b = crate::backend::cpu::exec(|| rocm_storage(512));
     assert_eq!((read_back(&a), read_back(&b)), (vec![0; 512], vec![0; 512]));
+}
+
+/// Dimensions merge as the CPU's `Plan` merges them.
+#[test]
+fn kernel_dimensions_merge_like_the_cpu_plan() {
+    use super::copy::merge_dims;
+    // Contiguous: one dimension; size-1 dimensions dropped.
+    assert_eq!(
+        merge_dims(&[2, 1, 3, 4], [&[12, 12, 4, 1]]),
+        Some(vec![(24, [1])])
+    );
+    // Transposed in one operand only: nothing merges.
+    assert_eq!(
+        merge_dims(&[2, 3], [&[3, 1], &[1, 2]]),
+        Some(vec![(2, [3, 1]), (3, [1, 2])])
+    );
+    // Broadcast (stride 0) merges with stride 0 neighbours.
+    assert_eq!(merge_dims(&[4, 3, 5], [&[0, 0, 0]]), Some(vec![(60, [0])]));
+    assert_eq!(merge_dims(&[0, 3], [&[3, 1]]), None);
+    assert_eq!(merge_dims::<1>(&[], [&[]]), Some(vec![]));
+    // `stride * size` doesn't fit in `usize`: not merged.
+    let half = usize::MAX / 2 + 1;
+    assert_eq!(merge_dims(&[2, 2], [&[0, half]]).unwrap().len(), 2);
+}
+
+/// More than 25 dimensions that can't be merged are refused, with the operation's name.
+#[test]
+#[should_panic(
+    expected = "copy on ROCm supports at most 25 dimensions that can't be merged, got 26"
+)]
+fn too_many_dimensions_are_refused() {
+    let _lock = memory_lock();
+    let x = crate::zeros_with(vec![2usize; 26], crate::Device::Rocm(0));
+    // Every other dimension reversed: no two neighbours are contiguous.
+    let perm: Vec<i64> = (0..26).rev().collect();
+    let _ = x.permute(perm).contiguous();
+}
+
+fn assert_out_of_memory(result: crate::Result<crate::Tensor>, device: crate::Device) {
+    match result {
+        Err(crate::Error::OutOfMemory(e)) => assert_eq!(e.device(), device),
+        Err(e) => panic!("not out of memory: {e}"),
+        Ok(_) => panic!("no failure"),
+    }
+}
+
+/// `try_to` returns the refusal of every allocation it makes (the target, the contiguous copy on
+/// the source device, the host staging of a conversion), leaves the source unchanged and leaks
+/// nothing (M4.5 step 2b, item 7).
+#[test]
+fn try_to_returns_every_refused_allocation() {
+    use crate::storage::alloc_faults::{clear, fail_nth};
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let before = memory_stats(0).allocated;
+    // A strided CPU tensor.
+    let x = crate::arange(12).reshape([3, 4]).transpose(0, 1);
+    let values = x.to_vec::<i64>();
+    // CPU -> GPU: the target, then the contiguous copy (or the cast) on the CPU.
+    fail_nth(gpu, 1);
+    assert_out_of_memory(x.try_to(gpu), gpu);
+    fail_nth(Device::Cpu, 1);
+    assert_out_of_memory(x.try_to(gpu), Device::Cpu);
+    fail_nth(Device::Cpu, 1);
+    assert_out_of_memory(x.try_to((DType::F32, gpu)), Device::Cpu);
+    clear();
+    // GPU -> CPU: the target, then the contiguous copy on the GPU; with a cast, the staging.
+    let g = x.to(gpu).transpose(0, 1);
+    let g_values = x.transpose(0, 1).to_vec::<i64>();
+    assert!(!g.is_contiguous());
+    fail_nth(Device::Cpu, 1);
+    assert_out_of_memory(g.try_to(Device::Cpu), Device::Cpu);
+    fail_nth(gpu, 1);
+    assert_out_of_memory(g.try_to(Device::Cpu), gpu);
+    fail_nth(Device::Cpu, 2);
+    assert_out_of_memory(g.try_to((DType::F16, Device::Cpu)), Device::Cpu);
+    // On the GPU: the converted copy.
+    fail_nth(gpu, 1);
+    assert_out_of_memory(g.try_to(DType::F16), gpu);
+    clear();
+    // Nothing changed, everything still works, and the failures leaked no memory.
+    assert_eq!(x.to_vec::<i64>(), values);
+    assert_eq!(g.to_vec::<i64>(), g_values);
+    assert_eq!(
+        g.try_to((DType::F64, Device::Cpu))
+            .unwrap()
+            .to_vec::<f64>()
+            .len(),
+        12
+    );
+    drop(g);
+    assert_eq!(memory_stats(0).allocated, before);
+}
+
+/// Between two ROCm devices, data goes through host staging, one device lock at a time. With one
+/// GPU, the same device stands for both (the lock-order checker of debug builds would panic if
+/// both locks were held).
+#[test]
+fn transfers_between_rocm_devices_go_through_the_host() {
+    use crate::storage::alloc_faults::{clear, fail_nth};
+    use crate::{DType, Device, Tensor};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let src = crate::arange_with(12, (DType::F32, gpu))
+        .reshape([3, 4])
+        .transpose(0, 1);
+    let dst = Tensor::empty_on(src.data().layout.shape.clone(), DType::F32, gpu).data();
+    crate::backend::try_transfer_into(&dst, &src.data()).unwrap();
+    assert_eq!(
+        Tensor::from_data(dst.clone()).to_vec::<f32>(),
+        src.to_vec::<f32>()
+    );
+    // The staging is CPU memory: its refusal is returned.
+    fail_nth(Device::Cpu, 1);
+    assert!(matches!(
+        crate::backend::try_transfer_into(&dst, &src.data()),
+        Err(crate::storage::AllocError::OutOfMemory {
+            device: Device::Cpu,
+            ..
+        })
+    ));
+    clear();
+}
+
+/// Makes the calling thread's next `n` data operations of the ROCm layer fail before queueing
+/// anything: out of memory, or with another HIP error (`hmr_test_fail_data`).
+fn fail_data(n: i32, out_of_memory: bool) {
+    // SAFETY: a testing hook without preconditions.
+    unsafe { ffi::hmr_test_fail_data(n, i32::from(out_of_memory)) };
+}
+
+#[track_caller]
+fn assert_out_of_memory_for(result: crate::Result<crate::Tensor>, requested: usize) {
+    match result {
+        Err(crate::Error::OutOfMemory(e)) => {
+            assert_eq!(
+                (e.device(), e.requested()),
+                (crate::Device::Rocm(0), requested)
+            )
+        }
+        Err(e) => panic!("not out of memory: {e}"),
+        Ok(_) => panic!("no failure"),
+    }
+}
+
+/// The message of the panic of `f`, which must panic.
+#[track_caller]
+fn panic_message(f: impl FnOnce()) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("no panic");
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(p) => p
+            .downcast_ref::<&str>()
+            .map_or_else(String::new, |s| s.to_string()),
+    }
+}
+
+/// The `try_` functions return the device's lack of memory when the fill or the copy after
+/// their allocation fails, not only when the allocation does; nothing leaks, the source stays as
+/// it was, and the retry succeeds (review round 124, R148).
+#[test]
+fn try_functions_return_a_kernel_that_runs_out_of_memory() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let src = crate::arange_with(6, (DType::F32, gpu));
+    let strided = src.reshape([2, 3]).transpose(0, 1);
+    let before = memory_stats(0).allocated;
+    // The fill of a new tensor.
+    fail_data(1, true);
+    assert_out_of_memory_for(crate::try_ones_with([5], (DType::F32, gpu)), 20);
+    fail_data(1, true);
+    assert_out_of_memory_for(crate::try_full_with([5], 3.0, (DType::F16, gpu)), 10);
+    // A conversion on the GPU.
+    fail_data(1, true);
+    assert_out_of_memory_for(src.try_to(DType::F64), 48);
+    fail_data(1, true);
+    assert_out_of_memory_for(strided.try_to(DType::I8), 6);
+    // The contiguous copy of a strided GPU tensor on its way to the CPU.
+    fail_data(1, true);
+    assert_out_of_memory_for(strided.try_to(Device::Cpu), 24);
+    // The transfers themselves (HIP's staging).
+    fail_data(1, true);
+    assert_out_of_memory_for(src.try_to(Device::Cpu), 24);
+    fail_data(1, true);
+    assert_out_of_memory_for(crate::arange(3).try_to(gpu), 24);
+    fail_data(0, false);
+    assert_eq!(memory_stats(0).allocated, before);
+
+    assert_eq!(src.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    let ones = crate::try_ones_with([5], (DType::F32, gpu)).unwrap();
+    assert_eq!(ones.to_vec::<f32>(), [1.0; 5]);
+    let full = crate::try_full_with([5], 3.0, (DType::F16, gpu)).unwrap();
+    assert_eq!(full.to_vec::<f32>(), [3.0; 5]);
+    let wide = src.try_to(DType::F64).unwrap();
+    assert_eq!(wide.to_vec::<f64>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    let host = strided.try_to(Device::Cpu).unwrap();
+    assert_eq!(host.to_vec::<f32>(), [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+}
+
+/// The entry points that can't return a failure panic for it: running out of memory like a
+/// refused allocation, other failures with HIP's message. A failed in-place write changes
+/// neither the data nor the version (review round 124, R148 and R149).
+#[test]
+fn failed_data_operations_panic_and_in_place_writes_keep_their_version() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let t = crate::arange_with(4, (DType::F32, gpu));
+    let other = crate::full_with([4], 9.0, (DType::F32, gpu));
+    let version = t.data().storage.version();
+    for (out_of_memory, text) in [(true, "out of memory"), (false, "invalid resource handle")] {
+        fail_data(1, out_of_memory);
+        assert!(panic_message(|| drop(crate::ones_with([3], gpu))).contains(text));
+        fail_data(1, out_of_memory);
+        assert!(panic_message(|| drop(t.to(DType::F64))).contains(text));
+        fail_data(1, out_of_memory);
+        assert!(
+            panic_message(|| {
+                t.fill_(5.0);
+            })
+            .contains(text)
+        );
+        fail_data(1, out_of_memory);
+        assert!(
+            panic_message(|| {
+                t.copy_(&other);
+            })
+            .contains(text)
+        );
+        fail_data(1, out_of_memory);
+        assert!(panic_message(|| drop(t.to_vec::<f32>())).contains(text));
+        fail_data(1, out_of_memory);
+        assert!(panic_message(|| drop(crate::arange_with(3, gpu))).contains(text));
+    }
+    // Recorded writes: the failure comes back through the recording, which records nothing.
+    let x = crate::ones([4]);
+    x.requires_grad_(true);
+    let y = x.to(gpu);
+    for out_of_memory in [true, false] {
+        fail_data(1, out_of_memory);
+        let _ = panic_message(|| {
+            y.copy_(&other);
+        });
+        fail_data(1, out_of_memory);
+        let _ = panic_message(|| {
+            y.fill_(2.0);
+        });
+    }
+    fail_data(0, false);
+    assert_eq!(y.grad_fn().unwrap().name(), "ToCopyBackward0");
+    assert_eq!((y.version(), y.to_vec::<f32>()), (0, vec![1.0; 4]));
+    y.copy_(&other);
+    assert_eq!(y.grad_fn().unwrap().name(), "CopyBackwards");
+    assert_eq!(y.version(), 1);
+
+    assert_eq!(t.data().storage.version(), version);
+    assert_eq!(t.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0]);
+    t.fill_(5.0);
+    assert_eq!(t.data().storage.version(), version + 1);
+    t.copy_(&other);
+    assert_eq!(t.data().storage.version(), version + 2);
+    assert_eq!(t.to_vec::<f32>(), [9.0; 4]);
 }

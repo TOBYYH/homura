@@ -338,9 +338,17 @@ impl Storage {
     /// Panics if the storage is not on a ROCm device (an internal error).
     #[cfg(all(feature = "rocm", test))]
     pub fn rocm_buffer(&self) -> &crate::backend::rocm::DeviceBuffer {
+        self.try_rocm_buffer()
+            .expect("internal error: not ROCm storage")
+    }
+
+    /// The device memory of ROCm storage; `None` for other storage, including the placeholders
+    /// of the unit tests (`fake_rocm`).
+    #[cfg(feature = "rocm")]
+    pub fn try_rocm_buffer(&self) -> Option<&crate::backend::rocm::DeviceBuffer> {
         match &self.buffer {
-            Buffer::Rocm(b) => b,
-            _ => panic!("internal error: not ROCm storage"),
+            Buffer::Rocm(b) => Some(b),
+            _ => None,
         }
     }
 
@@ -380,6 +388,23 @@ impl Storage {
 }
 
 impl AllocError {
+    /// The public error for the refusal, with a message that describes the device's memory now.
+    #[track_caller]
+    pub(crate) fn into_error(self) -> crate::Error {
+        let AllocError::OutOfMemory { device, requested } = self;
+        let message = match device {
+            #[cfg(feature = "rocm")]
+            Device::Rocm(i) => crate::backend::rocm::out_of_memory_message(i, requested),
+            _ => format!(
+                "{device} out of memory. Tried to allocate {:.2} MiB.",
+                requested as f64 / (1u64 << 20) as f64
+            ),
+        };
+        crate::Error::OutOfMemory(crate::error::OutOfMemoryError::new(
+            device, requested, message,
+        ))
+    }
+
     /// Panics (or, on the CPU, aborts) for a refused allocation from an entry point that can't
     /// return the error.
     #[track_caller]

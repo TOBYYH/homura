@@ -10,6 +10,17 @@ pub const HMR_HIP_ERROR: i32 = 3;
 pub const HMR_INTERNAL_ERROR: i32 = 4;
 pub const HMR_NAME_LEN: i32 = 256;
 pub const HMR_ARCH_LEN: i32 = 64;
+pub const HMR_BOOL: i32 = 0;
+pub const HMR_U8: i32 = 1;
+pub const HMR_I8: i32 = 2;
+pub const HMR_I16: i32 = 3;
+pub const HMR_I32: i32 = 4;
+pub const HMR_I64: i32 = 5;
+pub const HMR_F16: i32 = 6;
+pub const HMR_BF16: i32 = 7;
+pub const HMR_F32: i32 = 8;
+pub const HMR_F64: i32 = 9;
+pub const HMR_MAX_DIMS: i32 = 25;
 pub type hmr_status = i32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -28,6 +39,16 @@ pub struct hmr_context {
 pub type hmr_context_t = *mut hmr_context;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct hmr_tensor_desc {
+    pub data: *mut ::core::ffi::c_void,
+    pub offset: i64,
+    pub dtype: i32,
+    pub ndim: i32,
+    pub sizes: [i64; 25usize],
+    pub strides: [i64; 25usize],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct hmr_abi_info {
     pub abi_info_size: u32,
     pub properties_size: u32,
@@ -36,6 +57,11 @@ pub struct hmr_abi_info {
     pub status_values: [i32; 5usize],
     pub name_len: i32,
     pub arch_len: i32,
+    pub desc_size: u32,
+    pub desc_align: u32,
+    pub desc_offsets: [u32; 6usize],
+    pub dtype_values: [i32; 10usize],
+    pub max_dims: i32,
 }
 unsafe extern "C" {
     pub fn hmr_last_error() -> *const ::core::ffi::c_char;
@@ -65,11 +91,24 @@ unsafe extern "C" {
         src: *const ::core::ffi::c_void,
         nbytes: u64,
     ) -> hmr_status;
+    pub fn hmr_copy(
+        ctx: hmr_context_t,
+        dst: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_fill(ctx: hmr_context_t, dst: *const hmr_tensor_desc, bits: u64) -> hmr_status;
+    pub fn hmr_copy_device(
+        ctx: hmr_context_t,
+        dst: *mut ::core::ffi::c_void,
+        src: *const ::core::ffi::c_void,
+        nbytes: u64,
+    ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);
     pub fn hmr_test_fail_stream_create(n: i32);
     pub fn hmr_test_fail_after_probe(n: i32);
     pub fn hmr_test_fail_properties(n: i32);
+    pub fn hmr_test_fail_data(n: i32, out_of_memory: i32);
     pub fn hmr_test_live_streams() -> i32;
     pub fn hmr_test_current_device(device: *mut i32) -> hmr_status;
     pub fn hmr_test_set_current_device(device: i32) -> hmr_status;

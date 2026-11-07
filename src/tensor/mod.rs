@@ -408,16 +408,34 @@ impl Tensor {
     /// Panics if the size in bytes exceeds `isize::MAX`, on every device.
     #[track_caller]
     pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
+        match Tensor::try_empty_on(shape, dtype, device) {
+            Ok(t) => t,
+            Err(e) => e.raise(),
+        }
+    }
+
+    /// Like [`empty_on`](Tensor::empty_on), returning the device's refusal of the memory instead
+    /// of panicking for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size in bytes exceeds `isize::MAX` (an argument error, not a refusal).
+    #[track_caller]
+    pub(crate) fn try_empty_on(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+    ) -> Result<Tensor, crate::storage::AllocError> {
         let nbytes = match checked_nbytes(&shape, dtype) {
             Ok(nbytes) => nbytes,
             Err(e) => panic!("{e}"),
         };
-        let storage = Arc::new(Storage::new(nbytes, device));
-        Tensor::from_data(TensorData {
+        let storage = Arc::new(Storage::try_new(nbytes, device)?);
+        Ok(Tensor::from_data(TensorData {
             storage,
             layout: Layout::contiguous(shape),
             dtype,
-        })
+        }))
     }
 
     /// A view of this tensor with `layout`, as the public view operations create it: unlike

@@ -7,6 +7,12 @@ use super::accumulate::grad_accumulator;
 use super::node::{Edge, InputMeta, Node, NodeBuilder, NodeRef};
 use super::{is_grad_enabled, meta};
 use crate::Tensor;
+use crate::backend::DeviceFailure;
+
+/// The write of an in-place operation: it returns the device's failure instead of panicking for
+/// it, since it runs inside a closure, which wouldn't report the caller's location (review round
+/// 124, R149). Nothing is written when it fails.
+pub(crate) type Write = Box<dyn FnOnce() -> Result<(), DeviceFailure>>;
 
 /// Whether an operation on `inputs` is recorded: grad mode is on and a tensor input requires
 /// grad. `None` stands for a scalar operand, which never takes part in autograd.
@@ -41,7 +47,9 @@ pub(crate) fn check_recordable(inputs: &[Option<&Tensor>]) {
 /// Inside [`record_in_place`], an output that is the target of the in-place operation is
 /// recorded in place: the edges are looked up and the inputs saved while the target still holds
 /// its old value and history, then the result is written, the target's saved copies are moved to
-/// the version after the write, and the new node replaces the target's history.
+/// the version after the write, and the new node replaces the target's history. If the write
+/// fails, nothing is recorded: the failure is kept for `record_in_place` to return, and the
+/// target keeps its value, version and history.
 #[track_caller]
 pub(crate) fn record<N: Node>(
     inputs: &[Option<&Tensor>],
@@ -63,11 +71,19 @@ pub(crate) fn record<N: Node>(
     }
     let mut builder = NodeBuilder::new(edges);
     let formula = formula(&mut builder);
-    let target_nr = in_place.map(|(output_nr, write)| {
-        write();
+    let mut target_nr = None;
+    if let Some((output_nr, write)) = in_place {
+        if let Err(failure) = write() {
+            IN_PLACE.with(|c| {
+                if let Some(context) = c.borrow_mut().as_mut() {
+                    context.failure = Some(failure);
+                }
+            });
+            return;
+        }
         builder.refresh_output(output_nr as u32, outputs[output_nr].version());
-        output_nr
-    });
+        target_nr = Some(output_nr);
+    }
     let input_meta = outputs.iter().map(|t| InputMeta::of(t)).collect();
     let node = builder.build(formula, input_meta);
     for (output_nr, t) in outputs.iter().enumerate() {
@@ -83,7 +99,9 @@ pub(crate) fn record<N: Node>(
 /// write, until [`record`] runs it.
 struct InPlace {
     target: Tensor,
-    write: Option<Box<dyn FnOnce()>>,
+    write: Option<Write>,
+    /// The failure of the write, which then wrote nothing.
+    failure: Option<DeviceFailure>,
 }
 
 thread_local! {
@@ -110,7 +128,7 @@ impl Drop for InPlaceGuard {
 /// # Panics
 ///
 /// Panics if the write already ran: only one node may be recorded for the target.
-fn take_in_place_write(outputs: &[&Tensor]) -> Option<(usize, Box<dyn FnOnce()>)> {
+fn take_in_place_write(outputs: &[&Tensor]) -> Option<(usize, Write)> {
     IN_PLACE.with(|c| {
         let mut context = c.borrow_mut();
         let context = context.as_mut()?;
@@ -128,27 +146,40 @@ fn take_in_place_write(outputs: &[&Tensor]) -> Option<(usize, Box<dyn FnOnce()>)
 /// once, between saving the inputs and replacing the target's history. Contexts nest: a
 /// recording inside `recorder` for another target restores this one when it ends.
 ///
-/// Call it only when [`check_in_place`] returned true, and with `write` unable to fail: then a
+/// Call it only when [`check_in_place`] returned true, and with `write` unable to panic: then a
 /// panic before the write (an input that is a stale view, say) leaves data, version and history
-/// unchanged.
+/// unchanged. A failure of the device in the write is returned, with nothing recorded or
+/// written, for the caller to report where `#[track_caller]` names the user's call.
 ///
 /// # Panics
 ///
 /// Panics if `recorder` didn't record a node for `target`, an internal error. Nothing has been
 /// written then.
-pub(crate) fn record_in_place(target: &Tensor, write: Box<dyn FnOnce()>, recorder: impl FnOnce()) {
+pub(crate) fn record_in_place(
+    target: &Tensor,
+    write: Write,
+    recorder: impl FnOnce(),
+) -> Result<(), DeviceFailure> {
     let context = InPlace {
         target: target.clone(),
         write: Some(write),
+        failure: None,
     };
     let guard = InPlaceGuard(IN_PLACE.with(|c| c.replace(Some(context))));
     recorder();
-    let written = IN_PLACE.with(|c| c.borrow().as_ref().is_some_and(|c| c.write.is_none()));
+    let (written, failure) = IN_PLACE.with(|c| match c.borrow_mut().as_mut() {
+        Some(c) => (c.write.is_none(), c.failure.take()),
+        None => (false, None),
+    });
     assert!(
         written,
         "internal error: an in-place operation didn't record its target"
     );
     drop(guard);
+    match failure {
+        Some(f) => Err(f),
+        None => Ok(()),
+    }
 }
 
 /// A copy of `t` in new storage that has the history of `t`, for in-place operations whose

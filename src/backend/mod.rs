@@ -3,7 +3,8 @@
 //! Operations call the free functions of this module, which have the signatures of the CPU
 //! backend's kernels and pick the backend by device. The meta device has no data: callers return
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
-//! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics.
+//! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics. Moving data
+//! (reading, writing, copying, filling and the transfers between devices) works on ROCm.
 
 #[cfg(any(feature = "rocm", test))]
 pub(crate) mod caching;
@@ -18,7 +19,8 @@ pub(crate) use cpu::Fused;
 mod dispatch_tests;
 
 use crate::ops::{BinaryOp, Pool2d, ReduceOp, UnaryOp};
-use crate::tensor::TensorData;
+use crate::storage::AllocError;
+use crate::tensor::{Tensor, TensorData};
 use crate::{Device, Element, Scalar};
 
 /// Panics for a kernel the ROCm backend doesn't implement yet.
@@ -52,6 +54,20 @@ macro_rules! dispatch {
     };
 }
 
+/// [`dispatch`] for the kernels that the ROCm backend implements: `rocm::$kernel($args)`.
+macro_rules! dispatch_rocm {
+    ($data:expr, $kernel:ident($($arg:expr),* $(,)?)) => {
+        match $data.device() {
+            Device::Cpu => cpu::$kernel($($arg),*),
+            #[cfg(feature = "rocm")]
+            Device::Rocm(_) => rocm::$kernel($($arg),*),
+            #[cfg(not(feature = "rocm"))]
+            Device::Rocm(i) => rocm_todo(stringify!($kernel), i),
+            Device::Meta => meta(stringify!($kernel)),
+        }
+    };
+}
+
 /// Runs `f` while holding the execution lock of `device` (see `cpu::exec`), so that writes and
 /// version bumps in `f` are atomic. Meta tensors have no data and need no lock.
 #[track_caller]
@@ -68,27 +84,229 @@ pub(crate) fn exec<R>(device: Device, f: impl FnOnce() -> R) -> R {
 
 #[track_caller]
 pub(crate) fn write_host<T: Element>(dst: &TensorData, values: &[T]) {
-    dispatch!(dst, write_host(dst, values))
+    dispatch_rocm!(dst, write_host(dst, values))
 }
 
 #[track_caller]
 pub(crate) fn read_bytes(src: &TensorData) -> Vec<u8> {
-    dispatch!(src, read_bytes(src))
+    dispatch_rocm!(src, read_bytes(src))
 }
 
 #[track_caller]
 pub(crate) fn read_host<T: Element>(src: &TensorData) -> Vec<T> {
-    dispatch!(src, read_host(src))
+    dispatch_rocm!(src, read_host(src))
 }
 
+/// A device's failure to run a data operation, not reported yet. Operations inside the closure of
+/// an execution lock return it, to be reported after the closure, where `#[track_caller]` still
+/// names the caller: closures don't pass it on (review round 124, R149). Only ROCm devices fail.
+#[cfg(feature = "rocm")]
+#[derive(Debug)]
+pub(crate) struct DeviceFailure {
+    failure: rocm::Failure,
+    device: Device,
+    /// The bytes of the operation's device operand, reported if the device ran out of memory.
+    requested: usize,
+}
+
+/// See the `rocm` variant: without ROCm, no device fails.
+#[cfg(not(feature = "rocm"))]
+#[derive(Debug)]
+pub(crate) enum DeviceFailure {}
+
+impl DeviceFailure {
+    /// Running out of memory as the [`AllocError`] for the operand's bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the device's message for any other failure.
+    #[track_caller]
+    pub(crate) fn into_alloc_error(self) -> AllocError {
+        #[cfg(feature = "rocm")]
+        {
+            if self.failure.status == rocm::OUT_OF_MEMORY {
+                return AllocError::OutOfMemory {
+                    device: self.device,
+                    requested: self.requested,
+                };
+            }
+            panic!("{}", self.failure.message)
+        }
+        #[cfg(not(feature = "rocm"))]
+        match self {}
+    }
+
+    /// Panics for the failure: like a refused allocation for running out of memory, else with
+    /// the device's message.
+    #[track_caller]
+    pub(crate) fn raise(self) -> ! {
+        self.into_alloc_error().raise()
+    }
+}
+
+/// `result` of a ROCm operation on `device_data` (the operand on the device).
+#[cfg(feature = "rocm")]
+fn rocm_result(
+    result: Result<(), rocm::Failure>,
+    device_data: &TensorData,
+) -> Result<(), DeviceFailure> {
+    result.map_err(|failure| DeviceFailure {
+        failure,
+        device: device_data.device(),
+        requested: device_data.layout.num_elements() * device_data.dtype.size_in_bytes(),
+    })
+}
+
+/// Copies `src` into `dst` on the same device, broadcasting and converting the dtype.
+///
+/// # Panics
+///
+/// Panics for any failure of the device, running out of memory included (see [`try_copy`]).
 #[track_caller]
 pub(crate) fn copy(dst: &TensorData, src: &TensorData) {
-    dispatch!(dst, copy(dst, src))
+    if let Err(f) = copy_unreported(dst, src) {
+        f.raise()
+    }
 }
 
+/// [`copy`], returning the device's lack of memory instead of panicking for it.
+#[track_caller]
+pub(crate) fn try_copy(dst: &TensorData, src: &TensorData) -> Result<(), AllocError> {
+    match copy_unreported(dst, src) {
+        Ok(()) => Ok(()),
+        Err(f) => Err(f.into_alloc_error()),
+    }
+}
+
+/// [`copy`], returning every failure of the device unreported, for callers inside the closure of
+/// an execution lock. Nothing is written when it fails.
+#[track_caller]
+pub(crate) fn copy_unreported(dst: &TensorData, src: &TensorData) -> Result<(), DeviceFailure> {
+    match dst.device() {
+        Device::Cpu => {
+            cpu::copy(dst, src);
+            Ok(())
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => rocm_result(rocm::try_copy(dst, src), dst),
+        #[cfg(not(feature = "rocm"))]
+        Device::Rocm(i) => rocm_todo("copy", i),
+        Device::Meta => meta("copy"),
+    }
+}
+
+/// Sets every element of `dst` to `value`.
+///
+/// # Panics
+///
+/// Panics for any failure of the device, running out of memory included (see [`try_fill`]).
 #[track_caller]
 pub(crate) fn fill(dst: &TensorData, value: Scalar) {
-    dispatch!(dst, fill(dst, value))
+    if let Err(f) = fill_unreported(dst, value) {
+        f.raise()
+    }
+}
+
+/// [`fill`], returning the device's lack of memory instead of panicking for it.
+#[track_caller]
+pub(crate) fn try_fill(dst: &TensorData, value: Scalar) -> Result<(), AllocError> {
+    match fill_unreported(dst, value) {
+        Ok(()) => Ok(()),
+        Err(f) => Err(f.into_alloc_error()),
+    }
+}
+
+/// [`fill`], returning every failure of the device unreported, see [`copy_unreported`].
+#[track_caller]
+pub(crate) fn fill_unreported(dst: &TensorData, value: Scalar) -> Result<(), DeviceFailure> {
+    match dst.device() {
+        Device::Cpu => {
+            cpu::fill(dst, value);
+            Ok(())
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => rocm_result(rocm::try_fill(dst, value), dst),
+        #[cfg(not(feature = "rocm"))]
+        Device::Rocm(i) => rocm_todo("fill", i),
+        Device::Meta => meta("fill"),
+    }
+}
+
+/// `data` with its dtype and shape in new contiguous storage on `device`, another device than
+/// its own (not meta), or why the memory couldn't be allocated. See [`try_transfer_into`].
+#[track_caller]
+pub(crate) fn try_transfer(data: &TensorData, device: Device) -> Result<TensorData, AllocError> {
+    let dst = Tensor::try_empty_on(data.layout.shape.clone(), data.dtype, device)?.data();
+    try_transfer_into(&dst, data)?;
+    Ok(dst)
+}
+
+/// Copies `src` into `dst`, a contiguous tensor with its dtype and shape on another device (not
+/// meta), or reports why memory for the copy couldn't be allocated: a contiguous copy of `src` on
+/// its device, or the host staging between two ROCm devices. CPU and ROCm data move through
+/// pageable host memory, synchronously; data moves between two ROCm devices through the host,
+/// one device's execution lock at a time.
+///
+/// # Panics
+///
+/// Panics for failures of the devices other than running out of memory.
+#[track_caller]
+pub(crate) fn try_transfer_into(dst: &TensorData, src: &TensorData) -> Result<(), AllocError> {
+    debug_assert!(dst.layout.is_contiguous());
+    debug_assert_eq!(
+        (&dst.layout.shape, dst.dtype),
+        (&src.layout.shape, src.dtype)
+    );
+    match (src.device(), dst.device()) {
+        (Device::Cpu, Device::Rocm(_)) | (Device::Rocm(_), Device::Cpu) => {
+            host_device_copy(dst, &contiguous(src)?)
+        }
+        (Device::Rocm(_), Device::Rocm(_)) => {
+            host_device_copy(dst, &try_transfer(src, Device::Cpu)?)
+        }
+        (from, to) => panic!("internal error: a transfer from {from} to {to}"),
+    }
+}
+
+/// `data`, or a contiguous copy of it on its device.
+#[track_caller]
+fn contiguous(data: &TensorData) -> Result<TensorData, AllocError> {
+    if data.layout.is_contiguous() {
+        Ok(data.clone())
+    } else {
+        crate::ops::try_clone_data(data)
+    }
+}
+
+/// Copies the contiguous `src` into the contiguous `dst` of the same dtype and size, one on the
+/// CPU and the other on a ROCm device.
+#[cfg(feature = "rocm")]
+#[track_caller]
+fn host_device_copy(dst: &TensorData, src: &TensorData) -> Result<(), AllocError> {
+    let (result, device_data) = if dst.device() == Device::Cpu {
+        (rocm::download(dst, src), src)
+    } else {
+        (rocm::upload(dst, src), dst)
+    };
+    // HIP stages pageable copies through buffers of its own, which it may fail to allocate.
+    match rocm_result(result, device_data) {
+        Ok(()) => Ok(()),
+        Err(f) => Err(f.into_alloc_error()),
+    }
+}
+
+#[cfg(not(feature = "rocm"))]
+#[track_caller]
+fn host_device_copy(dst: &TensorData, src: &TensorData) -> Result<(), AllocError> {
+    let (kernel, device) = if dst.device() == Device::Cpu {
+        ("download", src.device())
+    } else {
+        ("upload", dst.device())
+    };
+    match device {
+        Device::Rocm(i) => rocm_todo(kernel, i),
+        d => unreachable!("a transfer to {d}"),
+    }
 }
 
 #[track_caller]

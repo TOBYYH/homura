@@ -25,9 +25,26 @@ All notable changes to this project are documented in this file. The format is b
 - `Device::memory_stats` (`MemoryStats`: allocated, reserved and peak bytes),
   `Device::reset_peak_memory_stats` and `Device::empty_cache`. The CPU counts the buffers homura
   allocates (not file mappings); the meta device reports zeros.
+- Data on ROCm GPUs: `to` moves tensors between the CPU and a GPU (through pageable host memory,
+  returning when the data has arrived) and between GPUs (through the host), and converts dtypes
+  on the GPU with exactly the CPU's results, NaN payloads included. `copy_` (also from another
+  device), `fill_`, the creation functions, `to_vec`, `item` and `Display` work on GPU tensors,
+  and so do the backward passes of `to` and `copy_` between devices and `Module::to`. Operations
+  that compute (arithmetic, reductions, matrix products, ...) don't run on the GPU yet.
+- `Tensor::try_to`, `try_zeros_with`, `try_ones_with` and `try_full_with` return
+  `Error::OutOfMemory` (`OutOfMemoryError`: the device, the requested bytes and a message like
+  PyTorch's) when a device refuses memory, including the staging of a transfer and a GPU's first
+  use, instead of panicking.
 
 ### Changed
 
+- Conversions to `f16` and `bf16` round through `f32`, as PyTorch does, on every host: a double
+  or an integer is rounded to `f32` first. `half`'s `from_f64` was used before, which made
+  `f64 -> f16` depend on the CPU (F16C) and rounded some ties differently from PyTorch for
+  `bf16`: `1 + 2^-8 + 2^-21` as `f32` became `1.0` instead of PyTorch's `1.0078125`.
+- Copies and conversions between the CPU and ROCm devices are no longer refused; only data out
+  of a meta tensor is. `Module::to` a device that doesn't exist panics at the first allocation
+  (before changing anything).
 - Every operation now goes through a dispatch layer that picks the backend by device. An
   operation on a ROCm tensor panics with "... is not implemented on ROCm yet", or says that
   homura was built without the `rocm` feature. CPU behaviour is unchanged.

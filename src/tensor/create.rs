@@ -233,8 +233,22 @@ impl Tensor {
 /// A tensor filled with `value`.
 #[track_caller]
 fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
+    match try_filled(shape, value, dtype, device) {
+        Ok(t) => t,
+        Err(e) => e.raise(),
+    }
+}
+
+/// [`filled`], returning the device's refusal of the memory instead of panicking for it.
+#[track_caller]
+fn try_filled(
+    shape: Shape,
+    value: Scalar,
+    dtype: DType,
+    device: Device,
+) -> Result<Tensor, crate::storage::AllocError> {
     let value = crate::ops::fill_value(value, dtype, device);
-    let t = Tensor::empty_on(shape, dtype, device);
+    let t = Tensor::try_empty_on(shape, dtype, device)?;
     // New memory is zeroed; `-0.0` still needs filling to keep its sign bit.
     let zero_bits = match value {
         Scalar::Bool(v) => !v,
@@ -242,9 +256,9 @@ fn filled(shape: Shape, value: Scalar, dtype: DType, device: Device) -> Tensor {
         Scalar::Float(v) => v.to_bits() == 0,
     };
     if device != Device::Meta && !zero_bits {
-        backend::fill(&t.data(), value);
+        backend::try_fill(&t.data(), value)?;
     }
-    t
+    Ok(t)
 }
 
 /// Zeros with the default dtype and device.
@@ -308,6 +322,71 @@ pub fn full_with(
         o.dtype.unwrap_or(value.dtype()),
         o.device(),
     )
+}
+
+/// [`zeros_with`], returning [`Error::OutOfMemory`](crate::Error::OutOfMemory) if the device
+/// refuses the memory (including the memory of a ROCm device's first use).
+///
+/// # Panics
+///
+/// Panics like [`zeros_with`] for everything but running out of memory: for a size in bytes
+/// beyond `isize::MAX` and for a device that doesn't exist.
+#[track_caller]
+pub fn try_zeros_with(
+    shape: impl IntoShape,
+    options: impl Into<TensorOptions>,
+) -> crate::Result<Tensor> {
+    let o = options.into();
+    try_filled(
+        shape.into_shape(),
+        Scalar::Int(0),
+        o.float_dtype(),
+        o.device(),
+    )
+    .map_err(|e| e.into_error())
+}
+
+/// [`ones_with`], returning [`Error::OutOfMemory`](crate::Error::OutOfMemory) as
+/// [`try_zeros_with`] does.
+///
+/// # Panics
+///
+/// Like [`try_zeros_with`].
+#[track_caller]
+pub fn try_ones_with(
+    shape: impl IntoShape,
+    options: impl Into<TensorOptions>,
+) -> crate::Result<Tensor> {
+    let o = options.into();
+    try_filled(
+        shape.into_shape(),
+        Scalar::Int(1),
+        o.float_dtype(),
+        o.device(),
+    )
+    .map_err(|e| e.into_error())
+}
+
+/// [`full_with`], returning [`Error::OutOfMemory`](crate::Error::OutOfMemory) as
+/// [`try_zeros_with`] does.
+///
+/// # Panics
+///
+/// Like [`try_zeros_with`], and if `value` overflows the dtype.
+#[track_caller]
+pub fn try_full_with(
+    shape: impl IntoShape,
+    value: impl Into<Scalar>,
+    options: impl Into<TensorOptions>,
+) -> crate::Result<Tensor> {
+    let (value, o) = (value.into(), options.into());
+    try_filled(
+        shape.into_shape(),
+        value,
+        o.dtype.unwrap_or(value.dtype()),
+        o.device(),
+    )
+    .map_err(|e| e.into_error())
 }
 
 /// Zeros with the shape, dtype and device of `t`.

@@ -206,7 +206,85 @@ fn creation_and_random() {
     at!(homura::concat(&[t23(), homura::ones([3, 4])], 0));
     at!(homura::stack(&[t23(), homura::ones([3, 2])], 0));
     at!(homura::stack::<Tensor>(&[], 0));
-    at!(homura::tensor([1.0f32]).to(Device::Rocm(0)));
+    // A device that doesn't exist; and, with the `rocm` feature, a copy too large for the GPU.
+    at!(homura::tensor([1.0f32]).to(Device::Rocm(99)));
+    at!(homura::tensor([1.0f32]).try_to(Device::Rocm(99)));
+    let huge = homura::zeros_with([1], DType::U8).expand([1usize << 42]);
+    at!(huge.to(Device::Rocm(0)));
+    at!(huge.to((DType::F16, Device::Rocm(0))));
+    at!(homura::try_zeros_with([2], Device::Rocm(99)));
+    at!(homura::try_ones_with([1usize << 62], DType::F64));
+    at!(homura::try_full_with([2], 300, DType::U8));
+    finish();
+}
+
+#[cfg(feature = "rocm")]
+unsafe extern "C" {
+    /// The ROCm layer's testing hook: the calling thread's next `n` data operations fail, out of
+    /// memory if `out_of_memory` is nonzero (csrc/homura_rocm.h).
+    fn hmr_test_fail_data(n: i32, out_of_memory: i32);
+}
+
+/// `t`, after making the calling thread's next data operation on a ROCm device fail.
+#[cfg(feature = "rocm")]
+fn failing(t: &Tensor, out_of_memory: bool) -> &Tensor {
+    // SAFETY: a testing hook without preconditions.
+    unsafe { hmr_test_fail_data(1, i32::from(out_of_memory)) };
+    t
+}
+
+/// The GPU, after making the calling thread's next data operation on a ROCm device fail.
+#[cfg(feature = "rocm")]
+fn failing_gpu(out_of_memory: bool) -> Device {
+    failing(&homura::zeros([0]), out_of_memory);
+    Device::Rocm(0)
+}
+
+/// Failures of the GPU once its context exists, in each data path: they panic at the caller's
+/// line also when the failing operation runs inside a device lock (review round 124, R149).
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_data_path_failures() {
+    let gpu = Device::Rocm(0);
+    let g = homura::arange_with(6, (DType::F32, gpu));
+    let h = homura::ones_with([6], gpu);
+    let gt = g.reshape([2, 3]).transpose(0, 1);
+    let cpu = homura::ones([6]);
+    let one = homura::ones_with([1], gpu);
+    for oom in [false, true] {
+        // Creation: the fill and the upload of computed values.
+        at!(homura::ones_with([3], failing_gpu(oom)));
+        at!(homura::full_with([3], 2.0, failing_gpu(oom)));
+        at!(homura::arange_with(3, failing_gpu(oom)));
+        at!(homura::tensor_with([1.0f32, 2.0], failing_gpu(oom)));
+        // Conversions: on the GPU, to the CPU (and through the contiguous copy), and uploads.
+        at!(failing(&g, oom).to(DType::F64));
+        at!(failing(&gt, oom).to(Device::Cpu));
+        at!(failing(&g, oom).to(Device::Cpu));
+        at!(failing(&cpu, oom).to(gpu));
+        // In-place writes, inside the device's lock.
+        at!(failing(&g, oom).fill_(5.0));
+        at!(failing(&g, oom).copy_(&h));
+        at!(failing(&g, oom).copy_(&cpu));
+        // Reading back.
+        at!(failing(&g, oom).to_vec::<f32>());
+        at!(failing(&gt, oom).to_vec::<f32>());
+        at!(failing(&one, oom).item::<f32>());
+    }
+    // More dimensions than the kernels take (no two neighbours merge): refused like a failure
+    // of the device, also inside the in-place write and in a `try_` function.
+    let deep = homura::zeros_with(vec![2usize; 26], (DType::U8, gpu))
+        .permute((0..26).rev().collect::<Vec<i64>>());
+    at!(deep.contiguous());
+    at!(deep.fill_(1));
+    at!(deep.try_to(Device::Cpu));
+    drop(deep);
+    // A non-OOM failure of a `try_` function is still a panic.
+    at!(homura::try_ones_with([3], failing_gpu(false)));
+    at!(failing(&g, false).try_to(DType::F16));
+    // SAFETY: a testing hook without preconditions.
+    unsafe { hmr_test_fail_data(0, 0) };
+    assert_eq!(g.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
     finish();
 }
 
@@ -259,7 +337,7 @@ fn module_methods() {
         fc: nn::Linear::new(3, 4),
     };
     at!(net.to(DType::I64));
-    at!(net.to(Device::Rocm(0)));
+    at!(net.to(Device::Rocm(99)));
     let shared = std::sync::Arc::new(Net {
         fc: nn::Linear::new(3, 4),
     });

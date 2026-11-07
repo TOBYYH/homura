@@ -27,6 +27,13 @@ which carry the attribute and are covered by the run-time test); unit test files
 and the functions in `ALLOWED` below, each with its reason. Neither are the other internal
 functions between an entry point and a check: the run-time test covers those.
 
+Closures don't pass `#[track_caller]` on, so a panic inside one reports the closure's line
+(review round 124, R149). The closures of the execution locks (`exec(...)`, `backend::exec(...)`,
+`cpu::exec(...)`) are where device operations run, so in the checked files they must not
+contain a panicking call: `expect(...)`, `.unwrap()`, `panic!`, `.raise()`, or a device data
+operation that reports its own failures (`backend::copy`, `backend::try_fill`, ...). They return
+the failure instead (`backend::copy_unreported`, the ROCm `Result`s), reported after the closure.
+
 The scanner reads rustfmt-formatted source line by line rather than parsing Rust: a function
 starts at a line with `fn` (its name on that line or the next), and only an attribute line
 `#[track_caller]` right above it, among its other attributes, comments and doc comments, counts.
@@ -266,6 +273,42 @@ def scan(path, text, internal=frozenset(), used=None, strict=False):
     return missing
 
 
+EXEC_RE = re.compile(r"\b(?:backend::|cpu::|rocm::)?exec\(")
+# Calls that panic for a failure (or report a device's failure with a panic) where they are.
+CLOSURE_PANIC_RE = re.compile(
+    r"\bexpect\(|\.unwrap\(\)|\bpanic!|\bunreachable!|\.raise\(\)"
+    r"|\bbackend::(?:try_)?(?:copy|fill)\(|\bbackend::(?:write_host|read_host|read_bytes)\b"
+)
+
+
+def code_only(text):
+    """`text` with comments, string and char literals blanked, keeping lines and columns."""
+    out = []
+    for line in text.splitlines():
+        code = strip_comment(line)
+        code = re.sub(r"'(\\.|[^'\\])'", lambda m: " " * len(m.group(0)), code)
+        code = re.sub(r'"(\\.|[^"\\])*"', lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', code)
+        out.append(code)
+    return "\n".join(out)
+
+
+def closure_panics(text):
+    """`(line number, call)` of every panicking call inside the arguments of an execution lock's
+    `exec(...)` (a closure)."""
+    code = code_only(text)
+    found = []
+    for m in EXEC_RE.finditer(code):
+        start = m.end()
+        depth, end = 1, start
+        while end < len(code) and depth:
+            depth += code[end] == "("
+            depth -= code[end] == ")"
+            end += 1
+        for p in CLOSURE_PANIC_RE.finditer(code, start, end - 1):
+            found.append((code.count("\n", 0, p.start()) + 1, p.group(0)))
+    return found
+
+
 def check(root):
     root = Path(root)
     failures = []
@@ -278,8 +321,14 @@ def check(root):
             strict = rel.startswith(STRICT) and rel not in STRICT_EXEMPT
             if not strict and (rel.startswith(SKIP_DIRS) or rel.endswith("_tests.rs")):
                 continue
-            for line, name in scan(rel, path.read_text(), internal, used, strict):
+            text = path.read_text()
+            for line, name in scan(rel, text, internal, used, strict):
                 failures.append(f"{rel}:{line}: `{name}` lacks #[track_caller]")
+            for line, call in closure_panics(text):
+                failures.append(
+                    f"{rel}:{line}: `{call}` panics inside an execution lock's closure, which "
+                    "hides the caller's location; return the failure and report it after"
+                )
     for path, name in sorted(set(ALLOWED) - used):
         failures.append(f"{path}: the ALLOWED entry for `{name}` excuses no function; remove it")
     return failures
@@ -348,8 +397,32 @@ STRICT_SELF_TESTS = [
 ]
 
 
+# (source, expected panicking calls) inside execution locks' closures (review round 124, R149).
+CLOSURE_SELF_TESTS = [
+    ("fn f() {\n    exec(i, || expect(ctx.fill(&d, bits)));\n}\n", ["expect("]),
+    ("fn f() {\n    expect(exec(i, || ctx.fill(&d, bits)));\n}\n", []),
+    ("fn f() {\n    backend::exec(d, || {\n        backend::copy(&dst, &s);\n"
+     "        bump();\n    });\n}\n", ["backend::copy("]),
+    ("fn f() {\n    let r = backend::exec(d, || {\n        let r = backend::copy_unreported(&a, &b);\n"
+     "        r\n    });\n    if let Err(f) = r {\n        f.raise()\n    }\n}\n", []),
+    ("fn f() {\n    cpu::exec(|| {\n        let x = g().unwrap();\n"
+     "        exec(i, || panic!(\"no\"))\n    })\n}\n", [".unwrap()", "panic!", "panic!"]),
+    ("fn f() {\n    exec(i, || {\n        // expect(x) in a comment\n        g(\"panic!\")\n    });\n}\n", []),
+    ("fn f() {\n    exec(i, || backend::try_fill(&d, v).map_err(|e| e.raise()));\n}\n",
+     ["backend::try_fill(", ".raise()"]),
+    ("fn f() {\n    exec(i, || backend::read_host::<i64>(&d));\n    backend::fill(&d, v);\n}\n",
+     ["backend::read_host"]),
+    ("pub(crate) fn exec<R>(index: u32, f: impl FnOnce() -> R) -> R {\n    f()\n}\n", []),
+]
+
+
 def self_test():
     failures = 0
+    for i, (source, expected) in enumerate(CLOSURE_SELF_TESTS):
+        got = [call for _, call in closure_panics(source)]
+        if got != expected:
+            failures += 1
+            print(f"closure self-test {i} failed: expected {expected}, got {got}\n{source}")
     cases = [(src, exp, False) for src, exp in SELF_TESTS]
     cases += [(src, exp, True) for src, exp in STRICT_SELF_TESTS]
     for i, (source, expected, strict) in enumerate(cases):
@@ -357,7 +430,8 @@ def self_test():
         if got != expected:
             failures += 1
             print(f"self-test {i} failed: expected {expected}, got {got}\n{source}")
-    print(f"{len(cases) - failures}/{len(cases)} self-tests passed")
+    total = len(cases) + len(CLOSURE_SELF_TESTS)
+    print(f"{total - failures}/{total} self-tests passed")
     return failures == 0
 
 

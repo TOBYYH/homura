@@ -24,6 +24,8 @@ thread_local const char *static_error = nullptr;
 thread_local int failing_stream_creations = 0;
 thread_local int failing_after_probe = 0;
 thread_local int failing_properties = 0;
+thread_local int failing_data = 0;
+thread_local bool failing_data_out_of_memory = false;
 thread_local int live_streams = 0;
 
 // Destroys `stream`, neither allocating nor touching the last error. The count of live streams
@@ -156,6 +158,12 @@ hmr_status hip_fail(hipError_t error, const char *call) noexcept {
     } catch (...) {
         return fail_static(hip_status(error), hipGetErrorString(error));
     }
+}
+
+hmr_status injected_data_failure(const char *call) noexcept {
+    if (failing_data <= 0) return HMR_OK;
+    --failing_data;
+    return hip_fail(failing_data_out_of_memory ? hipErrorOutOfMemory : hipErrorInvalidHandle, call);
 }
 
 DeviceGuard::~DeviceGuard() {
@@ -321,6 +329,18 @@ void hmr_abi_check(hmr_abi_info *out) {
     std::memcpy(out->status_values, statuses, sizeof statuses);
     out->name_len = HMR_NAME_LEN;
     out->arch_len = HMR_ARCH_LEN;
+    out->desc_size = sizeof(hmr_tensor_desc);
+    out->desc_align = alignof(hmr_tensor_desc);
+    out->desc_offsets[0] = offsetof(hmr_tensor_desc, data);
+    out->desc_offsets[1] = offsetof(hmr_tensor_desc, offset);
+    out->desc_offsets[2] = offsetof(hmr_tensor_desc, dtype);
+    out->desc_offsets[3] = offsetof(hmr_tensor_desc, ndim);
+    out->desc_offsets[4] = offsetof(hmr_tensor_desc, sizes);
+    out->desc_offsets[5] = offsetof(hmr_tensor_desc, strides);
+    const int32_t dtypes[10] = {HMR_BOOL, HMR_U8,  HMR_I8,   HMR_I16, HMR_I32,
+                                HMR_I64,  HMR_F16, HMR_BF16, HMR_F32, HMR_F64};
+    std::memcpy(out->dtype_values, dtypes, sizeof dtypes);
+    out->max_dims = HMR_MAX_DIMS;
 }
 
 void hmr_test_fail_stream_create(int32_t n) { hmr::failing_stream_creations = n; }
@@ -328,6 +348,11 @@ void hmr_test_fail_stream_create(int32_t n) { hmr::failing_stream_creations = n;
 void hmr_test_fail_after_probe(int32_t n) { hmr::failing_after_probe = n; }
 
 void hmr_test_fail_properties(int32_t n) { hmr::failing_properties = n; }
+
+void hmr_test_fail_data(int32_t n, int32_t out_of_memory) {
+    hmr::failing_data = n;
+    hmr::failing_data_out_of_memory = out_of_memory != 0;
+}
 
 int32_t hmr_test_live_streams(void) { return hmr::live_streams; }
 

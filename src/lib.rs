@@ -59,7 +59,7 @@ pub use defaults::{
 };
 pub use device::{Device, DeviceProperties, MemInfo, MemoryStats};
 pub use dtype::{DType, Element, Scalar, can_cast, promote_types};
-pub use error::{Error, Result};
+pub use error::{Error, OutOfMemoryError, Result};
 pub use io::{
     load, load_safetensors, load_safetensors_from_bytes, save, save_safetensors,
     save_safetensors_to_bytes,
@@ -72,6 +72,6 @@ pub use shape::{DimSize, Dims, IntoShape, IntoShapeSpec, Shape, Strides};
 pub use tensor::{
     Ellipsis, IndexItem, IndexSpec, NestedData, NewAxis, Tensor, TensorIndex, TensorOptions,
     arange, arange_step, arange_step_with, arange_with, eye, eye_with, full, full_like, full_with,
-    linspace, linspace_with, ones, ones_like, ones_with, tensor, tensor_with, zeros, zeros_like,
-    zeros_with,
+    linspace, linspace_with, ones, ones_like, ones_with, tensor, tensor_with, try_full_with,
+    try_ones_with, try_zeros_with, zeros, zeros_like, zeros_with,
 };

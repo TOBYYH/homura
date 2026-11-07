@@ -357,14 +357,14 @@ fn memory_methods_on_the_cpu_and_meta_devices() {
 /// other operations come in later steps.
 #[cfg(feature = "rocm")]
 #[test]
-fn rocm_tensors_are_allocated_but_their_kernels_are_not_implemented_yet() {
-    let x = homura::zeros_with([2, 3], Device::Rocm(0));
+fn rocm_tensors_move_data_but_their_other_kernels_are_not_implemented_yet() {
+    let x = homura::ones_with([2, 3], Device::Rocm(0));
     assert_eq!(x.device(), Device::Rocm(0));
-    assert_eq!(x.shape(), homura::zeros([2, 3]).shape());
-    let e = std::panic::catch_unwind(|| homura::ones_with([2], Device::Rocm(0))).unwrap_err();
+    assert_eq!(x.to_vec::<f32>(), [1.0; 6]);
+    let e = std::panic::catch_unwind(|| x.exp()).unwrap_err();
     assert_eq!(
         e.downcast_ref::<String>().map(String::as_str),
-        Some("fill is not implemented on ROCm yet (rocm:0)")
+        Some("unary is not implemented on ROCm yet (rocm:0)")
     );
 }
 

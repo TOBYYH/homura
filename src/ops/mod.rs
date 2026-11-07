@@ -7,6 +7,7 @@
 use crate::backend;
 use crate::dtype::Kind;
 use crate::shape::compute_view_strides;
+use crate::storage::AllocError;
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
@@ -172,25 +173,45 @@ pub(crate) fn common_device<'a>(tensors: impl IntoIterator<Item = &'a TensorData
 }
 
 /// `data` converted to `dtype` (a copy only when the dtype differs).
+#[track_caller]
 pub(crate) fn cast_data(data: &TensorData, dtype: DType) -> TensorData {
+    match try_cast_data(data, dtype) {
+        Ok(d) => d,
+        Err(e) => e.raise(),
+    }
+}
+
+/// [`cast_data`], returning the device's refusal of the memory instead of panicking for it.
+#[track_caller]
+pub(crate) fn try_cast_data(data: &TensorData, dtype: DType) -> Result<TensorData, AllocError> {
     if data.dtype == dtype {
-        return data.clone();
+        return Ok(data.clone());
     }
-    let out = Tensor::empty_on(data.layout.shape.clone(), dtype, data.device()).data();
+    let out = Tensor::try_empty_on(data.layout.shape.clone(), dtype, data.device())?.data();
     if data.device() != Device::Meta {
-        backend::copy(&out, data);
+        backend::try_copy(&out, data)?;
     }
-    out
+    Ok(out)
 }
 
 /// A contiguous copy of `data` in new storage, like [`Tensor::deep_clone`] but for operations
 /// to use internally: it is never recorded for autograd.
+#[track_caller]
 pub(crate) fn clone_data(data: &TensorData) -> TensorData {
-    let out = Tensor::empty_on(data.layout.shape.clone(), data.dtype, data.device()).data();
-    if data.device() != Device::Meta {
-        backend::copy(&out, data);
+    match try_clone_data(data) {
+        Ok(d) => d,
+        Err(e) => e.raise(),
     }
-    out
+}
+
+/// [`clone_data`], returning the device's refusal of the memory instead of panicking for it.
+#[track_caller]
+pub(crate) fn try_clone_data(data: &TensorData) -> Result<TensorData, AllocError> {
+    let out = Tensor::try_empty_on(data.layout.shape.clone(), data.dtype, data.device())?.data();
+    if data.device() != Device::Meta {
+        backend::try_copy(&out, data)?;
+    }
+    Ok(out)
 }
 
 /// `data` with `shape`, which has the same number of elements: the same storage when the layout
@@ -246,6 +267,7 @@ pub(crate) fn scalar_value(t: &Tensor) -> Scalar {
 }
 
 /// A zero-dimensional tensor holding `value`.
+#[track_caller]
 pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> TensorData {
     let out = Tensor::empty_on(Shape::scalar(), dtype, device).data();
     if device != Device::Meta {
@@ -318,20 +340,30 @@ impl Tensor {
     }
 
     /// The last step of every in-place operation, after its checks: runs `write`, which must be
-    /// unable to fail, on its own, or, if the write is `recorded` (as
+    /// unable to panic, on its own, or, if the write is `recorded` (as
     /// [`check_in_place`](crate::autograd::check_in_place) tells), inside the recording of the
     /// node that `record` records with `self` as its output (see
     /// [`record_in_place`](crate::autograd::record_in_place)).
+    ///
+    /// # Panics
+    ///
+    /// Panics for a failure of the device in the write, which then wrote nothing: here rather
+    /// than in the closure, so that the panic reports the caller's location (review round 124,
+    /// R149).
+    #[track_caller]
     pub(crate) fn write_in_place(
         &self,
         recorded: bool,
-        write: impl FnOnce() + 'static,
+        write: impl FnOnce() -> Result<(), backend::DeviceFailure> + 'static,
         record: impl FnOnce(),
     ) {
-        if recorded {
-            crate::autograd::record_in_place(self, Box::new(write), record);
+        let result = if recorded {
+            crate::autograd::record_in_place(self, Box::new(write), record)
         } else {
-            write();
+            write()
+        };
+        if let Err(f) = result {
+            f.raise()
         }
     }
 

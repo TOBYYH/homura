@@ -51,10 +51,12 @@ Implemented so far:
 - The start of the ROCm backend, behind the `rocm` feature: building homura's ROCm layer,
   querying devices (`Device::rocm_count`, `properties`, `mem_get_info`, `synchronize`) and
   device memory from a caching allocator (`memory_stats`, `reset_peak_memory_stats`,
-  `empty_cache`, which the CPU reports too). Zero-filled tensors can be created on a ROCm device,
-  but no operation runs on them yet.
+  `empty_cache`, which the CPU reports too). Tensors move to and from a ROCm GPU with `to`
+  (`try_to` reports running out of memory), are created, copied, filled, converted between
+  dtypes (with exactly the CPU's results) and read back there, but operations that compute don't
+  run on the GPU yet.
 
-Not available yet: tensors on GPUs (ROCm comes first), most neural network layers, autograd
+Not available yet: computing on GPUs (ROCm comes first), most neural network layers, autograd
 hooks, and in-place operations on views that require grad.
 
 ## Example

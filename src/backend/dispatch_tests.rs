@@ -21,11 +21,24 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
     }
 }
 
+/// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
+/// placeholder storage and panic there.
+const IMPLEMENTED: [&str; 6] = [
+    "write_host",
+    "read_host",
+    "copy",
+    "fill",
+    "upload",
+    "download",
+];
+
 /// Asserts that `f` panics in the ROCm arm of the dispatch layer, in `kernel`.
 #[track_caller]
 fn reaches<R>(kernel: &str, f: impl FnOnce() -> R) {
     let message = panic_message(f);
-    let expected = if cfg!(feature = "rocm") {
+    let expected = if cfg!(feature = "rocm") && IMPLEMENTED.contains(&kernel) {
+        format!("internal error: {kernel} on ROCm storage without device memory")
+    } else if cfg!(feature = "rocm") {
         format!("{kernel} is not implemented on ROCm yet (rocm:0)")
     } else {
         "homura was built without ROCm support; enable the `rocm` feature".into()
@@ -117,23 +130,31 @@ fn indexing_and_pooling() {
     });
 }
 
-/// Copies and conversions involving ROCm are refused by the device-pair checks until the
-/// transfers exist (M4 step 2b), before any kernel.
+/// Copies and conversions between the CPU and ROCm pass the device-pair checks and reach the
+/// transfers (M4 step 2b); only data out of meta tensors is refused.
 #[test]
-fn device_pairs_are_refused() {
-    let m = panic_message(|| {
+fn device_pairs_reach_the_transfers() {
+    reaches("copy", || {
         gpu(&[2]).copy_(&gpu(&[2]));
     });
-    assert_eq!(m, "copy from rocm:0 to rocm:0 is not supported");
-    let m = panic_message(|| gpu(&[2]).to(DType::F16));
-    assert_eq!(m, "copying from rocm:0 to rocm:0 is not supported yet");
-    let m = panic_message(|| crate::zeros([2]).to(GPU));
-    assert_eq!(m, "copying from cpu to rocm:0 is not supported yet");
+    reaches("copy", || gpu(&[2]).to(DType::F16));
+    reaches("upload", || crate::zeros([2]).to(GPU));
+    reaches("upload", || {
+        gpu(&[2]).copy_(&crate::zeros([2]));
+    });
+    reaches("download", || gpu(&[2]).to(Device::Cpu));
+    reaches("download", || {
+        crate::zeros([2]).copy_(&gpu(&[2]));
+    });
+    let m = panic_message(|| {
+        gpu(&[2]).copy_(&crate::zeros_with([2], Device::Meta));
+    });
+    assert_eq!(m, "Cannot copy out of meta tensor; no data!");
 }
 
 #[test]
 fn reading_data() {
     reaches("read_host", || format!("{:?}", gpu(&[2])));
-    let m = panic_message(|| gpu(&[2]).to_vec::<f32>());
-    assert_eq!(m, "to_vec: reading data from rocm:0 is not supported yet");
+    reaches("read_host", || gpu(&[2]).to_vec::<f32>());
+    reaches("read_host", || gpu(&[]).item::<f32>());
 }

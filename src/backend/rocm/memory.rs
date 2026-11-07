@@ -60,7 +60,6 @@ fn allocators() -> &'static [CachingAllocator<Hip>] {
 #[derive(Debug)]
 pub(crate) struct DeviceBuffer {
     /// The context whose stream uses the memory; it outlives the buffer.
-    #[cfg_attr(not(test), allow(dead_code))]
     ctx: Arc<Context>,
     index: u32,
     /// Null for 0 bytes, which take no block.
@@ -81,7 +80,7 @@ impl DeviceBuffer {
         self.nbytes
     }
 
-    #[cfg(test)]
+    /// The device address; null for 0 bytes.
     pub fn ptr(&self) -> *mut u8 {
         self.ptr
     }
@@ -91,7 +90,7 @@ impl DeviceBuffer {
         self.size
     }
 
-    #[cfg(test)]
+    /// The context of the buffer's device, whose stream all work on the buffer is queued on.
     pub fn context(&self) -> &Context {
         &self.ctx
     }

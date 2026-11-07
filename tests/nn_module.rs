@@ -787,12 +787,18 @@ fn to_converts_in_place_and_keeps_identity() {
             format!("Module::to only accepts floating point dtypes, but got desired dtype={dtype}")
         );
     }
-    assert_eq!(
-        panic_message(|| net.to(Device::Rocm(0))),
-        "Module::to can't convert parameter \"embed\": copying from cpu to rocm:0 is not \
-         supported yet"
-    );
+    // A device that doesn't exist fails at the first allocation, before anything changed.
+    let m = panic_message(|| net.to(Device::Rocm(99)));
+    if cfg!(feature = "rocm") {
+        assert!(m.starts_with("rocm:99 is not available: "), "{m}");
+    } else {
+        assert_eq!(
+            m,
+            "homura was built without ROCm support; enable the `rocm` feature"
+        );
+    }
     assert_eq!(embed.device(), Device::Cpu);
+    assert!(net.embed.is_same(&embed) && embed.dtype() == DType::F64);
 
     // A device moves integer buffers too; the meta device has no data to move back.
     net.to(Device::Meta);

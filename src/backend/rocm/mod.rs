@@ -5,6 +5,7 @@
 //! call into the library on this thread.
 
 mod context;
+mod copy;
 #[allow(clippy::all, unsafe_op_in_unsafe_fn)]
 mod ffi;
 mod memory;
@@ -13,12 +14,16 @@ use std::ffi::CStr;
 use std::sync::OnceLock;
 
 pub(crate) use context::{context, exec};
+pub(crate) use copy::{download, read_bytes, read_host, try_copy, try_fill, upload, write_host};
 pub(crate) use memory::{
     DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
     reset_peak_memory_stats,
 };
 
 use crate::device::{DeviceProperties, MemInfo};
+
+/// The status of a failure for lack of memory.
+pub(crate) const OUT_OF_MEMORY: ffi::hmr_status = ffi::HMR_OUT_OF_MEMORY;
 
 /// A failed call into the ROCm layer.
 #[derive(Debug)]

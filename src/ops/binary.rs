@@ -477,8 +477,9 @@ impl Tensor {
     #[track_caller]
     pub fn copy_(&self, src: &Tensor) -> &Self {
         let recorded = crate::autograd::check_in_place(self, &[Some(src)]);
-        self.check_copy(src);
-        let (target, s) = (self.clone(), src.clone());
+        let (dst, s) = self.check_copy(src);
+        let s = Tensor::from_data(copy_source(&dst, s));
+        let target = self.clone();
         self.write_in_place(
             recorded,
             move || target.write_copy(&s),
@@ -527,27 +528,36 @@ impl Tensor {
         self
     }
 
-    /// The data half of [`copy_`](Tensor::copy_), with the same checks and panics: writes `src`
-    /// into `self` and bumps the version exactly once, without touching autograd state.
+    /// The data half of [`copy_`](Tensor::copy_), with the same checks: writes `src` into `self`
+    /// and bumps the version exactly once, without touching autograd state. `src` is on the
+    /// device of `self` (or `self` is a meta tensor) and doesn't partially overlap it
+    /// ([`copy_source`] prepares it so). It runs as the closure of
+    /// [`write_in_place`](Tensor::write_in_place), so it returns the device's failure instead of
+    /// panicking for it (review round 124, R149); nothing is written then.
     ///
     /// Every public in-place operation writes its data with this function or
     /// [`write_fill`](Tensor::write_fill), exactly once, and never through another public
     /// in-place operation.
     #[track_caller]
-    pub(crate) fn write_copy(&self, src: &Tensor) {
-        let (dst, mut s) = self.check_copy(src);
+    pub(crate) fn write_copy(&self, src: &Tensor) -> Result<(), backend::DeviceFailure> {
+        let (dst, s) = self.check_copy(src);
         if dst.device() == Device::Meta {
             dst.storage.bump_version();
-            return;
+            return Ok(());
         }
-        if dst.partially_overlaps(&s) {
-            s = clone_data(&s);
-        }
-        // The version changes in the same critical section as the data.
+        assert!(
+            s.device() == dst.device() && !dst.partially_overlaps(&s),
+            "internal error: an unprepared source of an in-place write"
+        );
+        // The version changes in the same critical section as the data, and only if the data
+        // was written.
         backend::exec(dst.device(), || {
-            backend::copy(&dst, &s);
-            dst.storage.bump_version();
-        });
+            let r = backend::copy_unreported(&dst, &s);
+            if r.is_ok() {
+                dst.storage.bump_version();
+            }
+            r
+        })
     }
 
     /// The checks of [`write_copy`](Tensor::write_copy), which can't fail once they pass:
@@ -569,17 +579,38 @@ impl Tensor {
 
     /// The data half of [`fill_`](Tensor::fill_), see [`write_copy`](Tensor::write_copy).
     #[track_caller]
-    pub(crate) fn write_fill(&self, value: Scalar) {
+    pub(crate) fn write_fill(&self, value: Scalar) -> Result<(), backend::DeviceFailure> {
         let dst = self.data();
         check_writable(&dst);
-        if dst.device() != Device::Meta {
-            backend::exec(dst.device(), || {
-                backend::fill(&dst, value);
-                dst.storage.bump_version();
-            });
-        } else {
+        if dst.device() == Device::Meta {
             dst.storage.bump_version();
+            return Ok(());
         }
+        backend::exec(dst.device(), || {
+            let r = backend::fill_unreported(&dst, value);
+            if r.is_ok() {
+                dst.storage.bump_version();
+            }
+            r
+        })
+    }
+}
+
+/// The source that `copy_` writes into `dst` from `src`: `src` moved to the device (and dtype)
+/// of `dst` if it is on another one, or a copy of it if it partially overlaps `dst`. Prepared
+/// before the write, where `#[track_caller]` still names the caller of `copy_` for the failures
+/// of the conversion (review round 124, R149), and outside the target's execution lock, so that
+/// the locks of both devices are taken in their order (`backend::locks`).
+#[track_caller]
+fn copy_source(dst: &TensorData, src: TensorData) -> TensorData {
+    if dst.device() == Device::Meta {
+        src
+    } else if src.device() != dst.device() {
+        crate::tensor::convert_data(&src, dst.dtype, dst.device())
+    } else if dst.partially_overlaps(&src) {
+        clone_data(&src)
+    } else {
+        src
     }
 }
 
@@ -592,11 +623,13 @@ pub(crate) fn copy_error(dst: &TensorData, src: &TensorData) -> Option<String> {
         .or_else(|| copy_device_error(dst, src))
 }
 
+/// Why `copy_` from `src` into `dst` is impossible for their devices: only copying data out of
+/// a meta tensor into a tensor with data is.
 fn copy_device_error(dst: &TensorData, src: &TensorData) -> Option<String> {
     match (dst.device(), src.device()) {
-        (Device::Meta, _) | (Device::Cpu, Device::Cpu) => None,
+        (Device::Meta, _) => None,
         (_, Device::Meta) => Some("Cannot copy out of meta tensor; no data!".into()),
-        (d, sd) => Some(format!("copy from {sd} to {d} is not supported")),
+        _ => None,
     }
 }
 

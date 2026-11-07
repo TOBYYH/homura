@@ -40,9 +40,9 @@ fn add_in_place(target: &Tensor, other: &Tensor, runs: &Rc<Cell<u32>>, recorder:
     let (dst, runs) = (target.clone(), runs.clone());
     let write = Box::new(move || {
         runs.set(runs.get() + 1);
-        dst.write_copy(&result);
+        dst.write_copy(&result)
     });
-    record_in_place(target, write, recorder);
+    record_in_place(target, write, recorder).expect("the CPU doesn't fail");
 }
 
 fn add_formula(target: &Tensor, other: &Tensor) {

@@ -99,6 +99,52 @@ hmr_status hmr_memset_zero(hmr_context_t ctx, void *ptr, uint64_t nbytes);
 hmr_status hmr_copy_to_host(hmr_context_t ctx, void *dst, const void *src, uint64_t nbytes);
 hmr_status hmr_copy_from_host(hmr_context_t ctx, void *dst, const void *src, uint64_t nbytes);
 
+/* Element types, numbered as homura's DType. Bool elements are bytes holding 0 or 1, F16 and
+ * BF16 elements are their 16-bit patterns. */
+#define HMR_BOOL 0
+#define HMR_U8 1
+#define HMR_I8 2
+#define HMR_I16 3
+#define HMR_I32 4
+#define HMR_I64 5
+#define HMR_F16 6
+#define HMR_BF16 7
+#define HMR_F32 8
+#define HMR_F64 9
+
+/* The most dimensions a tensor description has (after the Rust side merges what it can). */
+#define HMR_MAX_DIMS 25
+
+/*
+ * A strided tensor in device memory: the element at index (i_0, ..., i_{ndim-1}) is element
+ * offset + sum_k i_k * strides[k] of the array of `dtype` elements at `data`. Only the first
+ * `ndim` sizes and strides are used; ndim is 0 for a single element. Passed by value to kernels.
+ */
+typedef struct hmr_tensor_desc {
+    void *data;
+    int64_t offset;
+    int32_t dtype;
+    int32_t ndim;
+    int64_t sizes[HMR_MAX_DIMS];
+    int64_t strides[HMR_MAX_DIMS];
+} hmr_tensor_desc;
+
+/*
+ * Queues dst[i] = src[i] for every index of dst, converting src's elements to dst's dtype as
+ * homura's Element::cast does (the same bytes when the dtypes are equal). Both have the same
+ * ndim and sizes; src's strides may be 0 (broadcasting). dst's elements are distinct and don't
+ * partially overlap src's.
+ */
+hmr_status hmr_copy(hmr_context_t ctx, const hmr_tensor_desc *dst, const hmr_tensor_desc *src);
+
+/* Queues setting every element of dst to the value whose bytes are the low bytes of `bits`
+ * (little endian, as many as the element's size). */
+hmr_status hmr_fill(hmr_context_t ctx, const hmr_tensor_desc *dst, uint64_t bits);
+
+/* Queues copying `nbytes` from `src` to `dst`, both device memory of the context's device that
+ * doesn't overlap (hipMemcpyAsync). */
+hmr_status hmr_copy_device(hmr_context_t ctx, void *dst, const void *src, uint64_t nbytes);
+
 /* The architectures this library was built for, separated by ';' (HOMURA_OFFLOAD_ARCH). */
 const char *hmr_built_archs(void);
 
@@ -111,6 +157,11 @@ typedef struct hmr_abi_info {
     int32_t status_values[5];
     int32_t name_len;
     int32_t arch_len;
+    uint32_t desc_size;
+    uint32_t desc_align;
+    uint32_t desc_offsets[6];
+    int32_t dtype_values[10];
+    int32_t max_dims;
 } hmr_abi_info;
 
 void hmr_abi_check(hmr_abi_info *out);
@@ -125,6 +176,10 @@ void hmr_abi_check(hmr_abi_info *out);
  * that a late failure destroys the stream.
  * hmr_test_fail_properties(n): the calling thread's next n hmr_device_properties_get calls fail
  * with HMR_HIP_ERROR, to test that a context created before such a failure is destroyed.
+ * hmr_test_fail_data(n, out_of_memory): the calling thread's next n data operations (hmr_copy,
+ * hmr_fill, hmr_copy_device, hmr_copy_to_host and hmr_copy_from_host) fail before queueing any
+ * work, as their HIP call would: with hipErrorOutOfMemory if out_of_memory is nonzero, else with
+ * hipErrorInvalidHandle (review round 124, R148 and R149).
  * hmr_test_live_streams(): the number of streams the calling thread created and hasn't destroyed.
  * hmr_test_current_device(): the calling thread's current HIP device (hipGetDevice).
  * hmr_test_set_current_device(): hipSetDevice for the calling thread.
@@ -133,6 +188,7 @@ void hmr_abi_check(hmr_abi_info *out);
 void hmr_test_fail_stream_create(int32_t n);
 void hmr_test_fail_after_probe(int32_t n);
 void hmr_test_fail_properties(int32_t n);
+void hmr_test_fail_data(int32_t n, int32_t out_of_memory);
 int32_t hmr_test_live_streams(void);
 hmr_status hmr_test_current_device(int32_t *device);
 hmr_status hmr_test_set_current_device(int32_t device);

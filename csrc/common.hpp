@@ -43,6 +43,10 @@ hmr_status hip_fail(hipError_t error, const char *call) noexcept;
         if (hmr_error_ != hipSuccess) return ::hmr::hip_fail(hmr_error_, #expr);                   \
     } while (0)
 
+// The failure injected by hmr_test_fail_data for the data operation whose HIP call is `call`, or
+// HMR_OK when none is pending for the calling thread.
+hmr_status injected_data_failure(const char *call) noexcept;
+
 // Runs `body` (returning hmr_status), turning C++ exceptions into status codes so that none
 // crosses the C ABI. The handlers don't need host memory, which may be what ran out: a message
 // that needs it falls back to a static one (review round 119, R140).

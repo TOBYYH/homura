@@ -288,6 +288,50 @@ fn rocm_data_path_failures() {
     finish();
 }
 
+/// Failures of the GPU in the elementwise kernels, the optimizers' fused steps and the random
+/// samplers (M4 step 3) panic at the caller's line, as the data path's do.
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_kernel_failures() {
+    use homura::optim::{Optimizer, Sgd};
+    let gpu = Device::Rocm(0);
+    let g = homura::arange_with(6, (DType::F32, gpu));
+    let h = homura::ones_with([6], gpu);
+    let half = homura::ones_with([6], (DType::F16, gpu));
+    let cond = homura::ones_with([6], (DType::Bool, gpu));
+    let m = homura::ones_with([2, 3], gpu);
+    let p = nn::Parameter::new(homura::ones_with([6], gpu));
+    p.set_grad(Some(homura::ones_with([6], gpu)));
+    let mut sgd = Sgd::new([p.clone()], 0.1);
+    for oom in [false, true] {
+        at!(failing(&g, oom).exp());
+        at!(failing(&g, oom).add(&h));
+        at!(failing(&half, oom).mul(2.0));
+        at!(homura::where_(failing(&cond, oom), &g, &h));
+        at!(failing(&m, oom).triu(0));
+        at!(failing(&m, oom).flip([1]));
+        at!(failing(&g, oom).add_(&h));
+        failing(&g, oom);
+        at!(sgd.step());
+        at!(homura::rand_with([5], failing_gpu(oom)));
+        at!(homura::randn_with([5], failing_gpu(oom)));
+        at!(homura::randint_with(0, 3, [5], failing_gpu(oom)));
+        at!(homura::randint_with(0, 4, [5], failing_gpu(oom)));
+    }
+    // More dimensions than the kernels take.
+    let deep = homura::zeros_with(vec![2usize; 26], (DType::F32, gpu))
+        .permute((0..26).rev().collect::<Vec<i64>>());
+    at!(deep.neg());
+    at!(deep.add(&deep));
+    at!(deep.flip([0]));
+    at!(deep.triu(0));
+    drop(deep);
+    // SAFETY: a testing hook without preconditions.
+    unsafe { hmr_test_fail_data(0, 0) };
+    assert_eq!(g.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    finish();
+}
+
 /// A module with one linear layer and one non-module field, for the module tests.
 #[derive(Module)]
 struct Net {

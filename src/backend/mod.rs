@@ -4,7 +4,8 @@
 //! backend's kernels and pick the backend by device. The meta device has no data: callers return
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
 //! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics. Moving data
-//! (reading, writing, copying, filling and the transfers between devices) works on ROCm.
+//! (reading, writing, copying, filling and the transfers between devices) and the elementwise
+//! kernels work on ROCm.
 
 #[cfg(any(feature = "rocm", test))]
 pub(crate) mod caching;
@@ -311,12 +312,12 @@ fn host_device_copy(dst: &TensorData, src: &TensorData) -> Result<(), AllocError
 
 #[track_caller]
 pub(crate) fn unary(op: UnaryOp, out: &TensorData, src: &TensorData) {
-    dispatch!(out, unary(op, out, src))
+    dispatch_rocm!(out, unary(op, out, src))
 }
 
 #[track_caller]
 pub(crate) fn binary(op: BinaryOp, out: &TensorData, a: &TensorData, b: &TensorData) {
-    dispatch!(out, binary(op, out, a, b))
+    dispatch_rocm!(out, binary(op, out, a, b))
 }
 
 #[track_caller]
@@ -327,7 +328,7 @@ pub(crate) fn binary_scalar(
     s: f64,
     scalar_first: bool,
 ) {
-    dispatch!(out, binary_scalar(op, out, a, s, scalar_first))
+    dispatch_rocm!(out, binary_scalar(op, out, a, s, scalar_first))
 }
 
 #[track_caller]
@@ -338,12 +339,12 @@ pub(crate) fn fused(
     b: &TensorData,
     c: Option<&TensorData>,
 ) {
-    dispatch!(out, fused(op, out, a, b, c))
+    dispatch_rocm!(out, fused(op, out, a, b, c))
 }
 
 #[track_caller]
 pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &TensorData) {
-    dispatch!(out, where_(out, cond, x, y))
+    dispatch_rocm!(out, where_(out, cond, x, y))
 }
 
 #[track_caller]
@@ -395,12 +396,12 @@ pub(crate) fn gather(out: &TensorData, src: &TensorData, dim: usize, index: &[us
 
 #[track_caller]
 pub(crate) fn triangle(out: &TensorData, src: &TensorData, diagonal: i64, upper: bool) {
-    dispatch!(out, triangle(out, src, diagonal, upper))
+    dispatch_rocm!(out, triangle(out, src, diagonal, upper))
 }
 
 #[track_caller]
 pub(crate) fn flip(out: &TensorData, src: &TensorData, mask: &[bool]) {
-    dispatch!(out, flip(out, src, mask))
+    dispatch_rocm!(out, flip(out, src, mask))
 }
 
 #[track_caller]

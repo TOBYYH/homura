@@ -21,6 +21,45 @@ pub const HMR_BF16: i32 = 7;
 pub const HMR_F32: i32 = 8;
 pub const HMR_F64: i32 = 9;
 pub const HMR_MAX_DIMS: i32 = 25;
+pub const HMR_UNARY_NEG: i32 = 0;
+pub const HMR_UNARY_ABS: i32 = 1;
+pub const HMR_UNARY_SIGN: i32 = 2;
+pub const HMR_UNARY_RELU: i32 = 3;
+pub const HMR_UNARY_EXP: i32 = 4;
+pub const HMR_UNARY_LOG: i32 = 5;
+pub const HMR_UNARY_SQRT: i32 = 6;
+pub const HMR_UNARY_RSQRT: i32 = 7;
+pub const HMR_UNARY_RECIPROCAL: i32 = 8;
+pub const HMR_UNARY_SIN: i32 = 9;
+pub const HMR_UNARY_COS: i32 = 10;
+pub const HMR_UNARY_ERF: i32 = 11;
+pub const HMR_UNARY_TANH: i32 = 12;
+pub const HMR_UNARY_SIGMOID: i32 = 13;
+pub const HMR_UNARY_LOG_SIGMOID: i32 = 14;
+pub const HMR_UNARY_SILU: i32 = 15;
+pub const HMR_UNARY_GELU: i32 = 16;
+pub const HMR_UNARY_GELU_TANH: i32 = 17;
+pub const HMR_UNARY_LOGICAL_NOT: i32 = 18;
+pub const HMR_BINARY_ADD: i32 = 0;
+pub const HMR_BINARY_SUB: i32 = 1;
+pub const HMR_BINARY_MUL: i32 = 2;
+pub const HMR_BINARY_DIV: i32 = 3;
+pub const HMR_BINARY_POW: i32 = 4;
+pub const HMR_BINARY_MAXIMUM: i32 = 5;
+pub const HMR_BINARY_MINIMUM: i32 = 6;
+pub const HMR_BINARY_GREATER: i32 = 7;
+pub const HMR_BINARY_GREATER_EQUAL: i32 = 8;
+pub const HMR_BINARY_LESS: i32 = 9;
+pub const HMR_BINARY_LESS_EQUAL: i32 = 10;
+pub const HMR_BINARY_EQUAL: i32 = 11;
+pub const HMR_BINARY_NOT_EQUAL: i32 = 12;
+pub const HMR_BINARY_LOGICAL_AND: i32 = 13;
+pub const HMR_BINARY_LOGICAL_OR: i32 = 14;
+pub const HMR_FUSED_SCALED_ADD: i32 = 0;
+pub const HMR_FUSED_LERP: i32 = 1;
+pub const HMR_FUSED_ADDCMUL: i32 = 2;
+pub const HMR_FUSED_ADDCDIV: i32 = 3;
+pub const HMR_RANDOM_INT_TILE: i32 = 256;
 pub type hmr_status = i32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -102,6 +141,83 @@ unsafe extern "C" {
         dst: *mut ::core::ffi::c_void,
         src: *const ::core::ffi::c_void,
         nbytes: u64,
+    ) -> hmr_status;
+    pub fn hmr_unary(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_binary(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        a: *const hmr_tensor_desc,
+        b: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_binary_scalar(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        a: *const hmr_tensor_desc,
+        s: f64,
+        scalar_first: i32,
+    ) -> hmr_status;
+    pub fn hmr_fused(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        a: *const hmr_tensor_desc,
+        b: *const hmr_tensor_desc,
+        c: *const hmr_tensor_desc,
+        coefficient: f64,
+        small: i32,
+    ) -> hmr_status;
+    pub fn hmr_where(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        cond: *const hmr_tensor_desc,
+        x: *const hmr_tensor_desc,
+        y: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_triangle(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        diagonal: i64,
+        upper: i32,
+    ) -> hmr_status;
+    pub fn hmr_flip(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_random_uniform(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        seed: u64,
+        offset: u64,
+        from: f64,
+        to: f64,
+    ) -> hmr_status;
+    pub fn hmr_random_normal(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        seed: u64,
+        offset: u64,
+        mean: f64,
+        std: f64,
+    ) -> hmr_status;
+    pub fn hmr_random_int(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        seed: u64,
+        offset: u64,
+        blocks: u64,
+        low: i64,
+        range: u64,
+        threshold: u64,
+        workspace: *mut ::core::ffi::c_void,
     ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);

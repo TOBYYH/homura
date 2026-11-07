@@ -11,7 +11,7 @@ use crate::{DType, Device, Element, Scalar};
 /// The most dimensions of a kernel operand, after merging (`HMR_MAX_DIMS`, PyTorch's limit too).
 pub(crate) const MAX_DIMS: usize = ffi::HMR_MAX_DIMS as usize;
 
-fn dtype_code(dtype: DType) -> i32 {
+pub(super) fn dtype_code(dtype: DType) -> i32 {
     match dtype {
         DType::Bool => ffi::HMR_BOOL,
         DType::U8 => ffi::HMR_U8,
@@ -65,7 +65,7 @@ pub(crate) fn merge_dims<const N: usize>(
 ///
 /// Panics (an internal error) for storage without device memory.
 #[track_caller]
-fn descs<const N: usize>(
+pub(super) fn descs<const N: usize>(
     kernel: &str,
     operands: [&TensorData; N],
 ) -> Result<Option<[ffi::hmr_tensor_desc; N]>, Failure> {
@@ -74,6 +74,24 @@ fn descs<const N: usize>(
     let Some(dims) = merge_dims(shape, strides) else {
         return Ok(None);
     };
+    let dims: Vec<(usize, [i64; N])> = dims
+        .into_iter()
+        .map(|(size, st)| (size, st.map(|s| s as i64)))
+        .collect();
+    let offsets = operands.map(|d| d.layout.offset as i64);
+    descs_with_dims(kernel, operands, offsets, &dims).map(Some)
+}
+
+/// The kernel descriptions of `operands` with the given element offsets and dimensions
+/// (`(size, stride of each operand)`, outermost first). Fails like [`descs`] for more than
+/// [`MAX_DIMS`] dimensions.
+#[track_caller]
+pub(super) fn descs_with_dims<const N: usize>(
+    kernel: &str,
+    operands: [&TensorData; N],
+    offsets: [i64; N],
+    dims: &[(usize, [i64; N])],
+) -> Result<[ffi::hmr_tensor_desc; N], Failure> {
     if dims.len() > MAX_DIMS {
         return Err(Failure {
             status: ffi::HMR_INVALID,
@@ -84,20 +102,20 @@ fn descs<const N: usize>(
             ),
         });
     }
-    Ok(Some(std::array::from_fn(|k| {
+    Ok(std::array::from_fn(|k| {
         let d = operands[k];
         // SAFETY: all-zero bytes are a valid description.
         let mut desc: ffi::hmr_tensor_desc = unsafe { std::mem::zeroed() };
         desc.data = buffer(kernel, d).ptr().cast();
-        desc.offset = d.layout.offset as i64;
+        desc.offset = offsets[k];
         desc.dtype = dtype_code(d.dtype);
         desc.ndim = dims.len() as i32;
         for (j, (size, st)) in dims.iter().enumerate() {
             desc.sizes[j] = *size as i64;
-            desc.strides[j] = st[k] as i64;
+            desc.strides[j] = st[k];
         }
         desc
-    })))
+    }))
 }
 
 /// The device memory of `data`'s storage.
@@ -107,14 +125,14 @@ fn descs<const N: usize>(
 /// Panics (an internal error) for storage without device memory: the placeholders of the unit
 /// tests (`storage::fake_rocm`), which reach kernels without being able to run them.
 #[track_caller]
-fn buffer<'a>(kernel: &str, data: &'a TensorData) -> &'a super::DeviceBuffer {
+pub(super) fn buffer<'a>(kernel: &str, data: &'a TensorData) -> &'a super::DeviceBuffer {
     match data.storage.try_rocm_buffer() {
         Some(b) => b,
         None => panic!("internal error: {kernel} on ROCm storage without device memory"),
     }
 }
 
-fn device_index(data: &TensorData) -> u32 {
+pub(super) fn device_index(data: &TensorData) -> u32 {
     match data.device() {
         Device::Rocm(i) => i,
         d => panic!("internal error: a ROCm kernel got a {d} tensor"),

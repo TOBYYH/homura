@@ -100,6 +100,12 @@ impl Context {
         call(unsafe { ffi::hmr_copy_device(self.raw, dst.cast(), src.cast(), nbytes as u64) })
     }
 
+    /// The library's handle, for the kernel wrappers that call the library themselves. Calls
+    /// that queue work on the stream belong inside the device's execution lock.
+    pub(super) fn raw(&self) -> ffi::hmr_context_t {
+        self.raw
+    }
+
     #[cfg(test)]
     pub fn index(&self) -> u32 {
         self.index

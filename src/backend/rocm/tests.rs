@@ -664,3 +664,158 @@ fn failed_data_operations_panic_and_in_place_writes_keep_their_version() {
     assert_eq!(t.data().storage.version(), version + 2);
     assert_eq!(t.to_vec::<f32>(), [9.0; 4]);
 }
+
+/// Pseudo-random values of a float dtype on the CPU: a mix of magnitudes, signs, zeros and
+/// values that overflow or vanish in F16.
+fn mixed_floats(dtype: crate::DType, n: usize, seed: u64) -> crate::Tensor {
+    let mut s = seed;
+    let v: Vec<f64> = (0..n)
+        .map(|i| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (s >> 11) as f64 / (1u64 << 53) as f64;
+            let e = ((s >> 3) % 40) as i32 - 20;
+            match i % 17 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => 7e4,
+                3 => 1e-7,
+                _ => (u * 2.0 - 1.0) * 2f64.powi(e),
+            }
+        })
+        .collect();
+    crate::Tensor::from_slice(&v, [n]).to(dtype)
+}
+
+/// The same bits on both devices (a NaN only has to meet a NaN).
+#[track_caller]
+fn assert_same_bits(gpu: &crate::Tensor, cpu: &crate::Tensor, what: &str) {
+    let (g, c) = (
+        gpu.to((crate::DType::F64, crate::Device::Cpu))
+            .to_vec::<f64>(),
+        cpu.to(crate::DType::F64).to_vec::<f64>(),
+    );
+    for (i, (a, b)) in g.iter().zip(&c).enumerate() {
+        assert!(
+            a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan(),
+            "{what}: element {i}: gpu {a:e}, cpu {b:e}"
+        );
+    }
+}
+
+/// `binary_scalar` in its three forms, `s / a` included (only the formulas use it), on every
+/// float dtype, with scalars that round differently in f32 and in the dtype.
+#[test]
+fn scalar_products_and_quotients_match_the_cpu() {
+    use crate::backend::cpu;
+    use crate::ops::BinaryOp;
+    use crate::{DType, Device, Tensor};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let a = mixed_floats(dtype, 1031, 1);
+        let ag = a.to(gpu);
+        for s in [
+            2.5,
+            1.0 / 3.0,
+            1e-5,
+            70000.0,
+            1e300,
+            -0.0,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            for (op, first) in [
+                (BinaryOp::Mul, false),
+                (BinaryOp::Div, false),
+                (BinaryOp::Div, true),
+            ] {
+                let (out, outg) = (
+                    Tensor::empty_on(a.shape(), dtype, Device::Cpu),
+                    Tensor::empty_on(a.shape(), dtype, gpu),
+                );
+                cpu::binary_scalar(op, &out.data(), &a.data(), s, first);
+                super::binary_scalar(op, &outg.data(), &ag.data(), s, first);
+                assert_same_bits(&outg, &out, &format!("{dtype} {op:?} {s} first={first}"));
+            }
+        }
+    }
+}
+
+/// Every fused step on every float dtype, with coefficients on both sides of Lerp's 0.5 and
+/// ones that round in the dtype (alpha) or only in f32 (the others): the FMA positions and the
+/// coefficients' roundings are the CPU's.
+#[test]
+fn fused_steps_match_the_cpu() {
+    use crate::backend::{Fused, cpu};
+    use crate::{DType, Device, Tensor};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        let [a, b, c] = [2, 3, 4].map(|seed| mixed_floats(dtype, 1031, seed));
+        let [ag, bg, cg] = [&a, &b, &c].map(|t| t.to(gpu));
+        let coefficients = [
+            0.1,
+            -0.3,
+            0.49999,
+            0.5,
+            0.9,
+            1.0 + 1e-4,
+            -1.7,
+            1.0 / 3.0,
+            1e-30,
+        ];
+        for v in coefficients {
+            for op in [
+                Fused::ScaledAdd(v),
+                Fused::Lerp(v),
+                Fused::Addcmul(v),
+                Fused::Addcdiv(v),
+            ] {
+                let three = matches!(op, Fused::Addcmul(_) | Fused::Addcdiv(_));
+                let out = Tensor::empty_on(a.shape(), dtype, Device::Cpu);
+                let outg = Tensor::empty_on(a.shape(), dtype, gpu);
+                let (cd, cgd) = (c.data(), cg.data());
+                cpu::fused(op, &out.data(), &a.data(), &b.data(), three.then_some(&cd));
+                super::fused(
+                    op,
+                    &outg.data(),
+                    &ag.data(),
+                    &bg.data(),
+                    three.then_some(&cgd),
+                );
+                assert_same_bits(&outg, &out, &format!("{dtype} {op:?}"));
+            }
+        }
+    }
+}
+
+/// In-place elementwise operations on the GPU bump the version as often as on the CPU, and an
+/// operation whose kernel fails changes neither the data nor the version.
+#[test]
+fn in_place_elementwise_versions_match_the_cpu() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    for device in [Device::Cpu, Device::Rocm(0)] {
+        let t = crate::arange_with(6, (DType::F32, device));
+        let u = crate::ones_with([6], device);
+        let v0 = t.data().storage.version();
+        t.add_(&u).mul_(2.0).sub_(1.0).clamp_(0.0, 5.0);
+        let bumps = t.data().storage.version() - v0;
+        assert_eq!(bumps, 4, "{device}");
+        assert_eq!(t.to_vec::<f32>(), [1.0, 3.0, 5.0, 5.0, 5.0, 5.0]);
+    }
+    let gpu = Device::Rocm(0);
+    let t = crate::arange_with(6, (DType::F32, gpu));
+    let v0 = t.data().storage.version();
+    fail_data(1, false);
+    assert!(
+        panic_message(|| {
+            t.add_(1.0);
+        })
+        .contains("invalid resource handle")
+    );
+    assert_eq!(t.data().storage.version(), v0);
+    assert_eq!(t.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+}

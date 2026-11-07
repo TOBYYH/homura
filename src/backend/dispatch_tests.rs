@@ -23,13 +23,23 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 6] = [
+const IMPLEMENTED: [&str; 16] = [
     "write_host",
     "read_host",
     "copy",
     "fill",
     "upload",
     "download",
+    "unary",
+    "binary",
+    "binary_scalar",
+    "fused",
+    "where_",
+    "triangle",
+    "flip",
+    "uniform",
+    "normal",
+    "randint",
 ];
 
 /// Asserts that `f` panics in the ROCm arm of the dispatch layer, in `kernel`.
@@ -92,6 +102,35 @@ fn elementwise() {
     });
     reaches("triangle", || gpu(&[2, 2]).triu(0));
     reaches("flip", || gpu(&[2, 2]).flip([0]));
+    // The optimizers' steps run fused kernels on the parameters' device.
+    reaches("fused", || {
+        use crate::optim::Optimizer;
+        let p = crate::nn::Parameter::new(gpu(&[2]));
+        p.set_grad(Some(gpu(&[2])));
+        crate::optim::Sgd::new([p], 0.1).step();
+    });
+}
+
+/// Random sampling on a ROCm device computes the samples there (M4 step 3, item 4). Without the
+/// `rocm` feature it stops at the device like every kernel.
+#[test]
+fn random_sampling() {
+    let host_path = !cfg!(feature = "rocm");
+    reaches(if host_path { "write_host" } else { "uniform" }, || {
+        crate::rand_with([3], GPU)
+    });
+    reaches(if host_path { "write_host" } else { "normal" }, || {
+        crate::randn_with([3], GPU)
+    });
+    // With rejection (a range that doesn't divide 2^64) and without.
+    for (low, high) in [(0, 3), (0, 4)] {
+        reaches(if host_path { "write_host" } else { "randint" }, || {
+            crate::randint_with(low, high, [3], GPU)
+        });
+    }
+    reaches(if host_path { "write_host" } else { "uniform" }, || {
+        gpu(&[2]).uniform_(0.0, 1.0);
+    });
 }
 
 #[test]

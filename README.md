@@ -53,11 +53,13 @@ Implemented so far:
   device memory from a caching allocator (`memory_stats`, `reset_peak_memory_stats`,
   `empty_cache`, which the CPU reports too). Tensors move to and from a ROCm GPU with `to`
   (`try_to` reports running out of memory), are created, copied, filled, converted between
-  dtypes (with exactly the CPU's results) and read back there, but operations that compute don't
-  run on the GPU yet.
+  dtypes (with exactly the CPU's results) and read back there. Elementwise operations, the
+  optimizers' steps and random sampling run on the GPU with the CPU's results (bit for bit, apart
+  from the last place of transcendental functions); reductions, matrix products, indexing,
+  pooling and convolutions don't yet.
 
-Not available yet: computing on GPUs (ROCm comes first), most neural network layers, autograd
-hooks, and in-place operations on views that require grad.
+Not available yet: most operations on GPUs (ROCm comes first), most neural network layers,
+autograd hooks, and in-place operations on views that require grad.
 
 ## Example
 

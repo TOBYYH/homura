@@ -29,8 +29,19 @@ All notable changes to this project are documented in this file. The format is b
   returning when the data has arrived) and between GPUs (through the host), and converts dtypes
   on the GPU with exactly the CPU's results, NaN payloads included. `copy_` (also from another
   device), `fill_`, the creation functions, `to_vec`, `item` and `Display` work on GPU tensors,
-  and so do the backward passes of `to` and `copy_` between devices and `Module::to`. Operations
-  that compute (arithmetic, reductions, matrix products, ...) don't run on the GPU yet.
+  and so do the backward passes of `to` and `copy_` between devices and `Module::to`.
+- Elementwise operations on ROCm GPUs: the unary and binary operations, comparisons, logic,
+  `where_`, `masked_fill`, `clamp`, `triu` / `tril` and `flip`, their in-place forms, and their
+  gradients where these need no reduction (a broadcast operand's does). They compute what the CPU
+  computes, in the same order and types; the results are the CPU's bit for bit except for exp, log,
+  sin, cos, tanh, erf, pow and the functions built from them, which use the GPU's math library and
+  may differ in the last places (relative to their largest intermediate value, so more where they
+  cancel, as gelu does for large negative inputs). The steps of `Sgd`, `Adam` and `AdamW` on GPU
+  parameters give the CPU's (and PyTorch's) bits, with the coefficient checks of the CPU.
+- Random sampling on ROCm GPUs runs there with the same generator: `rand`, `uniform_`,
+  `randint` and `dropout` give the CPU's samples bit for bit for the same seed, also when calls
+  on both devices alternate; `randn` and `normal_` use the GPU's log, cos and sin. Reductions,
+  matrix products, indexing, pooling and convolutions don't run on the GPU yet.
 - `Tensor::try_to`, `try_zeros_with`, `try_ones_with` and `try_full_with` return
   `Error::OutOfMemory` (`OutOfMemoryError`: the device, the requested bytes and a message like
   PyTorch's) when a device refuses memory, including the staging of a transfer and a GPU's first

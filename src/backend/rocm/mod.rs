@@ -6,15 +6,18 @@
 
 mod context;
 mod copy;
+mod elementwise;
 #[allow(clippy::all, unsafe_op_in_unsafe_fn)]
 mod ffi;
 mod memory;
+pub(crate) mod random;
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
 
 pub(crate) use context::{context, exec};
 pub(crate) use copy::{download, read_bytes, read_host, try_copy, try_fill, upload, write_host};
+pub(crate) use elementwise::{binary, binary_scalar, flip, fused, triangle, unary, where_};
 pub(crate) use memory::{
     DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
     reset_peak_memory_stats,

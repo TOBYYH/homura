@@ -50,6 +50,11 @@ fn philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
 }
 
 /// Seeds the global random number generator.
+///
+/// The generator is shared by all devices: a ROCm GPU computes its samples from the same
+/// sequence, so uniform samples, integers and Dropout's masks are the CPU's bit for bit, also
+/// when calls on the CPU and the GPU alternate. Normal samples use the GPU's `log`, `cos` and
+/// `sin`, which may differ from the CPU's in the last place.
 #[track_caller]
 pub fn manual_seed(seed: u64) {
     let _rank = locks::acquire(Rank::Generator);
@@ -58,15 +63,18 @@ pub fn manual_seed(seed: u64) {
     g.offset = 0;
 }
 
+/// Reserves `blocks` Philox blocks: the generator's seed and the first block.
+fn reserve_blocks(blocks: u64) -> (u64, u64) {
+    let _rank = locks::acquire(Rank::Generator);
+    let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
+    let start = g.offset;
+    g.offset += blocks;
+    (g.seed, start)
+}
+
 /// Reserves `blocks` Philox blocks and returns a function producing them.
 fn reserve(blocks: u64) -> impl Fn(u64) -> [u32; 4] {
-    let (seed, start) = {
-        let _rank = locks::acquire(Rank::Generator);
-        let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
-        let start = g.offset;
-        g.offset += blocks;
-        (g.seed, start)
-    };
+    let (seed, start) = reserve_blocks(blocks);
     let key = [seed as u32, (seed >> 32) as u32];
     move |i| {
         let n = start + i;
@@ -210,15 +218,21 @@ fn sample_float(n: usize, dist: &Dist, dtype: DType) -> Vec<f64> {
     out
 }
 
+/// The number of values in `[low, high)`, which must be nonempty, and the threshold below
+/// which [`sample_int`] rejects a word.
+fn int_range(low: i64, high: i64) -> (u64, u64) {
+    // `high - low` is in `1..=u64::MAX`, which may not fit in `i64`.
+    let range = (high as i128 - low as i128) as u64;
+    // Words below `2^64 mod range` would make small results more likely.
+    (range, range.wrapping_neg() % range)
+}
+
 /// Samples `n` integers uniformly from `[low, high)`, which must be nonempty.
 ///
 /// Uses rejection sampling on 64-bit words, so every value is equally likely even for ranges
 /// that don't divide `2^64`.
 fn sample_int(n: usize, low: i64, high: i64) -> Vec<i64> {
-    // `high - low` is in `1..=u64::MAX`, which may not fit in `i64`.
-    let range = (high as i128 - low as i128) as u64;
-    // Words below `2^64 mod range` would make small results more likely.
-    let threshold = range.wrapping_neg() % range;
+    let (range, threshold) = int_range(low, high);
     let mut out = Vec::with_capacity(n);
     let mut words: Vec<u64> = vec![];
     while out.len() < n {
@@ -245,8 +259,11 @@ fn sample_int(n: usize, low: i64, high: i64) -> Vec<i64> {
 #[track_caller]
 fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tensor {
     dist.validate(dtype);
-    if device == Device::Meta {
-        return Tensor::empty_on(shape, dtype, device);
+    match device {
+        Device::Meta => return Tensor::empty_on(shape, dtype, device),
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => return rocm_random_tensor(shape, dtype, device, dist),
+        _ => {}
     }
     let n = shape.num_elements();
     match dist {
@@ -270,6 +287,65 @@ fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tens
                     .collect();
                 Tensor::from_host(&v, shape, device)
             })
+        }
+    }
+}
+
+/// [`random_tensor`] on a ROCm device: the samples of the CPU's blocks computed there (M4 plan,
+/// step 3, item 4). Uniform samples and integers are the CPU's bit for bit; normal samples use
+/// the device library's log, cos and sin.
+#[cfg(feature = "rocm")]
+#[track_caller]
+fn rocm_random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tensor {
+    use crate::backend::rocm::random;
+    let n = shape.num_elements();
+    match dist {
+        Dist::Uniform(from, to) => {
+            let out = Tensor::empty_on(shape, dtype, device);
+            let per_block = if dtype == DType::F64 { 2 } else { 4 };
+            let (seed, start) = reserve_blocks(n.div_ceil(per_block) as u64);
+            random::uniform(&out.data(), seed, start, from, to);
+            out
+        }
+        Dist::Normal(mean, std) => {
+            let out = Tensor::empty_on(shape, dtype, device);
+            let (seed, start) = reserve_blocks(n.div_ceil(2) as u64);
+            random::normal(&out.data(), seed, start, mean, std);
+            out
+        }
+        Dist::Int(low, high) => {
+            let out = Tensor::empty_on(shape, DType::I64, device);
+            let (range, threshold) = int_range(low, high);
+            // Batches never need more blocks than the first, which needs one per two values.
+            let workspace = (threshold != 0).then(|| random::int_workspace(device, n.div_ceil(2)));
+            let flat = out.reshape([n]);
+            // As on the CPU, each batch reserves a block per two values still needed and the
+            // tail of the last one is dropped. The generator stays locked from the first batch
+            // until the last one has advanced it, so no other call reserves in between
+            // (generator before execution locks, see `backend::locks`).
+            let _rank = locks::acquire(Rank::Generator);
+            let mut g = GENERATOR.lock().unwrap_or_else(|e| e.into_inner());
+            let mut done = 0;
+            while done < n {
+                let needed = n - done;
+                let blocks = needed.div_ceil(2) as u64;
+                let start = g.offset;
+                g.offset += blocks;
+                let part = flat.narrow(0, done as i64, needed).data();
+                let accepted = random::int_batch(
+                    &part,
+                    g.seed,
+                    start,
+                    blocks,
+                    low,
+                    range,
+                    threshold,
+                    workspace.as_ref(),
+                );
+                done += accepted.map_or(needed, |a| (a as usize).min(needed));
+            }
+            drop(g);
+            out.to(dtype)
         }
     }
 }

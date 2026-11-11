@@ -23,7 +23,7 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 21] = [
+const IMPLEMENTED: [&str; 34] = [
     "write_host",
     "read_host",
     "copy",
@@ -45,6 +45,19 @@ const IMPLEMENTED: [&str; 21] = [
     "arg_reduce",
     "softmax",
     "exclusive_cumprod",
+    "index_select",
+    "gather",
+    "index_add",
+    "scatter_add",
+    "index_overwrite",
+    "index_positions",
+    "mask_coordinates",
+    "out_of_range",
+    "max_pool2d",
+    "max_pool2d_backward",
+    "adaptive_avg_pool2d",
+    "adaptive_avg_pool2d_backward",
+    "unfold_backward",
 ];
 
 /// Asserts that `f` panics in the ROCm arm of the dispatch layer, in `kernel`.
@@ -155,18 +168,53 @@ fn indexing_and_pooling() {
     reaches("index_select", || {
         drop(gpu(&[3, 2]).index_select(0, &gpu_index(2)))
     });
-    // Advanced indexing with CPU indices reads them, then gathers on the GPU; GPU indices are
-    // read from the GPU.
-    reaches("index_select", || {
-        drop(gpu(&[3, 2]).index(cpu_index(&[0, 2])))
+    // Advanced indexing copies CPU indices to the GPU first (a snapshot), then checks them and
+    // computes the positions there; GPU indices are checked there directly.
+    reaches(
+        if cfg!(feature = "rocm") {
+            "upload"
+        } else {
+            "index_positions"
+        },
+        || drop(gpu(&[3, 2]).index(cpu_index(&[0, 2]))),
+    );
+    reaches("index_positions", || gpu(&[3, 2]).index(gpu_index(2)));
+    reaches("mask_coordinates", || {
+        gpu(&[3, 2]).index(crate::zeros_with([3, 2], (DType::Bool, GPU)))
     });
-    reaches("read_host", || gpu(&[3, 2]).index(gpu_index(2)));
-    reaches("read_host", || gpu(&[3]).gather(0, &gpu_index(2)));
-    reaches("read_host", || {
+    reaches("gather", || gpu(&[3]).gather(0, &gpu_index(2)));
+    // index_add and scatter_add copy `self` first; the kernels themselves come after.
+    reaches("copy", || {
         drop(gpu(&[3]).index_add(0, &gpu_index(2), &gpu(&[2])))
     });
-    reaches("read_host", || {
+    reaches("copy", || {
         drop(gpu(&[3]).scatter_add(0, &gpu_index(2), &gpu(&[2])))
+    });
+    // Made inside the closures: without the `rocm` feature, making them panics already.
+    let operands = || (gpu(&[3]).data(), gpu_index(2).data(), gpu(&[2]).data());
+    reaches("index_add", || {
+        let (out, index, src) = operands();
+        super::index_add(&out, 0, &index, &src, super::Bounds::NonNegative)
+    });
+    reaches("index_overwrite", || {
+        let (out, index, src) = operands();
+        super::index_overwrite(&out, 0, &index, &src)
+    });
+    reaches("scatter_add", || {
+        let (out, index, src) = operands();
+        super::scatter_add(&out, 0, &index, &src)
+    });
+    reaches("out_of_range", || {
+        drop(F::embedding(&gpu_index(2), &gpu(&[3, 2]), None))
+    });
+    reaches("out_of_range", || {
+        drop(F::nll_loss(
+            &gpu(&[2, 3]),
+            &gpu_index(2),
+            None,
+            -100,
+            F::Reduction::Mean,
+        ))
     });
     let pool = MaxPool2dOptions::new([2, 2]);
     reaches("max_pool2d", || {
@@ -174,6 +222,29 @@ fn indexing_and_pooling() {
     });
     reaches("adaptive_avg_pool2d", || {
         drop(F::adaptive_avg_pool2d(&gpu(&[1, 1, 4, 4]), [2, 2]))
+    });
+    reaches("max_pool2d_backward", || {
+        let indices = crate::zeros_with([1, 1, 2, 2], (DType::I64, GPU));
+        drop(crate::ops::max_pool2d_backward(
+            &gpu(&[1, 1, 2, 2]),
+            &gpu(&[1, 1, 4, 4]),
+            &indices,
+        ))
+    });
+    reaches("adaptive_avg_pool2d_backward", || {
+        drop(crate::ops::adaptive_avg_pool2d_backward(
+            &gpu(&[1, 1, 2, 2]),
+            &gpu(&[1, 1, 4, 4]),
+        ))
+    });
+    reaches("unfold_backward", || {
+        drop(crate::ops::unfold_backward(
+            &gpu(&[3, 2]),
+            &crate::Shape::new(&[4]),
+            0,
+            2,
+            1,
+        ))
     });
 }
 

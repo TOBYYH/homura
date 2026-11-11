@@ -94,9 +94,9 @@ pub(crate) fn reduce(op: ReduceOp, out: &TensorData, src: &TensorData, mask: &[b
     match op {
         ReduceOp::Sum | ReduceOp::Prod | ReduceOp::Mean if dtype.is_floating_point() => {
             dispatch_float!(dtype, T => match op {
-                ReduceOp::Sum => fold::<T, T, f64>(out, src, mask, 0.0, |a, x| a + x.to_f64(), |a, _| T::from_f64(a)),
-                ReduceOp::Prod => fold::<T, T, f64>(out, src, mask, 1.0, |a, x| a * x.to_f64(), |a, _| T::from_f64(a)),
-                _ => fold::<T, T, f64>(out, src, mask, 0.0, |a, x| a + x.to_f64(), |a, n| T::from_f64(a / n as f64)),
+                ReduceOp::Sum => fold::<T, T, f64>(out, src, mask, 0.0, |a, x| a + x.to_f64(), |a, _| <T as Sealed>::from_f64(a)),
+                ReduceOp::Prod => fold::<T, T, f64>(out, src, mask, 1.0, |a, x| a * x.to_f64(), |a, _| <T as Sealed>::from_f64(a)),
+                _ => fold::<T, T, f64>(out, src, mask, 0.0, |a, x| a + x.to_f64(), |a, n| <T as Sealed>::from_f64(a / n as f64)),
             })
         }
         ReduceOp::Sum | ReduceOp::Prod => {
@@ -163,7 +163,7 @@ pub(crate) fn var(
                 // An empty reduction has no mean, whatever the correction.
                 let v = if count == 0 { f64::NAN } else { sq / divisor };
                 // SAFETY: `out` is contiguous with one element per kept position.
-                unsafe { *po.add(o) = T::from_f64(if take_sqrt { v.sqrt() } else { v }) };
+                unsafe { *po.add(o) = <T as Sealed>::from_f64(if take_sqrt { v.sqrt() } else { v }) };
             })
         });
     })

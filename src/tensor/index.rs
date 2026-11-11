@@ -719,7 +719,12 @@ impl Tensor {
         shape[dim] = idx.layout.num_elements();
         let out = Tensor::empty_on(shape, src.dtype, device);
         if device != Device::Meta {
-            backend::index_select(&out.data(), &src, dim, &idx, allow_negative);
+            let bounds = if allow_negative {
+                backend::Bounds::AllowNegative
+            } else {
+                backend::Bounds::NonNegative
+            };
+            backend::index_select(&out.data(), &src, dim, &idx, bounds);
         }
         out
     }

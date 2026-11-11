@@ -12,9 +12,9 @@
 use super::binary::{check_no_overlap, check_writable};
 use super::{clone_data, common_device, reshape_data};
 use crate::autograd::formulas;
-use crate::backend;
-use crate::shape::{checked_num_elements, contiguous_strides};
-use crate::tensor::{Layout, TensorData};
+use crate::backend::{self, Bounds};
+use crate::shape::checked_num_elements;
+use crate::tensor::{Layout, TensorData, convert_data};
 use crate::{DType, Device, Shape, Tensor};
 
 /// Panics unless `dtype` is a dtype that indexing accepts: `i64` or `i32` positions, or a `bool`
@@ -39,8 +39,22 @@ pub(crate) const META_VALUES: &str = "indexing with a bool mask or a zero-dimens
 /// One index of the core after masks are expanded.
 struct Coords {
     shape: Shape,
-    /// The positions in row-major order; `None` for an index on the meta device.
-    values: Option<Vec<i64>>,
+    /// The positions, an integer tensor on the device of the target (CPU ones for a meta target);
+    /// `None` for an index on the meta device.
+    values: Option<TensorData>,
+}
+
+/// `data` on the device of the target, `device`: indices on the CPU are copied to the target's
+/// device first. The copy is a snapshot taken before the target's execution lock is held, so
+/// that checking and using the positions never reads a CPU tensor under that lock (which would
+/// take the CPU's lock after a GPU's, against the lock order; review round 116, R132), and so
+/// that both read the same values.
+#[track_caller]
+fn on_device(data: TensorData, device: Device) -> TensorData {
+    match (data.device(), device) {
+        (Device::Cpu, Device::Rocm(_)) => convert_data(&data, data.dtype, device),
+        _ => data,
+    }
 }
 
 /// The work out of an advanced indexing expression, before anything is read or written.
@@ -122,8 +136,13 @@ impl AdvancedIndex {
             };
             let data = t.data();
             if t.dtype() != DType::Bool {
-                let values =
-                    (data.device() != Device::Meta).then(|| backend::read_host::<i64>(&data));
+                // Not `bool::then`: a closure would hide the caller's location from a failed
+                // upload (review round 131, R155).
+                let values = if data.device() != Device::Meta {
+                    Some(on_device(data.clone(), device))
+                } else {
+                    None
+                };
                 slots.push(Some(Coords {
                     shape: data.layout.shape.clone(),
                     values,
@@ -146,8 +165,8 @@ impl AdvancedIndex {
             }
             for values in backend::mask_coordinates(&data) {
                 slots.push(Some(Coords {
-                    shape: Shape::new(&[values.len()]),
-                    values: Some(values),
+                    shape: values.layout.shape.clone(),
+                    values: Some(on_device(values, device)),
                 }));
             }
         }
@@ -220,59 +239,39 @@ impl AdvancedIndex {
         )
     }
 
-    /// Panics unless every position of the indices on the CPU is in range: from `-size` to
-    /// `size - 1` along its dimension. Unlike PyTorch, this holds even when the result is empty
-    /// and for meta targets. Indices on the meta device have no positions to check.
+    /// Checks every position of the indices (those with values) to be in range: from `-size` to
+    /// `size - 1` along its dimension, the indices in order, each in row-major order. With
+    /// `out`, then writes the linear position in the indexed subspace (row-major over the indexed
+    /// dimensions) of every element of the broadcast shape to `out`, a new `I64` tensor of that
+    /// shape on the target's device. Unlike PyTorch, the check holds even when the result is empty
+    /// and for meta targets.
     #[track_caller]
-    fn check_bounds(&self) {
-        for (k, (c, &size)) in self.coords.iter().zip(self.indexed_sizes()).enumerate() {
-            let size = size as i64;
-            let bad = c.values.iter().flatten().find(|&&v| v < -size || v >= size);
-            if let Some(v) = bad {
-                panic!("index {v} is out of bounds for dimension {k} with size {size}");
-            }
+    fn check_and_place(&self, out: Option<&TensorData>) {
+        let coords: Vec<Option<TensorData>> =
+            self.coords.iter().map(|c| c.values.clone()).collect();
+        let sizes = self.indexed_sizes();
+        if let Some((k, v)) = backend::index_positions(out, &coords, sizes) {
+            panic!("{}", backend::out_of_bounds(v, k, sizes[k]));
         }
     }
 
-    /// The linear position in the indexed subspace (row-major over the indexed dimensions) for
-    /// every element of the broadcast shape, in row-major order, after
-    /// [`check_bounds`](Self::check_bounds). All indices must be on the CPU.
+    /// [`check_and_place`](Self::check_and_place) without positions.
     #[track_caller]
-    fn positions(&self) -> Vec<usize> {
-        self.check_bounds();
-        let sizes = self.indexed_sizes();
-        let strides = contiguous_strides(sizes);
-        let shape = &self.broadcast;
-        let walks: Vec<_> = self
-            .coords
-            .iter()
-            .map(|c| Layout::contiguous(c.shape.clone()).expand_to(shape).strides)
-            .collect();
-        let values: Vec<&[i64]> = self
-            .coords
-            .iter()
-            .map(|c| c.values.as_deref().expect("indices on the CPU"))
-            .collect();
-        let total = shape.num_elements();
-        let mut out = Vec::with_capacity(total);
-        let mut index = vec![0usize; shape.len()];
-        for _ in 0..total {
-            let mut position = 0;
-            for k in 0..values.len() {
-                let offset: usize = index.iter().zip(walks[k].iter()).map(|(i, s)| i * s).sum();
-                let v = values[k][offset];
-                let wrapped = if v < 0 { v + sizes[k] as i64 } else { v } as usize;
-                position += wrapped * strides[k];
-            }
-            out.push(position);
-            for d in (0..index.len()).rev() {
-                index[d] += 1;
-                if index[d] < shape[d] {
-                    break;
-                }
-                index[d] = 0;
-            }
-        }
+    fn check_bounds(&self) {
+        self.check_and_place(None);
+    }
+
+    /// The checked linear positions in the indexed subspace for every element of the broadcast
+    /// shape, in row-major order, as a new `I64` tensor on `device`, the target's.
+    #[track_caller]
+    fn positions(&self, device: Device) -> TensorData {
+        let n = self.broadcast.num_elements();
+        let out = Tensor::empty_on(Shape::new(&[n]), DType::I64, device).data();
+        let shaped = TensorData {
+            layout: Layout::contiguous(self.broadcast.clone()),
+            ..out.clone()
+        };
+        self.check_and_place(Some(&shaped));
         out
     }
 
@@ -297,7 +296,8 @@ impl AdvancedIndex {
             self.check_bounds();
             return out;
         }
-        let positions: Vec<i64> = self.positions().into_iter().map(|p| p as i64).collect();
+        let positions = self.positions(target.device());
+        let count = positions.layout.num_elements();
         let (before, indexed, after) = self.fold();
         let src = reshape_data(
             &self.permuted(target),
@@ -305,11 +305,10 @@ impl AdvancedIndex {
         );
         let o = out.data();
         let folded = TensorData {
-            layout: Layout::contiguous(Shape::new(&[before, positions.len(), after])),
+            layout: Layout::contiguous(Shape::new(&[before, count, after])),
             ..o
         };
-        let index = Tensor::from_host(&positions, Shape::new(&[positions.len()]), Device::Cpu);
-        backend::index_select(&folded, &src, 1, &index.data(), false);
+        backend::index_select(&folded, &src, 1, &positions, Bounds::Valid);
         out
     }
 
@@ -339,7 +338,7 @@ impl AdvancedIndex {
         }
     }
 
-    /// A copy of the CPU tensor `target` with `values` written at the indexed positions: added
+    /// A copy of `target` with `values` written at the indexed positions: added
     /// with `accumulate`, otherwise copied, with the last of repeated positions winning. The
     /// work happens on a contiguous copy with the dimensions in the order of `perm`, which the
     /// result sees in the original order: new storage, possibly not contiguous.
@@ -349,7 +348,8 @@ impl AdvancedIndex {
         if self.out_shape.num_elements() == 0 {
             self.check_bounds();
         } else {
-            let positions = self.positions();
+            let positions = self.positions(target.device());
+            let count = positions.layout.num_elements();
             let (before, indexed, after) = self.fold();
             let folded = TensorData {
                 layout: Layout::contiguous(Shape::new(&[before, indexed, after])),
@@ -357,10 +357,10 @@ impl AdvancedIndex {
             };
             let src = reshape_data(
                 &values.expand_to(&self.out_shape),
-                Shape::new(&[before, positions.len(), after]),
+                Shape::new(&[before, count, after]),
             );
             if accumulate {
-                backend::index_add(&folded, 1, &positions, &src);
+                backend::index_add(&folded, 1, &positions, &src, Bounds::Valid);
             } else {
                 backend::index_overwrite(&folded, 1, &positions, &src);
             }

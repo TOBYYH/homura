@@ -12,8 +12,22 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int64_t kMaxBlocks = 1 << 16;
 
+// n / d rounded up, for n >= 0 and d > 0, without forming n + d - 1 (which overflows for the
+// largest sizes; review round 131, R154).
+__host__ __device__ inline constexpr int64_t ceil_div(int64_t n, int64_t d) { return n / d + (n % d != 0); }
+
+// Byte and word counts of workspaces, computed without signed overflow (which is undefined, and
+// whose wrapped results once passed for small or negative sizes; review round 131, R154): each
+// returns false once a step overflows int64_t.
+inline bool checked_mul(int64_t a, int64_t b, int64_t &r) {
+    return !__builtin_mul_overflow(a, b, &r);
+}
+inline bool checked_add(int64_t a, int64_t b, int64_t &r) {
+    return !__builtin_add_overflow(a, b, &r);
+}
+
 inline dim3 blocks_for(int64_t n) {
-    int64_t b = (n + kThreads - 1) / kThreads;
+    int64_t b = ceil_div(n, kThreads);
     return dim3(static_cast<unsigned>(b < kMaxBlocks ? b : kMaxBlocks));
 }
 

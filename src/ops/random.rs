@@ -279,10 +279,10 @@ fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tens
                     .map(|&x| match dist {
                         // Rounding to `T` can reach the excluded upper bound; PyTorch maps it to
                         // the lower bound in that case too.
-                        Dist::Uniform(from, to) if from < to && T::from_f64(x).to_f64() >= to => {
-                            T::from_f64(from)
+                        Dist::Uniform(from, to) if from < to && <T as Sealed>::from_f64(x).to_f64() >= to => {
+                            <T as Sealed>::from_f64(from)
                         }
-                        _ => T::from_f64(x),
+                        _ => <T as Sealed>::from_f64(x),
                     })
                     .collect();
                 Tensor::from_host(&v, shape, device)
@@ -317,7 +317,13 @@ fn rocm_random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) ->
             let out = Tensor::empty_on(shape, DType::I64, device);
             let (range, threshold) = int_range(low, high);
             // Batches never need more blocks than the first, which needs one per two values.
-            let workspace = (threshold != 0).then(|| random::int_workspace(device, n.div_ceil(2)));
+            // Not `bool::then`: a closure would hide the caller's location from an allocation
+            // failure (review round 131).
+            let workspace = if threshold != 0 {
+                Some(random::int_workspace(device, n.div_ceil(2)))
+            } else {
+                None
+            };
             let flat = out.reshape([n]);
             // As on the CPU, each batch reserves a block per two values still needed and the
             // tail of the last one is dropped. The generator stays locked from the first batch

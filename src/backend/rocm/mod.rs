@@ -9,7 +9,9 @@ mod copy;
 mod elementwise;
 #[allow(clippy::all, unsafe_op_in_unsafe_fn)]
 mod ffi;
+mod index;
 mod memory;
+mod pool;
 pub(crate) mod random;
 mod reduce;
 
@@ -19,9 +21,16 @@ use std::sync::OnceLock;
 pub(crate) use context::{context, exec};
 pub(crate) use copy::{download, read_bytes, read_host, try_copy, try_fill, upload, write_host};
 pub(crate) use elementwise::{binary, binary_scalar, flip, fused, triangle, unary, where_};
+pub(crate) use index::{
+    gather, index_add, index_overwrite, index_positions, index_select, mask_coordinates,
+    max_pool2d_backward, out_of_range, scatter_add,
+};
 pub(crate) use memory::{
     DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
     reset_peak_memory_stats,
+};
+pub(crate) use pool::{
+    adaptive_avg_pool2d, adaptive_avg_pool2d_backward, max_pool2d, unfold_backward,
 };
 pub(crate) use reduce::{arg_reduce, exclusive_cumprod, reduce, softmax, var};
 
@@ -57,6 +66,27 @@ fn expect<T>(result: Result<T, Failure>) -> T {
     match result {
         Ok(v) => v,
         Err(f) => panic!("{}", f.message),
+    }
+}
+
+/// A workspace of `bytes` bytes on `device`, if any are needed. `bytes` is what a sizing entry of
+/// the library reported, which fails rather than report a size that overflows (review round 131,
+/// R154), so it is never negative.
+#[track_caller]
+fn workspace(bytes: i64, device: crate::Device) -> Option<crate::Tensor> {
+    assert!(
+        bytes >= 0,
+        "internal error: a negative workspace size {bytes}"
+    );
+    // Not `bool::then`: a closure would hide the caller's location from an allocation failure.
+    if bytes > 0 {
+        Some(crate::Tensor::empty_on(
+            crate::Shape::new(&[bytes as usize]),
+            crate::DType::U8,
+            device,
+        ))
+    } else {
+        None
     }
 }
 

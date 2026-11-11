@@ -43,13 +43,20 @@ All notable changes to this project are documented in this file. The format is b
   on both devices alternate; `randn` and `normal_` use the GPU's log, cos and sin.
 - Reductions on ROCm GPUs: `sum`, `mean`, `prod`, `max`, `min`, `all`, `any`, `var`, `std`
   (over all elements and over dimensions), the arg reductions, `max_dim` / `min_dim`,
-  `softmax` and `log_softmax`, and the gradients built from them (except those of `max_dim` and
-  `min_dim`, which scatter). Integer sums and products, `all`, `any`, `max`, `min` and the
+  `softmax` and `log_softmax`, and the gradients built from them. Integer sums and products, `all`, `any`, `max`, `min` and the
   indices give the CPU's bits (the first of equal values, or the first NaN, wins). Float sums,
   products, variances and softmax accumulate in f64 like the CPU's, where PyTorch's GPU kernels
   use f32, in an order that depends only on the shape and strides: the same bits on every run,
-  and the CPU's up to that order (and the GPU's exp and log in softmax). Matrix products,
-  indexing, pooling and convolutions don't run on the GPU yet.
+  and the CPU's up to that order (and the GPU's exp and log in softmax).
+- Indexing and pooling on ROCm GPUs, with the CPU's bits: `index_select`, `gather`,
+  `index_add`, `scatter_add`, advanced indexing with integer tensors and masks (indices on the
+  CPU or on the GPU), `index_put` and `index_put_accumulate`, `embedding`, `nll_loss`,
+  `max_pool2d` (and its indices), `adaptive_avg_pool2d`, and their gradients, including those of
+  `max_dim`, `min_dim` and `unfold`. Repeated positions add up in the CPU's order and type (no
+  atomic additions), and overwrite with the last value. Positions are checked on the GPU, which
+  reports the position the CPU reports, with its message, from a few bytes read back (one
+  synchronization per call that takes an index tensor). Matrix products and convolutions don't
+  run on the GPU yet.
 - `Tensor::try_to`, `try_zeros_with`, `try_ones_with` and `try_full_with` return
   `Error::OutOfMemory` (`OutOfMemoryError`: the device, the requested bytes and a message like
   PyTorch's) when a device refuses memory, including the staging of a transfer and a GPU's first
@@ -61,6 +68,9 @@ All notable changes to this project are documented in this file. The format is b
   or an integer is rounded to `f32` first. `half`'s `from_f64` was used before, which made
   `f64 -> f16` depend on the CPU (F16C) and rounded some ties differently from PyTorch for
   `bf16`: `1 + 2^-8 + 2^-21` as `f32` became `1.0` instead of PyTorch's `1.0078125`.
+  The kernels that compute in f64 and round once (sums, means, products, `var` / `std`,
+  softmax, matrix products, `index_add`, `scatter_add`, `index_put_accumulate`, normal samples)
+  still rounded half results with `half`'s `from_f64` and now round through `f32` too.
 - Copies and conversions between the CPU and ROCm devices are no longer refused; only data out
   of a meta tensor is. `Module::to` a device that doesn't exist panics at the first allocation
   (before changing anything).

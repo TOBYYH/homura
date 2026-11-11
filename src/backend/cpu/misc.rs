@@ -1,10 +1,14 @@
 //! Kernels that don't fit the elementwise or reduction patterns.
 
-use super::{Float, FloatElement, Plan, base, copy, dispatch_all, dispatch_float, exec, read_host};
+use super::{
+    Float, FloatElement, Plan, base, copy, dispatch_all, dispatch_float, exec, read_host,
+    write_host,
+};
+use crate::backend::{Bounds, out_of_bounds};
 use crate::dtype::sealed::Sealed;
 use crate::shape::contiguous_strides;
-use crate::tensor::TensorData;
-use crate::{Shape, Strides};
+use crate::tensor::{Layout, Tensor, TensorData};
+use crate::{Device, Shape, Strides};
 
 /// Softmax (or log-softmax) of `src` along `dim` into `out`, which has the same shape. Computed in
 /// `f64`, subtracting the maximum first.
@@ -39,36 +43,51 @@ pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool)
                 for k in 0..n {
                     let v = if log { x(k) - max - log_sum } else { (x(k) - max).exp() / sum };
                     // SAFETY: as above.
-                    unsafe { *po.add(o + k * so) = T::from_f64(v) };
+                    unsafe { *po.add(o + k * so) = <T as Sealed>::from_f64(v) };
                 }
             })
         });
     })
 }
 
-/// `out` = the slices of `src` along `dim` picked by the 1-D integer tensor `index`. Negative
-/// indices count from the end when `allow_negative` is set.
+/// The values of the integer tensor `index` in row-major order as positions along a dimension
+/// `dim` of `size`: checked as `bounds` says (panicking with PyTorch's message for the first one
+/// out of range), negative ones counted from the end.
+#[track_caller]
+fn positions(index: &TensorData, dim: usize, size: usize, bounds: Bounds) -> Vec<usize> {
+    let n = size as i64;
+    let low = if bounds == Bounds::AllowNegative {
+        -n
+    } else {
+        0
+    };
+    let mut out = vec![];
+    for i in read_host::<i64>(index) {
+        if bounds != Bounds::Valid && !(low..n).contains(&i) {
+            panic!("{}", out_of_bounds(i, dim, size));
+        }
+        out.push(if i < 0 { i + n } else { i } as usize);
+    }
+    out
+}
+
+/// `out` = the slices of `src` along `dim` picked by the 1-D integer tensor `index`, checked as
+/// `bounds` says.
 #[track_caller]
 pub(crate) fn index_select(
     out: &TensorData,
     src: &TensorData,
     dim: usize,
     index: &TensorData,
-    allow_negative: bool,
+    bounds: Bounds,
 ) {
-    let indices: Vec<i64> = read_host(index);
-    let size = src.layout.shape[dim] as i64;
+    let picked = positions(index, dim, src.layout.shape[dim], bounds);
     // When the slices have no elements, their strides may be arbitrary and their offsets may not
     // even fit in `usize`: check the indices but don't build the slices.
-    let copies = out.layout.num_elements() > 0;
-    for (j, &i) in indices.iter().enumerate() {
-        let wrapped = if i < 0 && allow_negative { i + size } else { i };
-        if wrapped < 0 || wrapped >= size {
-            panic!("index {i} is out of bounds for dimension {dim} with size {size}");
-        }
-        if !copies {
-            continue;
-        }
+    if out.layout.num_elements() == 0 {
+        return;
+    }
+    for (j, &i) in picked.iter().enumerate() {
         let dst = TensorData {
             storage: out.storage.clone(),
             layout: out.layout.select(dim, j),
@@ -76,7 +95,7 @@ pub(crate) fn index_select(
         };
         let s = TensorData {
             storage: src.storage.clone(),
-            layout: src.layout.select(dim, wrapped as usize),
+            layout: src.layout.select(dim, i),
             dtype: src.dtype,
         };
         copy(&dst, &s);
@@ -85,12 +104,13 @@ pub(crate) fn index_select(
 
 /// Copies slice `i` of `src` along `dim` into slice `index[i]` of `out`, in order, so that the
 /// last of repeated positions wins: the overwriting `index_put`. `out` is new memory that shares
-/// none with `src`, and the positions must be in range.
-pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &[usize], src: &TensorData) {
+/// none with `src`, and `index` holds [`Bounds::Valid`] positions.
+pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &TensorData, src: &TensorData) {
     // An empty source writes nothing, and its strides and offset may be arbitrary.
     if src.layout.num_elements() == 0 {
         return;
     }
+    let index = positions(index, dim, out.layout.shape[dim], Bounds::Valid);
     for (i, &j) in index.iter().enumerate() {
         let dst = TensorData {
             layout: out.layout.select(dim, j),
@@ -105,8 +125,8 @@ pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &[usize], src
 }
 
 /// The positions of the true elements of the bool tensor `mask` in row-major order, as one
-/// vector of coordinates per dimension: PyTorch's `nonzero`, transposed.
-pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<Vec<i64>> {
+/// `I64` vector of coordinates per dimension: PyTorch's `nonzero`, transposed.
+pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<TensorData> {
     let shape = &mask.layout.shape;
     let mut coords = vec![vec![]; shape.len()];
     let mut index = vec![0usize; shape.len()];
@@ -125,6 +145,74 @@ pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<Vec<i64>> {
         }
     }
     coords
+        .iter()
+        .map(|c| Tensor::from_host(c, Shape::new(&[c.len()]), Device::Cpu).data())
+        .collect()
+}
+
+/// See `backend::index_positions`.
+pub(crate) fn index_positions(
+    out: Option<&TensorData>,
+    coords: &[Option<TensorData>],
+    sizes: &[usize],
+) -> Option<(usize, i64)> {
+    let values: Vec<Option<Vec<i64>>> = coords
+        .iter()
+        .map(|c| c.as_ref().map(read_host::<i64>))
+        .collect();
+    for (k, (v, &size)) in values.iter().zip(sizes).enumerate() {
+        let size = size as i64;
+        if let Some(&bad) = v.iter().flatten().find(|&&v| v < -size || v >= size) {
+            return Some((k, bad));
+        }
+    }
+    let out = out?;
+    let shape = &out.layout.shape;
+    let strides = contiguous_strides(sizes);
+    let walks: Vec<Strides> = coords
+        .iter()
+        .map(|c| {
+            let c = c.as_ref().expect("indices with values");
+            Layout::contiguous(c.layout.shape.clone())
+                .expand_to(shape)
+                .strides
+        })
+        .collect();
+    let values: Vec<Vec<i64>> = values.into_iter().flatten().collect();
+    let total = shape.num_elements();
+    let mut positions = Vec::with_capacity(total);
+    let mut index = vec![0usize; shape.len()];
+    for _ in 0..total {
+        let mut position = 0i64;
+        for k in 0..values.len() {
+            let offset: usize = index.iter().zip(walks[k].iter()).map(|(i, s)| i * s).sum();
+            let v = values[k][offset];
+            let wrapped = if v < 0 { v + sizes[k] as i64 } else { v };
+            position += wrapped * strides[k] as i64;
+        }
+        positions.push(position);
+        for d in (0..index.len()).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    write_host(out, &positions);
+    None
+}
+
+/// See `backend::out_of_range`.
+pub(crate) fn out_of_range(
+    index: &TensorData,
+    low: i64,
+    high: i64,
+    exempt: Option<i64>,
+) -> Option<i64> {
+    read_host::<i64>(index)
+        .into_iter()
+        .find(|&v| Some(v) != exempt && !(low..high).contains(&v))
 }
 
 /// `out[o] += src[s]` for every pair of offsets that `pairs` reports, where `o` counts the
@@ -152,7 +240,7 @@ fn add_at(out: &TensorData, src: &TensorData, pairs: impl Fn(&mut dyn FnMut(usiz
                 let mut acc: Vec<f64> = elements.iter().map(|v| v.to_f64()).collect();
                 pairs(&mut |o, s| acc[o] += read(s).to_f64());
                 for (e, v) in elements.iter_mut().zip(acc) {
-                    *e = T::from_f64(v);
+                    *e = <T as Sealed>::from_f64(v);
                 }
             } else {
                 let mut acc: Vec<i64> = elements.iter().map(|v| v.to_i64()).collect();
@@ -166,8 +254,17 @@ fn add_at(out: &TensorData, src: &TensorData, pairs: impl Fn(&mut dyn FnMut(usiz
 }
 
 /// Adds slice `i` of `src` along `dim` into slice `index[i]` of the contiguous `out`
-/// (`torch.index_add`), see [`add_at`] for the precision. The positions must be in range.
-pub(crate) fn index_add(out: &TensorData, dim: usize, index: &[usize], src: &TensorData) {
+/// (`torch.index_add`), see [`add_at`] for the precision; the positions are checked as `bounds`
+/// says.
+#[track_caller]
+pub(crate) fn index_add(
+    out: &TensorData,
+    dim: usize,
+    index: &TensorData,
+    src: &TensorData,
+    bounds: Bounds,
+) {
+    let index = positions(index, dim, out.layout.shape[dim], bounds);
     // An empty source adds nothing, and its strides and offset may be arbitrary.
     if src.layout.num_elements() == 0 {
         return;
@@ -192,16 +289,12 @@ pub(crate) fn index_add(out: &TensorData, dim: usize, index: &[usize], src: &Ten
 }
 
 /// `out[.., index[p], ..] += src[p]`, with `index[p]` along `dim`, for every position `p` of the
-/// index tensor, whose shape is `index_shape` and whose values `index` holds in row-major order
-/// (`torch.scatter_add`). `out` is contiguous and `src` may be larger than the index; see
-/// [`add_at`] for the precision. The positions must be in range.
-pub(crate) fn scatter_add(
-    out: &TensorData,
-    dim: usize,
-    index_shape: &[usize],
-    index: &[usize],
-    src: &TensorData,
-) {
+/// index tensor (`torch.scatter_add`), whose values are checked to be positions along `dim`.
+/// `out` is contiguous and `src` may be larger than the index; see [`add_at`] for the precision.
+#[track_caller]
+pub(crate) fn scatter_add(out: &TensorData, dim: usize, index: &TensorData, src: &TensorData) {
+    let index_shape = &index.layout.shape;
+    let index = positions(index, dim, out.layout.shape[dim], Bounds::NonNegative);
     if index.is_empty() {
         return;
     }
@@ -220,9 +313,11 @@ pub(crate) fn scatter_add(
 }
 
 /// `out[p] = src[.., index[p], ..]`, with `index[p]` along `dim`, for every position `p` of the
-/// contiguous `out`, which has the shape of the index tensor; `index` holds its values in
-/// row-major order (`torch.gather`). The positions must be in range.
-pub(crate) fn gather(out: &TensorData, src: &TensorData, dim: usize, index: &[usize]) {
+/// contiguous `out`, which has the shape of the index tensor (`torch.gather`), whose values are
+/// checked to be positions along `dim`.
+#[track_caller]
+pub(crate) fn gather(out: &TensorData, src: &TensorData, dim: usize, index: &TensorData) {
+    let index = positions(index, dim, src.layout.shape[dim], Bounds::NonNegative);
     let (lo, ls) = (&out.layout, &src.layout);
     assert!(lo.is_contiguous() && lo.num_elements() == index.len());
     if index.is_empty() {

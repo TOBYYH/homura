@@ -5,7 +5,7 @@
 
 use super::{clone_data, common_device};
 use crate::autograd::formulas;
-use crate::backend;
+use crate::backend::{self, Bounds};
 use crate::shape::normalize_dim;
 use crate::tensor::{Layout, TensorData, select_position, slice_bounds};
 use crate::{DType, Device, Shape, Strides, Tensor};
@@ -20,24 +20,6 @@ fn check_index_dtype(op: &str, index: &TensorData) {
             index.dtype
         );
     }
-}
-
-/// The values of `index` in row-major order, checked to be positions along a dimension `dim` of
-/// `size`. Negative values are out of range, as in PyTorch's `index_add`, `gather` and
-/// `scatter_add`. The meta device has no values to check: the result is empty there.
-#[track_caller]
-fn positions(index: &TensorData, dim: usize, size: usize) -> Vec<usize> {
-    if index.device() == Device::Meta {
-        return vec![];
-    }
-    let mut out = vec![];
-    for i in backend::read_host::<i64>(index) {
-        if !(0..size as i64).contains(&i) {
-            panic!("index {i} is out of bounds for dimension {dim} with size {size}");
-        }
-        out.push(i as usize);
-    }
-    out
 }
 
 /// `data` with a zero-dimensional layout seen as a one-dimensional one of one element, as
@@ -119,10 +101,11 @@ impl Tensor {
                  dimension. Got self.shape = {shape:?} source.shape = {src_shape:?}"
             );
         }
-        let positions = positions(&idx, d, shape[d]);
+        // The backend checks the positions: negative ones are out of range, as in PyTorch's
+        // `index_add`, `gather` and `scatter_add`. The meta device has no values to check.
         let out = Tensor::from_data(clone_data(&data));
         if device != Device::Meta {
-            backend::index_add(&out.data(), d, &positions, &src);
+            backend::index_add(&out.data(), d, &idx, &src, Bounds::NonNegative);
         }
         formulas::index_add(self, d, index, source, &out);
         out
@@ -175,10 +158,9 @@ impl Tensor {
                 idx.layout.shape, data.layout.shape
             );
         }
-        let positions = positions(&idx, d, shape[d]);
         let out = Tensor::empty_on(idx.layout.shape.clone(), data.dtype, device);
         if device != Device::Meta {
-            backend::gather(&at_least_1d(&out.data()), &src, d, &positions);
+            backend::gather(&at_least_1d(&out.data()), &src, d, &index_1d);
         }
         formulas::gather(self, d, index, &out);
         out
@@ -231,11 +213,10 @@ impl Tensor {
                 idx.layout.shape, data.layout.shape, source.layout.shape
             );
         }
-        let positions = positions(&idx, d, shape[d]);
         let out = Tensor::from_data(clone_data(&data));
         if device != Device::Meta {
             let o = at_least_1d(&out.data());
-            backend::scatter_add(&o, d, index_shape, &positions, &source_1d);
+            backend::scatter_add(&o, d, &index_1d, &source_1d);
         }
         formulas::scatter_add(self, d, index, src, &out);
         out

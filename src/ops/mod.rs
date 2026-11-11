@@ -217,6 +217,7 @@ pub(crate) fn try_clone_data(data: &TensorData) -> Result<TensorData, AllocError
 /// `data` with `shape`, which has the same number of elements: the same storage when the layout
 /// allows it, otherwise a contiguous copy. Like [`Tensor::reshape`] but for operations to use
 /// internally: the result is not a tensor, so nothing is recorded as a view or for autograd.
+#[track_caller]
 pub(crate) fn reshape_data(data: &TensorData, shape: Shape) -> TensorData {
     debug_assert_eq!(shape.num_elements(), data.layout.num_elements());
     let l = &data.layout;

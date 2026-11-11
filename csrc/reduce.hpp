@@ -78,13 +78,13 @@ inline ReducePlan make_plan(const hmr_tensor_desc &kept, const hmr_tensor_desc &
     if (p.nout > 0 && p.nred > 0) {
         int64_t lanes = p.nout * p.group;
         if (lanes < kReduceTargetLanes) {
-            int64_t want = (kReduceTargetLanes + lanes - 1) / lanes;
+            int64_t want = ceil_div(kReduceTargetLanes, lanes);
             int64_t worth = p.nred / (p.group * kReduceMinPerLane);
             p.splits = std::max<int64_t>(1, std::min({want, worth, kReduceMaxSplits}));
         }
     }
-    p.chunk = p.splits > 1 ? (p.nred + p.splits - 1) / p.splits : p.nred;
-    if (p.splits > 1) p.splits = (p.nred + p.chunk - 1) / p.chunk;
+    p.chunk = p.splits > 1 ? ceil_div(p.nred, p.splits) : p.nred;
+    if (p.splits > 1) p.splits = ceil_div(p.nred, p.chunk);
     return p;
 }
 

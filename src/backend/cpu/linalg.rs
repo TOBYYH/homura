@@ -13,7 +13,7 @@ pub(crate) fn matmul(out: &TensorData, a: &TensorData, b: &TensorData) {
     let dtype = a.dtype;
     if dtype.is_floating_point() {
         dispatch_float!(dtype, T => {
-            mm::<T, f64>(out, a, b, 0.0, |acc, x, y| acc + x.to_f64() * y.to_f64(), T::from_f64)
+            mm::<T, f64>(out, a, b, 0.0, |acc, x, y| acc + x.to_f64() * y.to_f64(), <T as Sealed>::from_f64)
         })
     } else if dtype.is_integral() {
         dispatch_int!(dtype, T => {

@@ -4,8 +4,8 @@
 //! backend's kernels and pick the backend by device. The meta device has no data: callers return
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
 //! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics. Moving data
-//! (reading, writing, copying, filling and the transfers between devices) and the elementwise
-//! kernels work on ROCm.
+//! (reading, writing, copying, filling and the transfers between devices), the elementwise
+//! kernels, the reductions, indexing and pooling work on ROCm.
 
 #[cfg(any(feature = "rocm", test))]
 pub(crate) mod caching;
@@ -352,46 +352,102 @@ pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool)
     dispatch_rocm!(out, softmax(out, src, dim, log))
 }
 
+/// How an indexing kernel treats the positions in its index tensor, a tensor of `I32` or `I64`
+/// positions along a dimension of `size`. The kernels check them with the device's execution lock
+/// held, then use the same values: a check and its use can't see different data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bounds {
+    /// In `0..size`, else the kernel panics with PyTorch's message.
+    NonNegative,
+    /// In `-size..size`, negative positions counting from the end; else the kernel panics.
+    AllowNegative,
+    /// Positions an earlier step made and checked (advanced indexing): in `0..size`, unchecked.
+    Valid,
+}
+
+/// The message of a position out of range.
+#[track_caller]
+pub(crate) fn out_of_bounds(value: i64, dim: usize, size: usize) -> String {
+    format!("index {value} is out of bounds for dimension {dim} with size {size}")
+}
+
 #[track_caller]
 pub(crate) fn index_select(
     out: &TensorData,
     src: &TensorData,
     dim: usize,
     index: &TensorData,
-    allow_negative: bool,
+    bounds: Bounds,
 ) {
-    dispatch!(out, index_select(out, src, dim, index, allow_negative))
+    dispatch_rocm!(out, index_select(out, src, dim, index, bounds))
+}
+
+/// Copies slice `i` of `src` along `dim` into slice `index[i]` of `out`, the last of repeated
+/// positions winning: the overwriting `index_put`. `index` holds [`Bounds::Valid`] positions.
+#[track_caller]
+pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &TensorData, src: &TensorData) {
+    dispatch_rocm!(out, index_overwrite(out, dim, index, src))
+}
+
+/// The coordinates of the true elements of the bool tensor `mask` in row-major order: one `I64`
+/// vector per dimension, on the device of `mask`.
+#[track_caller]
+pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<TensorData> {
+    dispatch_rocm!(mask, mask_coordinates(mask))
 }
 
 #[track_caller]
-pub(crate) fn index_overwrite(out: &TensorData, dim: usize, index: &[usize], src: &TensorData) {
-    dispatch!(out, index_overwrite(out, dim, index, src))
-}
-
-#[track_caller]
-pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<Vec<i64>> {
-    dispatch!(mask, mask_coordinates(mask))
-}
-
-#[track_caller]
-pub(crate) fn index_add(out: &TensorData, dim: usize, index: &[usize], src: &TensorData) {
-    dispatch!(out, index_add(out, dim, index, src))
-}
-
-#[track_caller]
-pub(crate) fn scatter_add(
+pub(crate) fn index_add(
     out: &TensorData,
     dim: usize,
-    index_shape: &[usize],
-    index: &[usize],
+    index: &TensorData,
     src: &TensorData,
+    bounds: Bounds,
 ) {
-    dispatch!(out, scatter_add(out, dim, index_shape, index, src))
+    dispatch_rocm!(out, index_add(out, dim, index, src, bounds))
 }
 
+/// `out[.., index[p], ..] += src[p]` for every position `p` of `index`, whose values are checked
+/// to be positions along `dim` (non-negative).
 #[track_caller]
-pub(crate) fn gather(out: &TensorData, src: &TensorData, dim: usize, index: &[usize]) {
-    dispatch!(out, gather(out, src, dim, index))
+pub(crate) fn scatter_add(out: &TensorData, dim: usize, index: &TensorData, src: &TensorData) {
+    dispatch_rocm!(out, scatter_add(out, dim, index, src))
+}
+
+/// `out[p] = src[.., index[p], ..]`, the values of `index` checked to be positions along `dim`
+/// (non-negative).
+#[track_caller]
+pub(crate) fn gather(out: &TensorData, src: &TensorData, dim: usize, index: &TensorData) {
+    dispatch_rocm!(out, gather(out, src, dim, index))
+}
+
+/// The positions of advanced indexing: checks each index of `coords` (`None` for one without
+/// values, on the meta device), in order, to lie in `-size..size` for its size in `sizes`, and
+/// returns the first position out of range as `(k, value)` for index `k`. Without one, and if
+/// `out` is given, writes to `out` (`I64`, the shape the indices broadcast to) the linear
+/// position in the indexed subspace (row-major over `sizes`) of every element, negative
+/// coordinates counting from the end. The indices are on the device of `out`, and are checked
+/// and read with its execution lock held.
+#[track_caller]
+pub(crate) fn index_positions(
+    out: Option<&TensorData>,
+    coords: &[Option<TensorData>],
+    sizes: &[usize],
+) -> Option<(usize, i64)> {
+    let first = out.or(coords.iter().flatten().next())?;
+    dispatch_rocm!(first, index_positions(out, coords, sizes))
+}
+
+/// The first value of the integer tensor `index`, in row-major order, outside `low..high` and,
+/// if `exempt` is given, not equal to it.
+#[track_caller]
+pub(crate) fn out_of_range(
+    index: &TensorData,
+    low: i64,
+    high: i64,
+    exempt: Option<i64>,
+) -> Option<i64> {
+    dispatch_rocm!(index, out_of_range(index, low, high, exempt))
 }
 
 #[track_caller]
@@ -412,27 +468,27 @@ pub(crate) fn unfold_backward(
     size: usize,
     step: usize,
 ) {
-    dispatch!(out, unfold_backward(out, grad, dim, size, step))
+    dispatch_rocm!(out, unfold_backward(out, grad, dim, size, step))
 }
 
 #[track_caller]
 pub(crate) fn max_pool2d(out: &TensorData, indices: &TensorData, input: &TensorData, g: &Pool2d) {
-    dispatch!(out, max_pool2d(out, indices, input, g))
+    dispatch_rocm!(out, max_pool2d(out, indices, input, g))
 }
 
 #[track_caller]
 pub(crate) fn max_pool2d_backward(out: &TensorData, grad: &TensorData, indices: &TensorData) {
-    dispatch!(out, max_pool2d_backward(out, grad, indices))
+    dispatch_rocm!(out, max_pool2d_backward(out, grad, indices))
 }
 
 #[track_caller]
 pub(crate) fn adaptive_avg_pool2d(out: &TensorData, input: &TensorData) {
-    dispatch!(out, adaptive_avg_pool2d(out, input))
+    dispatch_rocm!(out, adaptive_avg_pool2d(out, input))
 }
 
 #[track_caller]
 pub(crate) fn adaptive_avg_pool2d_backward(out: &TensorData, grad: &TensorData) {
-    dispatch!(out, adaptive_avg_pool2d_backward(out, grad))
+    dispatch_rocm!(out, adaptive_avg_pool2d_backward(out, grad))
 }
 
 #[track_caller]

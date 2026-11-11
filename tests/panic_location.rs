@@ -262,6 +262,11 @@ fn rocm_data_path_failures() {
         at!(failing(&gt, oom).to(Device::Cpu));
         at!(failing(&g, oom).to(Device::Cpu));
         at!(failing(&cpu, oom).to(gpu));
+        // A module whose parameters have gradients: the upload of a `.grad` fails first
+        // (review round 131).
+        let lin = nn::Linear::new(3, 2);
+        lin.forward(&homura::ones([1, 3])).sum().backward();
+        at!(lin.to(failing_gpu(oom)));
         // In-place writes, inside the device's lock.
         at!(failing(&g, oom).fill_(5.0));
         at!(failing(&g, oom).copy_(&h));
@@ -341,6 +346,85 @@ fn rocm_kernel_failures() {
     // SAFETY: a testing hook without preconditions.
     unsafe { hmr_test_fail_data(0, 0) };
     assert_eq!(g.to_vec::<f32>(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    finish();
+}
+
+/// Failures of the GPU in indexing and pooling, positions out of range checked on the GPU, and
+/// operands with more dimensions than the kernels take: all reported at the caller's line (M4
+/// step 4b).
+#[cfg(feature = "rocm")]
+#[test]
+fn rocm_index_failures() {
+    use homura::nn::functional as F;
+    let gpu = Device::Rocm(0);
+    let x = homura::arange_with(12, (DType::F32, gpu)).reshape([3, 4]);
+    let i = homura::tensor([2i64, 0]).to(gpu);
+    let ci = homura::tensor([2i64, 0]);
+    let gi = homura::tensor([[1i64, 0], [3, 3]]).to(gpu);
+    let src = homura::ones_with([2, 4], gpu);
+    let mask = homura::ones_with([3, 4], (DType::Bool, gpu));
+    let img = homura::ones_with([1, 1, 4, 4], gpu);
+    let w = homura::ones_with([5, 3], gpu);
+    let t = homura::tensor([1i64, 0]).to(gpu);
+    let logp = homura::zeros_with([2, 3], gpu);
+    let pool = F::MaxPool2dOptions::new([2, 2]);
+    for oom in [false, true] {
+        at!(failing(&x, oom).index_select(0, &i));
+        at!(failing(&x, oom).gather(1, &gi));
+        at!(failing(&x, oom).index_add(0, &i, &src));
+        at!(failing(&x, oom).scatter_add(1, &gi, &src));
+        at!(failing(&x, oom).index((&i,)));
+        at!(failing(&x, oom).index(&mask));
+        at!(failing(&x, oom).index_put((&i,), &src));
+        at!(failing(&x, oom).index_put_accumulate((&i,), &src));
+        // Indices on the CPU, uploaded before the GPU's lock is taken: the upload fails
+        // (review round 131, R155).
+        at!(failing(&x, oom).index((&ci,)));
+        at!(failing(&x, oom).index((&ci, &i)));
+        at!(failing(&x, oom).index_put((&ci,), &src));
+        at!(failing(&x, oom).index_put_accumulate((&ci,), &src));
+        at!(F::embedding(failing(&i, oom), &w, None));
+        at!(F::nll_loss(
+            &logp,
+            failing(&t, oom),
+            None,
+            -100,
+            F::Reduction::Mean
+        ));
+        at!(F::max_pool2d(failing(&img, oom), pool));
+        at!(F::adaptive_avg_pool2d(failing(&img, oom), [3, 3]));
+    }
+    // Positions out of range, found on the GPU.
+    let bad = homura::tensor([5i64]).to(gpu);
+    at!(x.index_select(0, &bad));
+    at!(x.gather(1, &bad.reshape([1, 1])));
+    at!(x.index_add(0, &bad, &src.narrow(0, 0, 1)));
+    at!(x.scatter_add(1, &bad.reshape([1, 1]), &src));
+    at!(x.index((&bad,)));
+    at!(x.index((&homura::tensor([0i64]), &bad)));
+    at!(x.index_put((&bad,), &src.narrow(0, 0, 1)));
+    at!(x.index_put_accumulate((&bad,), &src.narrow(0, 0, 1)));
+    at!(F::embedding(&bad, &w, None));
+    at!(F::nll_loss(
+        &logp,
+        &homura::tensor([0i64, 7]).to(gpu),
+        None,
+        -100,
+        F::Reduction::Mean
+    ));
+    // More dimensions than the kernels take.
+    let deep = homura::zeros_with(vec![2usize; 26], (DType::F32, gpu))
+        .permute((0..26).rev().collect::<Vec<i64>>());
+    let deep_index = homura::zeros_with(vec![2usize; 26], (DType::I64, gpu))
+        .permute((0..26).rev().collect::<Vec<i64>>());
+    let zero = homura::tensor([0i64]).to(gpu);
+    at!(deep.index_select(0, &zero));
+    at!(deep.gather(0, &deep_index));
+    at!(deep.index((&zero,)));
+    at!(F::adaptive_avg_pool2d(&deep, [3, 3]));
+    drop(deep);
+    // SAFETY: a testing hook without preconditions.
+    unsafe { hmr_test_fail_data(0, 0) };
     finish();
 }
 

@@ -322,6 +322,101 @@ hmr_status hmr_exclusive_cumprod(hmr_context_t ctx, const hmr_tensor_desc *out_l
                                  const hmr_tensor_desc *src_lines, int64_t n, int64_t out_stride,
                                  int64_t src_stride, int32_t reverse);
 
+/*
+ * Indexing (csrc/index.hip). Index tensors are I32 or I64; positions are checked before they
+ * are used (hmr_index_check, in the same execution lock), so the kernels take them as valid.
+ */
+
+/* The first element of `index`, in row-major order of its logical positions, that is outside
+ * [low, high) and, if has_exempt, not equal to `exempt`: queues writing its position to slot[0]
+ * (UINT64_MAX if there is none) and its value to slot[1]. `slot` is two words of device memory. */
+hmr_status hmr_index_check(hmr_context_t ctx, const hmr_tensor_desc *index, int64_t low,
+                           int64_t high, int32_t has_exempt, int64_t exempt, uint64_t *slot);
+
+/* cpu::index_select: out (src's sizes but `index`'s length along dim) gets the slices of src
+ * along dim at the positions of the 1-D `index`, negative ones counted from the end if
+ * wrap_negative. */
+hmr_status hmr_index_select(hmr_context_t ctx, const hmr_tensor_desc *out,
+                            const hmr_tensor_desc *src, const hmr_tensor_desc *index, int32_t dim,
+                            int32_t wrap_negative);
+
+/* cpu::gather: out (index's sizes) gets src at each index position with the coordinate along
+ * dim replaced by the index element. */
+hmr_status hmr_gather(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *src,
+                      const hmr_tensor_desc *index, int32_t dim);
+
+/* One indexed dimension of advanced indexing: out (I64) = (if first) or += coord * stride, the
+ * coordinate wrapped by `size` when negative; `coord` has out's sizes (broadcast). */
+hmr_status hmr_index_positions(hmr_context_t ctx, const hmr_tensor_desc *out,
+                               const hmr_tensor_desc *coord, int64_t size, int64_t stride,
+                               int32_t first);
+
+/* cpu::index_overwrite: slice i of src along dim is copied to slice positions[i] of out, the last
+ * of repeated positions winning. `positions` is a contiguous 1-D I64 tensor; the workspace has
+ * hmr_index_overwrite_workspace bytes for out's size along dim. */
+hmr_status hmr_index_overwrite_workspace(int64_t size, int64_t *bytes);
+hmr_status hmr_index_overwrite(hmr_context_t ctx, const hmr_tensor_desc *out,
+                               const hmr_tensor_desc *src, const hmr_tensor_desc *positions,
+                               int32_t dim, void *workspace, int64_t workspace_bytes);
+
+/* cpu::index_add: slice i of src along dim is added into slice index[i] of out, each element of
+ * out summed in f64 (floats; integers wrap in i64, bools are or-ed) in the order of i and rounded
+ * once. The workspace has hmr_index_add_workspace bytes for `m` positions (`size`, out's size
+ * along dim, bounds them). */
+hmr_status hmr_index_add_workspace(int64_t m, int64_t size, int64_t *bytes);
+hmr_status hmr_index_add(hmr_context_t ctx, const hmr_tensor_desc *out,
+                         const hmr_tensor_desc *src, const hmr_tensor_desc *index, int32_t dim,
+                         void *workspace, int64_t workspace_bytes);
+
+/* cpu::scatter_add: src at each index position is added into out at that position with the
+ * coordinate along dim replaced by the index element, summed as hmr_index_add sums, in row-major
+ * order of the index positions. The workspace has hmr_scatter_add_workspace bytes for the index's
+ * number of elements. */
+hmr_status hmr_scatter_add_workspace(int64_t n, int64_t *bytes);
+hmr_status hmr_scatter_add(hmr_context_t ctx, const hmr_tensor_desc *out,
+                           const hmr_tensor_desc *src, const hmr_tensor_desc *index, int32_t dim,
+                           void *workspace, int64_t workspace_bytes);
+
+/* cpu::max_pool2d_backward: each element of grad is added into the contiguous out at the plane
+ * position `indices` (I64, grad's sizes, checked to lie in the plane) holds for it, in the dtype,
+ * one at a time in row-major order of grad. The workspace has
+ * hmr_max_pool2d_backward_workspace bytes for grad's number of elements. */
+hmr_status hmr_max_pool2d_backward_workspace(int64_t n, int64_t *bytes);
+hmr_status hmr_max_pool2d_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
+                                   const hmr_tensor_desc *grad, const hmr_tensor_desc *indices,
+                                   void *workspace, int64_t workspace_bytes);
+
+/* cpu::mask_coordinates in two calls: hmr_mask_count queues counting the true elements of the
+ * BOOL mask, whose number it leaves at word total_word of the workspace (hmr_mask_workspace bytes
+ * for the mask's number of elements); hmr_mask_coordinates then writes coordinate d of the k-th
+ * true element, in row-major order, to out[d][k] (I64, contiguous, mask's rank x the number). */
+hmr_status hmr_mask_workspace(int64_t n, int64_t *bytes, int64_t *total_word);
+hmr_status hmr_mask_count(hmr_context_t ctx, const hmr_tensor_desc *mask, void *workspace,
+                          int64_t workspace_bytes);
+hmr_status hmr_mask_coordinates(hmr_context_t ctx, const hmr_tensor_desc *mask, void *workspace,
+                                int64_t workspace_bytes, const hmr_tensor_desc *out);
+
+/*
+ * Pooling (csrc/pool.hip): the planes are all dimensions but the last two.
+ */
+
+/* cpu::max_pool2d: out and indices (I64, plane positions) for the windows of input; `geometry`
+ * holds the kernel size, stride, padding and dilation, each for the height and the width. */
+hmr_status hmr_max_pool2d(hmr_context_t ctx, const hmr_tensor_desc *out,
+                          const hmr_tensor_desc *indices, const hmr_tensor_desc *input,
+                          const int64_t *geometry);
+
+/* cpu::adaptive_avg_pool2d and its backward (out has the input's shape). */
+hmr_status hmr_adaptive_avg_pool2d(hmr_context_t ctx, const hmr_tensor_desc *out,
+                                   const hmr_tensor_desc *input);
+hmr_status hmr_adaptive_avg_pool2d_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
+                                            const hmr_tensor_desc *grad);
+
+/* cpu::unfold_backward: out has x's shape, grad that of x.unfold(dim, size, step). */
+hmr_status hmr_unfold_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
+                               const hmr_tensor_desc *grad, int32_t dim, int64_t size,
+                               int64_t step);
+
 /* The architectures this library was built for, separated by ';' (HOMURA_OFFLOAD_ARCH). */
 const char *hmr_built_archs(void);
 
@@ -354,14 +449,18 @@ void hmr_abi_check(hmr_abi_info *out);
  * hmr_test_fail_properties(n): the calling thread's next n hmr_device_properties_get calls fail
  * with HMR_HIP_ERROR, to test that a context created before such a failure is destroyed.
  * hmr_test_fail_data(n, out_of_memory): the calling thread's next n data operations (hmr_copy,
- * hmr_fill, hmr_copy_device, hmr_copy_to_host, hmr_copy_from_host, and the kernels, samplers
- * and reductions above) fail before queueing any work, as their HIP call would: with
- * hipErrorOutOfMemory if out_of_memory is nonzero, else with hipErrorInvalidHandle (review round
- * 124, R148 and R149).
+ * hmr_fill, hmr_copy_device, hmr_copy_to_host, hmr_copy_from_host, and the kernels, samplers,
+ * reductions, indexing and pooling entries above) fail before queueing any work, as their HIP
+ * call would: with hipErrorOutOfMemory if out_of_memory is nonzero, else with
+ * hipErrorInvalidHandle (review round 124, R148 and R149).
  * hmr_test_reduce_plan(): the plan hmr_reduce chooses for a reduction (csrc/reduce.hpp): the
  * lanes per output, the number of chunks of the reduced range and their size, to test that the
  * tests reach every path. hmr_test_softmax_plan(): the same for hmr_softmax: whether it splits
  * its rows, the lanes per row and the elements a lane keeps in registers (0: none).
+ * hmr_test_index_value(): the second step of hmr_index_check alone: if slot[0] (a logical
+ * position of `index`, set by the caller) isn't UINT64_MAX, writes the value there to slot[1], to
+ * test positions far beyond what a check could reach in a test (2^60 and more, in views with
+ * zero strides).
  * hmr_test_live_streams(): the number of streams the calling thread created and hasn't destroyed.
  * hmr_test_current_device(): the calling thread's current HIP device (hipGetDevice).
  * hmr_test_set_current_device(): hipSetDevice for the calling thread.
@@ -375,6 +474,8 @@ hmr_status hmr_test_reduce_plan(const hmr_tensor_desc *kept, const hmr_tensor_de
                                 int64_t *group, int64_t *splits, int64_t *chunk);
 hmr_status hmr_test_softmax_plan(const hmr_tensor_desc *src_rows, int64_t n, int64_t src_stride,
                                  int32_t *split, int32_t *group, int32_t *cache);
+hmr_status hmr_test_index_value(hmr_context_t ctx, const hmr_tensor_desc *index,
+                                uint64_t *slot);
 int32_t hmr_test_live_streams(void);
 hmr_status hmr_test_current_device(int32_t *device);
 hmr_status hmr_test_set_current_device(int32_t device);

@@ -56,8 +56,9 @@ Implemented so far:
   dtypes (with exactly the CPU's results) and read back there. Elementwise operations, the
   optimizers' steps and random sampling run on the GPU with the CPU's results (bit for bit, apart
   from the last place of transcendental functions), and so do reductions and softmax
-  (accumulated in f64 like the CPU's, in another order, with the GPU's exp and log in softmax);
-  matrix products, indexing, pooling and convolutions don't yet.
+  (accumulated in f64 like the CPU's, in another order, with the GPU's exp and log in softmax),
+  and indexing, embedding, `nll_loss` and pooling (bit for bit, positions checked on the GPU);
+  matrix products and convolutions don't yet.
 
 Not available yet: most operations on GPUs (ROCm comes first), most neural network layers,
 autograd hooks, and in-place operations on views that require grad.

@@ -119,7 +119,13 @@ fn arg_op(
     }
     let shape = reduced_shape(&src.layout.shape, &mask, keepdim);
     let device = src.device();
-    let vals = values.then(|| Tensor::empty_on(shape.clone(), src.dtype, device));
+    // Not `bool::then`: a closure would hide the caller's location from an allocation failure
+    // (review round 131).
+    let vals = if values {
+        Some(Tensor::empty_on(shape.clone(), src.dtype, device))
+    } else {
+        None
+    };
     let indices = Tensor::empty_on(shape, DType::I64, device);
     if device != Device::Meta {
         let vd = vals.as_ref().map(Tensor::data);

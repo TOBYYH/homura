@@ -24,7 +24,7 @@ use crate::{DType, Device, Tensor, no_grad};
 ///
 /// With PyTorch's messages: if `padding_idx` is not in `-num_embeddings..num_embeddings`, if
 /// `weight` isn't 2-D, if `input` isn't `I64` or `I32`, or if an index is negative or not less
-/// than the number of rows (checked for CPU indices). That message is "index out of range in
+/// than the number of rows. That message is "index out of range in
 /// self" also for tables without rows or columns, for which PyTorch's `index_select` reports
 /// others.
 #[track_caller]
@@ -46,12 +46,9 @@ pub fn embedding(input: &Tensor, weight: &Tensor, padding_idx: Option<i64>) -> T
              i64, i32; but got {dtype} instead (while checking arguments for embedding)"
         );
     }
+    // Checked on the device of `input`, before the table is read.
     if input.device() != Device::Meta
-        && input
-            .to(DType::I64)
-            .to_vec::<i64>()
-            .iter()
-            .any(|&i| i < 0 || i >= rows)
+        && crate::backend::out_of_range(&input.data(), 0, rows, None).is_some()
     {
         panic!("index out of range in self");
     }

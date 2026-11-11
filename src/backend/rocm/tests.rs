@@ -948,3 +948,313 @@ fn softmax_plans_cover_every_path() {
         }
     }
 }
+
+/// The host picks the first check that found a position out of range, in the order of the
+/// checks, whatever the positions: a slot holds a 64-bit position (`u64::MAX` for none), so
+/// positions near 2^63 can't collide with the sentinel (review round 115, R132).
+#[test]
+fn the_first_check_with_a_violation_wins() {
+    let slots = |words: &[u64]| -> Vec<u8> { words.iter().flat_map(|w| w.to_ne_bytes()).collect() };
+    let none = u64::MAX;
+    let big = (1u64 << 63) - 1;
+    let s = slots(&[none, 0, 1 << 60, 7, 0, 9]);
+    assert_eq!(
+        index::first_violation(&s, &[true, true, true]),
+        Some((1, 7))
+    );
+    // A check that didn't run (an empty index) doesn't count, whatever its slot holds.
+    assert_eq!(
+        index::first_violation(&s, &[true, false, true]),
+        Some((2, 9))
+    );
+    let s = slots(&[big, -5i64 as u64, 0, 1]);
+    assert_eq!(index::first_violation(&s, &[true, true]), Some((0, -5)));
+    let s = slots(&[none, 3, none, 4]);
+    assert_eq!(index::first_violation(&s, &[true, true]), None);
+}
+
+/// The workspace sizes of the sorts (index_add, scatter_add, max_pool2d backward), of
+/// overwriting and of masks: exactly the C formula up to the largest size whose byte count fits
+/// in an i64, and a failure beyond it rather than a wrapped or negative size (review round 131,
+/// R154). The model recomputes the formula in i128.
+#[test]
+fn workspace_sizes_fail_instead_of_overflowing() {
+    let ceil = |n: i128, d: i128| (n + d - 1) / d;
+    // 4 words per pair, a count per digit and 2048-pair tile, the scan's words (two per chunk of
+    // 4096 counts, and the total).
+    let sort = |n: i128| -> i128 {
+        if n == 0 {
+            return 0;
+        }
+        let counts = 256 * ceil(n, 2048);
+        8 * (4 * n + counts + 2 * ceil(counts, 4096) + 1)
+    };
+    let mask = |n: i128| -> i128 {
+        let tiles = ceil(n, 16384);
+        8 * (tiles + 2 * ceil(tiles, 4096) + 1)
+    };
+    let max = i64::MAX as i128;
+    // The largest n whose sort workspace fits.
+    let (mut lo, mut hi) = (0i128, max);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if sort(mid) <= max {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    let largest = lo as i64;
+    type Sizing = fn(i64) -> Result<i64, Failure>;
+    let sizings: [(&str, Sizing); 3] = [
+        ("index_add", |n| {
+            let mut b = -1;
+            // SAFETY: a valid output location.
+            call(unsafe { ffi::hmr_index_add_workspace(n, 0, &mut b) }).map(|()| b)
+        }),
+        ("scatter_add", |n| {
+            let mut b = -1;
+            // SAFETY: as above.
+            call(unsafe { ffi::hmr_scatter_add_workspace(n, &mut b) }).map(|()| b)
+        }),
+        ("max_pool2d_backward", |n| {
+            let mut b = -1;
+            // SAFETY: as above.
+            call(unsafe { ffi::hmr_max_pool2d_backward_workspace(n, &mut b) }).map(|()| b)
+        }),
+    ];
+    let too_large = |name: &str, n: i64, r: Result<i64, Failure>| match r {
+        Err(f) => assert_eq!(f.message, "the workspace is too large", "{name} {n}"),
+        Ok(b) => panic!("{name} {n}: {b} bytes"),
+    };
+    for (name, sizing) in sizings {
+        for n in [
+            0,
+            1,
+            2047,
+            2048,
+            2049,
+            (1 << 20) + 1,
+            1 << 40,
+            largest - 1,
+            largest,
+        ] {
+            assert_eq!(
+                sizing(n).map(i128::from).ok(),
+                Some(sort(n.into())),
+                "{name} {n}"
+            );
+        }
+        for n in [largest + 1, 1 << 58, 1 << 59, 1 << 61, 1 << 62, i64::MAX] {
+            too_large(name, n, sizing(n));
+        }
+    }
+    let overwrite = |size: i64| {
+        let mut b = -1;
+        // SAFETY: a valid output location.
+        call(unsafe { ffi::hmr_index_overwrite_workspace(size, &mut b) }).map(|()| b)
+    };
+    assert_eq!(overwrite(i64::MAX / 8).ok(), Some(i64::MAX / 8 * 8));
+    too_large(
+        "index_overwrite",
+        i64::MAX / 8 + 1,
+        overwrite(i64::MAX / 8 + 1),
+    );
+    too_large("index_overwrite", i64::MAX, overwrite(i64::MAX));
+    for n in [0, 1, 16384, 16385, 1 << 40, i64::MAX] {
+        let (mut b, mut total) = (-1, -1);
+        // SAFETY: valid output locations.
+        call(unsafe { ffi::hmr_mask_workspace(n, &mut b, &mut total) }).unwrap();
+        assert_eq!(i128::from(b), mask(n.into()), "mask {n}");
+    }
+}
+
+/// The value at a logical position of an index tensor, read by the second step of a check, for
+/// positions as large as a tensor's logical shape allows (below 2^63), in views of two elements
+/// with zero strides; the kernels compute offsets in 64 bits.
+#[test]
+fn values_are_read_at_large_logical_positions() {
+    let _lock = memory_lock();
+    use crate::tensor::{Layout, TensorData};
+    let base = crate::tensor([11i64, 22]).to(crate::Device::Rocm(0));
+    let data = base.data();
+    let view = |shape: &[usize], strides: &[usize]| TensorData {
+        layout: Layout {
+            shape: crate::Shape::new(shape),
+            strides: crate::Strides::new(strides),
+            offset: 0,
+        },
+        ..data.clone()
+    };
+    let cases: [(&[usize], &[usize], u64, i64); 5] = [
+        (&[2, 1 << 60], &[1, 0], 1 << 60, 22),
+        (&[2, 1 << 60], &[1, 0], (1 << 60) - 1, 11),
+        (&[2, 1 << 60], &[1, 0], (1 << 61) - 1, 22),
+        (&[1 << 62, 2], &[0, 1], (1 << 63) - 1, 22),
+        (&[1 << 62, 2], &[0, 1], (1 << 63) - 2, 11),
+    ];
+    let slots = crate::Tensor::empty_on(crate::Shape::new(&[2]), crate::DType::I64, base.device());
+    for (shape, strides, position, expected) in cases {
+        let index = view(shape, strides);
+        let [desc] = expect(copy::descs_with_dims(
+            "test",
+            [&index],
+            [0],
+            &shape
+                .iter()
+                .zip(strides)
+                .map(|(&n, &s)| (n, [s as i64]))
+                .collect::<Vec<_>>(),
+        ));
+        write_host(&slots.data(), &[position as i64, 0]);
+        let ctx = copy::buffer("test", &data).context();
+        let slot = copy::buffer("test", &slots.data()).ptr().cast();
+        // SAFETY: the description lies inside `base`'s two elements (zero strides elsewhere);
+        // `slot` is two words of device memory.
+        expect(call(unsafe {
+            ffi::hmr_test_index_value(ctx.raw(), &desc, slot)
+        }));
+        let got = read_host::<i64>(&slots.data());
+        assert_eq!(got, [position as i64, expected], "{shape:?} at {position}");
+    }
+}
+
+/// The backward of max_pool2d checks the indices on the GPU and reports the first offending one
+/// in row-major order, with the CPU's message.
+#[test]
+fn max_pool2d_backward_checks_its_indices() {
+    let _lock = memory_lock();
+    for device in [crate::Device::Cpu, crate::Device::Rocm(0)] {
+        let grad = crate::ones_with([1, 2, 2, 2], device);
+        let input = crate::zeros_with([1, 2, 4, 4], device);
+        let indices = crate::tensor([0i64, 5, 16, 3, 1, -1, 2, 99])
+            .reshape([1, 2, 2, 2])
+            .to(device);
+        let message =
+            panic_message(|| drop(crate::ops::max_pool2d_backward(&grad, &input, &indices)));
+        assert_eq!(
+            message, "max_pool2d index 16 is outside a plane of 16 elements",
+            "{device}"
+        );
+    }
+}
+
+/// The coordinates of a mask with more tiles than one chunk of the device scan (4096 tiles of
+/// 16384 elements), against a mask whose true elements are known: every 7th.
+#[test]
+fn masks_beyond_one_chunk_of_the_scan_compact_in_order() {
+    let _lock = memory_lock();
+    let (rows, cols) = (10_000usize, 7_000usize);
+    let mask = crate::zeros_with([rows, cols], (crate::DType::Bool, crate::Device::Rocm(0)));
+    mask.reshape([-1, 7]).select(1, 0).fill_(true);
+    let coords = mask_coordinates(&mask.data());
+    assert_eq!(coords.len(), 2);
+    let r = read_host::<i64>(&coords[0]);
+    let c = read_host::<i64>(&coords[1]);
+    assert_eq!(r.len(), rows * cols / 7);
+    for (k, (&r, &c)) in r.iter().zip(&c).enumerate() {
+        let linear = 7 * k;
+        assert_eq!(
+            (r as usize, c as usize),
+            (linear / cols, linear % cols),
+            "{k}"
+        );
+    }
+}
+
+/// Timings of the indexing kernels on representative shapes (M4.14 item 13: the synchronization
+/// of the device checks), printed; run on demand with
+/// `cargo test --release --features rocm --lib -- --ignored indexing_timings --nocapture`.
+#[test]
+#[ignore = "a measurement, run on demand"]
+fn indexing_timings() {
+    use crate::backend::Bounds;
+    use crate::{DType, Device, Shape, Tensor};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let time = |name: &str, f: &dyn Fn()| {
+        for _ in 0..3 {
+            f();
+        }
+        synchronize(0);
+        let reps = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            f();
+        }
+        synchronize(0);
+        let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!("{name:<64} {us:>10.1} us");
+    };
+    let tokens = crate::randint_with(0, 32000, [2048], gpu);
+    // Embedding lookup: Llama's table, 2048 tokens.
+    let table = crate::zeros_with([32000, 4096], (DType::F16, gpu));
+    let picked = Tensor::empty_on(Shape::new(&[2048, 4096]), DType::F16, gpu);
+    for bounds in [Bounds::NonNegative, Bounds::Valid] {
+        time(
+            &format!("index_select [32000, 4096] f16, 2048 rows, {bounds:?}"),
+            &|| {
+                crate::backend::index_select(
+                    &picked.data(),
+                    &table.data(),
+                    0,
+                    &tokens.data(),
+                    bounds,
+                )
+            },
+        );
+    }
+    time(
+        "out_of_range of 2048 tokens (check + read-back only)",
+        &|| {
+            let _ = crate::backend::out_of_range(&tokens.data(), 0, 32000, None);
+        },
+    );
+    // Its backward: 2048 rows added into the table, f32.
+    let table32 = crate::zeros_with([32000, 4096], (DType::F32, gpu));
+    let rows = crate::ones_with([2048, 4096], (DType::F32, gpu));
+    for bounds in [Bounds::NonNegative, Bounds::Valid] {
+        time(
+            &format!("index_add 2048 rows into [32000, 4096] f32, {bounds:?}"),
+            &|| crate::backend::index_add(&table32.data(), 0, &tokens.data(), &rows.data(), bounds),
+        );
+    }
+    // NLL over Llama's logits: gather and its backward, a scatter_add.
+    let logits = crate::zeros_with([2048, 32000], (DType::F32, gpu));
+    let target = tokens.reshape([2048, 1]);
+    let one = Tensor::empty_on(Shape::new(&[2048, 1]), DType::F32, gpu);
+    time("gather [2048, 32000] f32 at [2048, 1]", &|| {
+        crate::backend::gather(&one.data(), &logits.data(), 1, &target.data())
+    });
+    time("scatter_add [2048, 1] into [2048, 32000] f32", &|| {
+        crate::backend::scatter_add(&logits.data(), 1, &target.data(), &one.data())
+    });
+    // ResNet-50's max pooling (3x3, stride 2, padding 1) and its backward.
+    let x = crate::randn_with([32, 64, 112, 112], gpu);
+    let o = crate::nn::functional::MaxPool2dOptions {
+        stride: Some([2, 2]),
+        padding: [1, 1],
+        ..crate::nn::functional::MaxPool2dOptions::new([3, 3])
+    };
+    let (y, indices) = crate::nn::functional::max_pool2d_with_indices(&x, o);
+    time("max_pool2d [32, 64, 112, 112] f32 3x3/2", &|| {
+        drop(crate::nn::functional::max_pool2d_with_indices(&x, o))
+    });
+    let g = crate::ones_like(&y);
+    time("max_pool2d backward (check, sort, add)", &|| {
+        drop(crate::ops::max_pool2d_backward(&g, &x, &indices))
+    });
+    time("adaptive_avg_pool2d [32, 2048, 7, 7] -> [2, 3]", &|| {
+        drop(crate::nn::functional::adaptive_avg_pool2d(
+            &crate::zeros_with([32, 2048, 7, 7], gpu),
+            [2, 3],
+        ))
+    });
+    // Masks of 2^20 to 2^26 elements, half true.
+    for e in [20, 24, 26] {
+        let m = crate::rand_with([1usize << e], gpu).less(0.5);
+        time(&format!("mask coordinates of 2^{e} elements"), &|| {
+            drop(mask_coordinates(&m.data()))
+        });
+    }
+}

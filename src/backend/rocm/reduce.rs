@@ -10,12 +10,12 @@
 
 use super::context::exec;
 use super::copy::{buffer, descs_with_dims, device_index, merge_dims};
-use super::{call, expect, ffi};
+use super::{call, expect, ffi, workspace};
+use crate::Tensor;
 use crate::backend::cpu::walk_strides;
 use crate::ops::ReduceOp;
 use crate::shape::contiguous_strides;
 use crate::tensor::TensorData;
-use crate::{DType, Shape, Tensor};
 
 fn reduce_code(op: ReduceOp) -> i32 {
     match op {
@@ -104,13 +104,13 @@ fn output(kernel: &str, r: &Reduction, out: &TensorData) -> ffi::hmr_tensor_desc
 
 /// The workspace of a reduction's plan on the device of `src`, if it needs one.
 #[track_caller]
-fn workspace(r: &Reduction, src: &TensorData, var: bool) -> Option<Tensor> {
+fn plan_workspace(r: &Reduction, src: &TensorData, var: bool) -> Option<Tensor> {
     let mut bytes = 0i64;
     // SAFETY: the descriptions are valid; the call only reads their sizes and strides.
     expect(call(unsafe {
         ffi::hmr_reduce_workspace(&r.kept, &r.red, var as i32, &mut bytes)
     }));
-    (bytes > 0).then(|| Tensor::empty_on(Shape::new(&[bytes as usize]), DType::U8, src.device()))
+    workspace(bytes, src.device())
 }
 
 /// A workspace's pointer and size for the C ABI.
@@ -147,7 +147,7 @@ pub(crate) fn reduce(op: ReduceOp, out: &TensorData, src: &TensorData, mask: &[b
         return;
     };
     let o = output("reduce", &r, out);
-    let ws = workspace(&r, src, false);
+    let ws = plan_workspace(&r, src, false);
     let (ptr, bytes) = raw("reduce", &ws);
     // SAFETY: the descriptions lie inside device memory of `out`'s device (ops put the source
     // there); `out` is a new tensor and the workspace holds `bytes` bytes of the same device.
@@ -169,7 +169,7 @@ pub(crate) fn var(
         return;
     };
     let o = output("var", &r, out);
-    let ws = workspace(&r, src, true);
+    let ws = plan_workspace(&r, src, true);
     let (ptr, bytes) = raw("var", &ws);
     // SAFETY: as in `reduce`.
     run("var", out, |ctx| unsafe {
@@ -208,7 +208,7 @@ pub(crate) fn arg_reduce(
     };
     let i = output("arg_reduce", &r, indices);
     let v = values.map(|v| output("arg_reduce", &r, v));
-    let ws = workspace(&r, src, false);
+    let ws = plan_workspace(&r, src, false);
     let (ptr, bytes) = raw("arg_reduce", &ws);
     let vp = v.as_ref().map_or(std::ptr::null(), |v| v as *const _);
     // SAFETY: as in `reduce`; `values`, when given, is another new tensor.
@@ -275,8 +275,7 @@ pub(crate) fn softmax(out: &TensorData, src: &TensorData, dim: usize, log: bool)
     expect(call(unsafe {
         ffi::hmr_softmax_workspace(&s, n as i64, si as i64, &mut bytes)
     }));
-    let ws = (bytes > 0)
-        .then(|| Tensor::empty_on(Shape::new(&[bytes as usize]), DType::U8, src.device()));
+    let ws = workspace(bytes, src.device());
     let (ptr, bytes) = raw("softmax", &ws);
     // SAFETY: the descriptions lie inside device memory of `out`'s device; `out` is a new
     // tensor and the workspace holds `bytes` bytes of the same device.

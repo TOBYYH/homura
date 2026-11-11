@@ -34,6 +34,14 @@ contain a panicking call: `expect(...)`, `.unwrap()`, `panic!`, `.raise()`, or a
 operation that reports its own failures (`backend::copy`, `backend::try_fill`, ...). They return
 the failure instead (`backend::copy_unreported`, the ROCm `Result`s), reported after the closure.
 
+For the same reason, the closures passed to combinators (`.then(..)`, `.map(..)`, `.and_then(..)`,
+`.unwrap_or_else(..)`, ...) in the checked files must not call homura's internal allocation and
+transfer primitives, whose failures on a device (out of memory, a failed upload) panic where
+they are: `empty_on(..)`, `convert_data(..)`, `on_device(..)` and the workspace helpers
+(`..workspace(..)`); an explicit `if` / `match` keeps the caller's location (review round 131,
+R155). This covers the primitives only: a public tensor operation called inside such a closure
+also reports the closure's line when it fails, which the run-time test has to find.
+
 The scanner reads rustfmt-formatted source line by line rather than parsing Rust: a function
 starts at a line with `fn` (its name on that line or the next), and only an attribute line
 `#[track_caller]` right above it, among its other attributes, comments and doc comments, counts.
@@ -309,6 +317,32 @@ def closure_panics(text):
     return found
 
 
+# A combinator whose argument is a closure, up to the closure's parameters.
+COMBINATOR_RE = re.compile(
+    r"\.(?:then|map|and_then|or_else|unwrap_or_else|map_or_else|map_err|filter_map|flat_map"
+    r"|find_map|for_each|get_or_insert_with)\(\s*(?:move\s+)?\|"
+)
+# The allocation and transfer primitives that panic for a device's failure where they are.
+ALLOCATION_RE = re.compile(r"\b(?:empty_on|convert_data|on_device|\w*workspace)\(")
+
+
+def combinator_allocations(text):
+    """`(line number, call)` of every allocation or transfer primitive inside the closure of a
+    combinator such as `.then(|| ..)` or `.map(|x| ..)`."""
+    code = code_only(text)
+    found = []
+    for m in COMBINATOR_RE.finditer(code):
+        start = m.end()
+        depth, end = 1, start
+        while end < len(code) and depth:
+            depth += code[end] == "("
+            depth -= code[end] == ")"
+            end += 1
+        for p in ALLOCATION_RE.finditer(code, start, end - 1):
+            found.append((code.count("\n", 0, p.start()) + 1, p.group(0)))
+    return found
+
+
 def check(root):
     root = Path(root)
     failures = []
@@ -328,6 +362,11 @@ def check(root):
                 failures.append(
                     f"{rel}:{line}: `{call}` panics inside an execution lock's closure, which "
                     "hides the caller's location; return the failure and report it after"
+                )
+            for line, call in combinator_allocations(text):
+                failures.append(
+                    f"{rel}:{line}: `{call}` allocates or transfers inside a combinator's "
+                    "closure, which hides the caller's location; use an explicit `if` or `match`"
                 )
     for path, name in sorted(set(ALLOWED) - used):
         failures.append(f"{path}: the ALLOWED entry for `{name}` excuses no function; remove it")
@@ -416,8 +455,35 @@ CLOSURE_SELF_TESTS = [
 ]
 
 
+# (source, expected calls) of allocation primitives inside combinators' closures (review round
+# 131, R155): the four shapes found in steps 3, 4a and 4b, and what may stay.
+COMBINATOR_SELF_TESTS = [
+    ("fn f() {\n    let v = (d != Meta).then(|| on_device(data.clone(), device));\n}\n",
+     ["on_device("]),
+    ("fn f() {\n    (bytes > 0).then(|| Tensor::empty_on(Shape::new(&[n]), DType::U8, d))\n}\n",
+     ["empty_on("]),
+    ("fn f() {\n    let ws = (bytes > 0)\n        .then(|| Tensor::empty_on(s, DType::U8, d));\n}\n",
+     ["empty_on("]),
+    ("fn f() {\n    let w = (t != 0).then(|| random::int_workspace(device, n.div_ceil(2)));\n}\n",
+     ["int_workspace("]),
+    ("fn f() {\n    let v = xs.iter().map(move |x| {\n        convert_data(x, dt, d)\n    });\n}\n",
+     ["convert_data("]),
+    ("fn f() {\n    let w = if bytes > 0 {\n        Some(Tensor::empty_on(s, DType::U8, d))\n"
+     "    } else {\n        None\n    };\n}\n", []),
+    ("fn f() {\n    let r = ok.then(|| Tensor::try_empty_on(s, t, d));\n}\n", []),
+    ("fn f() {\n    let s = v.map(|t| t.layout.clone());\n    workspace(bytes, d);\n}\n", []),
+    ("fn f() {\n    // x.then(|| empty_on(s))\n    let m = v.map(|t| \"empty_on(\");\n}\n", []),
+    ("fn f() {\n    let a = v.then_some(empty_on(s, t, d));\n}\n", []),
+]
+
+
 def self_test():
     failures = 0
+    for i, (source, expected) in enumerate(COMBINATOR_SELF_TESTS):
+        got = [call for _, call in combinator_allocations(source)]
+        if got != expected:
+            failures += 1
+            print(f"combinator self-test {i} failed: expected {expected}, got {got}\n{source}")
     for i, (source, expected) in enumerate(CLOSURE_SELF_TESTS):
         got = [call for _, call in closure_panics(source)]
         if got != expected:
@@ -430,7 +496,7 @@ def self_test():
         if got != expected:
             failures += 1
             print(f"self-test {i} failed: expected {expected}, got {got}\n{source}")
-    total = len(cases) + len(CLOSURE_SELF_TESTS)
+    total = len(cases) + len(CLOSURE_SELF_TESTS) + len(COMBINATOR_SELF_TESTS)
     print(f"{total - failures}/{total} self-tests passed")
     return failures == 0
 

@@ -287,6 +287,116 @@ unsafe extern "C" {
         src_stride: i64,
         reverse: i32,
     ) -> hmr_status;
+    pub fn hmr_index_check(
+        ctx: hmr_context_t,
+        index: *const hmr_tensor_desc,
+        low: i64,
+        high: i64,
+        has_exempt: i32,
+        exempt: i64,
+        slot: *mut u64,
+    ) -> hmr_status;
+    pub fn hmr_index_select(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        index: *const hmr_tensor_desc,
+        dim: i32,
+        wrap_negative: i32,
+    ) -> hmr_status;
+    pub fn hmr_gather(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        index: *const hmr_tensor_desc,
+        dim: i32,
+    ) -> hmr_status;
+    pub fn hmr_index_positions(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        coord: *const hmr_tensor_desc,
+        size: i64,
+        stride: i64,
+        first: i32,
+    ) -> hmr_status;
+    pub fn hmr_index_overwrite_workspace(size: i64, bytes: *mut i64) -> hmr_status;
+    pub fn hmr_index_overwrite(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        positions: *const hmr_tensor_desc,
+        dim: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_index_add_workspace(m: i64, size: i64, bytes: *mut i64) -> hmr_status;
+    pub fn hmr_index_add(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        index: *const hmr_tensor_desc,
+        dim: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_scatter_add_workspace(n: i64, bytes: *mut i64) -> hmr_status;
+    pub fn hmr_scatter_add(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        src: *const hmr_tensor_desc,
+        index: *const hmr_tensor_desc,
+        dim: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_max_pool2d_backward_workspace(n: i64, bytes: *mut i64) -> hmr_status;
+    pub fn hmr_max_pool2d_backward(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        grad: *const hmr_tensor_desc,
+        indices: *const hmr_tensor_desc,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_mask_workspace(n: i64, bytes: *mut i64, total_word: *mut i64) -> hmr_status;
+    pub fn hmr_mask_count(
+        ctx: hmr_context_t,
+        mask: *const hmr_tensor_desc,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
+    pub fn hmr_mask_coordinates(
+        ctx: hmr_context_t,
+        mask: *const hmr_tensor_desc,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+        out: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_max_pool2d(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        indices: *const hmr_tensor_desc,
+        input: *const hmr_tensor_desc,
+        geometry: *const i64,
+    ) -> hmr_status;
+    pub fn hmr_adaptive_avg_pool2d(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        input: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_adaptive_avg_pool2d_backward(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        grad: *const hmr_tensor_desc,
+    ) -> hmr_status;
+    pub fn hmr_unfold_backward(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        grad: *const hmr_tensor_desc,
+        dim: i32,
+        size: i64,
+        step: i64,
+    ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);
     pub fn hmr_test_fail_stream_create(n: i32);
@@ -307,6 +417,11 @@ unsafe extern "C" {
         split: *mut i32,
         group: *mut i32,
         cache: *mut i32,
+    ) -> hmr_status;
+    pub fn hmr_test_index_value(
+        ctx: hmr_context_t,
+        index: *const hmr_tensor_desc,
+        slot: *mut u64,
     ) -> hmr_status;
     pub fn hmr_test_live_streams() -> i32;
     pub fn hmr_test_current_device(device: *mut i32) -> hmr_status;

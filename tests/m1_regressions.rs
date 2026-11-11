@@ -1113,3 +1113,38 @@ fn coefficients_must_fit_the_type_the_kernel_takes_them_in() {
     let out = o(&[1, 1]).addmm(&o(&[1, 1]), &o(&[1, 1]), 1, f64::MAX);
     assert_eq!(out.to_vec::<f64>(), [f64::MAX]);
 }
+
+/// Results computed in f64 round to `f16` and `bf16` through `f32`, as PyTorch converts a double
+/// to a half type (M4 plan revision 8), in every kernel: `half`'s own `from_f64` rounds directly
+/// (and for `f16` depends on the host), and a call through a concrete type found it before the
+/// trait's (M4 step 4b). The f64 sum here lies just below the bf16 tie -3.0859375: rounding
+/// directly gives -3.078125, through f32 -3.09375.
+#[test]
+fn half_results_round_through_f32() {
+    let v = [-2.59375f64, -0.4921875, 9.725553695716371e-14];
+    let x = homura::tensor(v.to_vec()).to(homura::DType::BF16);
+    assert_eq!(x.to(homura::DType::F64).to_vec::<f64>(), v, "exact in bf16");
+    let through_f32 = half::bf16::from_f32(v.iter().sum::<f64>() as f32);
+    assert_eq!(through_f32.to_f32(), -3.09375);
+    assert_ne!(half::bf16::from_f64(v.iter().sum::<f64>()), through_f32);
+    let picks = homura::tensor([0i64, 0, 0]);
+    let zeros = homura::zeros_with([1], homura::DType::BF16);
+    let results = [
+        ("sum", x.sum().reshape([1])),
+        ("index_add", zeros.index_add(0, &picks, &x)),
+        ("scatter_add", zeros.scatter_add(0, &picks, &x)),
+        (
+            "index_put accumulate",
+            zeros.index_put_accumulate((&picks,), &x),
+        ),
+        (
+            "matmul",
+            homura::ones_with([1, 3], homura::DType::BF16)
+                .matmul(&x.reshape([3, 1]))
+                .reshape([1]),
+        ),
+    ];
+    for (name, r) in results {
+        assert_eq!(r.to_vec::<half::bf16>(), [through_f32], "{name}");
+    }
+}

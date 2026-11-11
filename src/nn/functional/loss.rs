@@ -108,7 +108,7 @@ pub fn mse_loss(input: &Tensor, target: &Tensor, reduction: Reduction) -> Tensor
 /// With PyTorch's messages: if `input` is 0-D or not floating point, if the shapes don't match
 /// as described, if `target` is not `I64` or `U8`, if `weight` doesn't have one element per class
 /// (`[C]`) or the dtype of `input`, if `weight` requires grad in grad mode, or if a target that
-/// isn't `ignore_index` is not a class (checked for CPU targets).
+/// isn't `ignore_index` is not a class.
 #[track_caller]
 pub fn nll_loss(
     input: &Tensor,
@@ -199,11 +199,14 @@ pub fn nll_loss(
     let (out, total_weight) = {
         let _guard = no_grad();
         let target = target.to(DType::I64);
+        // Checked on the device of `target`, without reading it back.
         if target.device() != Device::Meta {
-            let bad = target
-                .to_vec::<i64>()
-                .into_iter()
-                .find(|&t| t != ignore_index && !(0..n_classes as i64).contains(&t));
+            let bad = crate::backend::out_of_range(
+                &target.data(),
+                0,
+                n_classes as i64,
+                Some(ignore_index),
+            );
             if let Some(t) = bad {
                 panic!("Target {t} is out of bounds.");
             }

@@ -225,7 +225,9 @@
 //! and multiplications; softmax and log-softmax also take `exp` and `log` from the GPU's math
 //! library, which may differ from the CPU's in the last place. Either way the order depends on
 //! the shape and strides alone, so the same reduction of the same tensor gives the same bits
-//! every time it runs. Scaled matrix products also use rules independent of size and layout;
+//! every time it runs. Its indexing and pooling kernels give the CPU's bits: repeated positions
+//! are added in the CPU's order and type, after grouping them on the GPU, not with atomic
+//! additions. Scaled matrix products also use rules independent of size and layout;
 //! see [`Tensor::addmm`]. The sums at repeated positions of
 //! advanced indexing's backward pass and of [`Tensor::index_put_accumulate`] are computed the same
 //! way, so they can differ from PyTorch's, which round after each addition, by more than the

@@ -20,38 +20,6 @@ using hmr::guarded;
 namespace hmr {
 namespace {
 
-// The type a floating point dtype computes in, as the CPU's FloatElement::C.
-template <int DT>
-struct Comp {
-    using C = float;
-};
-template <>
-struct Comp<HMR_F64> {
-    using C = double;
-};
-
-// Exact widening to the computation type (half's to_f32).
-template <int DT>
-__device__ inline typename Comp<DT>::C up(typename Elem<DT>::T v) {
-    if constexpr (DT == HMR_F16) {
-        return static_cast<float>(__builtin_bit_cast(_Float16, v));
-    } else if constexpr (DT == HMR_BF16) {
-        return __uint_as_float(static_cast<uint32_t>(v) << 16);
-    } else {
-        return v;
-    }
-}
-
-// Rounding to the dtype, to nearest even (half's from_f32).
-template <int DT>
-__device__ inline typename Elem<DT>::T down(typename Comp<DT>::C c) {
-    if constexpr (DT == HMR_F16 || DT == HMR_BF16) {
-        return from_f32<DT>(c);
-    } else {
-        return c;
-    }
-}
-
 // The math functions of the CPU kernels for f32 and f64 (Rust's f32::exp is expf, and so on).
 __device__ inline float m_exp(float x) { return expf(x); }
 __device__ inline double m_exp(double x) { return exp(x); }

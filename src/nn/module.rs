@@ -878,11 +878,16 @@ fn convert<M: Member + ?Sized>(module: &M, options: TensorOptions) {
         changes.push((t, data, dtype, device, grad));
     }
     for (t, data, dtype, device, grad) in changes {
-        let grad = grad.map(|(grad, requires_grad)| {
-            let g = Tensor::from_data(convert_data(&grad, dtype, device));
-            g.requires_grad_(requires_grad);
-            g
-        });
+        // Not `Option::map`: a closure would hide the caller's location from a failed
+        // conversion (review round 131).
+        let grad = match grad {
+            Some((grad, requires_grad)) => {
+                let g = Tensor::from_data(convert_data(&grad, dtype, device));
+                g.requires_grad_(requires_grad);
+                Some(g)
+            }
+            None => None,
+        };
         crate::autograd::replace_leaf_data(t, convert_data(&data, dtype, device), grad);
     }
 }

@@ -28,8 +28,8 @@ mod reduce;
 pub(crate) use iter::{Plan, walk_strides};
 pub(crate) use linalg::matmul;
 pub(crate) use misc::{
-    flip, gather, index_add, index_overwrite, index_select, mask_coordinates, scatter_add, softmax,
-    triangle, unfold_backward,
+    flip, gather, index_add, index_overwrite, index_positions, index_select, mask_coordinates,
+    out_of_range, scatter_add, softmax, triangle, unfold_backward,
 };
 pub(crate) use num::{Float, FloatElement, IntElement};
 pub(crate) use pool::{

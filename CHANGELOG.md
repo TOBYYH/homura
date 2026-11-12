@@ -53,7 +53,8 @@ All notable changes to this project are documented in this file. The format is b
   CPU or on the GPU), `index_put` and `index_put_accumulate`, `embedding`, `nll_loss`,
   `max_pool2d` (and its indices), `adaptive_avg_pool2d`, and their gradients, including those of
   `max_dim`, `min_dim` and `unfold`. Repeated positions add up in the CPU's order and type (no
-  atomic additions), and overwrite with the last value. Positions are checked on the GPU, which
+  atomic additions), and overwrite with the last value; the gradient of `max_pool2d` is gathered
+  at each input position from the windows that cover it. Positions are checked on the GPU, which
   reports the position the CPU reports, with its message, from a few bytes read back (one
   synchronization per call that takes an index tensor). Matrix products and convolutions don't
   run on the GPU yet.

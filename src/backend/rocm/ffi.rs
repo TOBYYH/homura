@@ -379,6 +379,21 @@ unsafe extern "C" {
         input: *const hmr_tensor_desc,
         geometry: *const i64,
     ) -> hmr_status;
+    pub fn hmr_max_pool2d_check(
+        ctx: hmr_context_t,
+        indices: *const hmr_tensor_desc,
+        height: i64,
+        width: i64,
+        geometry: *const i64,
+        slot: *mut u64,
+    ) -> hmr_status;
+    pub fn hmr_max_pool2d_gather_backward(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        grad: *const hmr_tensor_desc,
+        indices: *const hmr_tensor_desc,
+        geometry: *const i64,
+    ) -> hmr_status;
     pub fn hmr_adaptive_avg_pool2d(
         ctx: hmr_context_t,
         out: *const hmr_tensor_desc,
@@ -422,6 +437,15 @@ unsafe extern "C" {
         ctx: hmr_context_t,
         index: *const hmr_tensor_desc,
         slot: *mut u64,
+    ) -> hmr_status;
+    pub fn hmr_test_wide_pool(on: i32);
+    pub fn hmr_test_pool_candidates(
+        geometry: *const i64,
+        height: i64,
+        width: i64,
+        out_h: i64,
+        out_w: i64,
+        count: *mut i64,
     ) -> hmr_status;
     pub fn hmr_test_live_streams() -> i32;
     pub fn hmr_test_current_device(device: *mut i32) -> hmr_status;

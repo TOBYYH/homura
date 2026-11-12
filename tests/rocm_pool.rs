@@ -2,8 +2,12 @@
 //! indices, every float and integer dtype, NaNs and ties, M2 step 8's kernel / stride / padding /
 //! dilation / ceil_mode combinations), adaptive_avg_pool2d (windows smaller and larger than the
 //! input), and the gradients of both and of unfold, which add overlapping contributions one at a
-//! time in the dtype: every result with the CPU's bits.
+//! time in the dtype: every result with the CPU's bits. The gradient of max_pool2d gathers, for
+//! each input position, the windows that cover it (step 4c): every geometry, the CPU's order of
+//! the additions, second-order gradients.
 #![cfg(feature = "rocm")]
+
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[path = "common/rocm.rs"]
 mod rocm;
@@ -120,19 +124,225 @@ fn compare_gradients(what: &str, f: &dyn Fn(&Tensor) -> Tensor, x: &Tensor, seed
     assert_bitwise(&g, &c, what);
 }
 
+/// Options with a stride, padding and dilation for both dimensions and no ceil mode.
+fn options(
+    kernel: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+) -> MaxPool2dOptions {
+    let mut o = MaxPool2dOptions::new(kernel);
+    o.stride = Some(stride);
+    o.padding = padding;
+    o.dilation = dilation;
+    o
+}
+
+/// Geometries beyond `pool_options`, with the input shape for each: strides above the kernel
+/// size (inputs no window covers, whose gradient is 0), large dilations (a position covered by
+/// up to 9 windows of a 3 × 3 kernel with stride 2, review round 133, R157), ceil mode's last
+/// window cut by the input, outputs of 1 × 1, and dilations far larger than the kernel, also
+/// different for the rows and the columns, where the gather visits only the windows that cover a
+/// position, not their whole span (review round 135, R159).
+fn more_options() -> Vec<([usize; 4], MaxPool2dOptions)> {
+    let mut ceil = options([3, 3], [2, 2], [1, 1], [1, 1]);
+    ceil.ceil_mode = true;
+    let mut ceil_dilated = options([2, 3], [3, 2], [1, 0], [2, 3]);
+    ceil_dilated.ceil_mode = true;
+    vec![
+        ([2, 3, 9, 11], options([2, 2], [3, 3], [0, 0], [1, 1])),
+        ([2, 3, 9, 11], options([1, 1], [2, 3], [0, 0], [1, 1])),
+        ([2, 3, 9, 11], options([2, 3], [4, 5], [1, 1], [1, 1])),
+        ([2, 3, 9, 11], options([3, 3], [2, 2], [0, 0], [2, 2])),
+        ([2, 3, 13, 13], options([3, 3], [2, 2], [1, 1], [3, 2])),
+        ([1, 1, 9, 9], options([3, 3], [2, 2], [0, 0], [2, 2])),
+        ([2, 3, 10, 12], ceil),
+        ([2, 3, 9, 11], ceil_dilated),
+        ([2, 3, 3, 3], options([3, 3], [1, 1], [0, 0], [1, 1])),
+        ([2, 3, 5, 5], options([3, 3], [2, 2], [1, 1], [2, 2])),
+        ([3, 1, 1, 1], options([1, 1], [1, 1], [0, 0], [1, 1])),
+        (
+            [1, 1, 512, 512],
+            options([2, 2], [1, 1], [0, 0], [256, 256]),
+        ),
+        ([2, 3, 64, 64], options([3, 3], [1, 1], [0, 0], [16, 16])),
+        ([2, 3, 9, 17], options([2, 3], [1, 2], [1, 1], [1, 3])),
+        ([2, 3, 20, 30], options([3, 2], [2, 1], [1, 0], [7, 1])),
+    ]
+}
+
 #[test]
 fn max_pool2d_gradients_add_like_the_cpu() {
-    let shape = [2, 3, 9, 11];
-    let n: usize = shape.iter().product();
     for (s, &dtype) in FLOATS.iter().enumerate() {
         // Overlapping windows over many ties: several outputs pick the same input, whose
         // gradient adds them in output order, rounding each addition in the dtype.
-        let x = tied(dtype, n, 40 + s as u64).reshape([2, 3, 9, 11]);
-        for o in pool_options().into_iter().step_by(5) {
-            let what = format!("{dtype} {o:?}");
+        let cases = pool_options()
+            .into_iter()
+            .map(|o| ([2, 3, 9, 11], o))
+            .chain(more_options());
+        for (k, (shape, o)) in cases.enumerate() {
+            let n: usize = shape.iter().product();
+            let x = tied(dtype, n, 40 + s as u64 + k as u64).reshape(shape);
+            let what = format!("{dtype} {shape:?} {o:?}");
             compare_gradients(&what, &|x| F::max_pool2d(x, o), &x, 50 + s as u64);
         }
+        // A strided gradient: the output transposed (its gradient is a transposed view).
+        for o in pool_options().into_iter().step_by(7) {
+            let x = tied(dtype, 2 * 3 * 9 * 11, 45 + s as u64).reshape([2, 3, 9, 11]);
+            let what = format!("{dtype} {o:?}, transposed gradient");
+            compare_gradients(
+                &what,
+                &|x| F::max_pool2d(x, o).transpose(2, 3),
+                &x,
+                55 + s as u64,
+            );
+        }
     }
+}
+
+/// `d<max_pool2d(x), v>/dx` on `device` for this `v`, as a CPU tensor.
+fn gradient_for(x: &Tensor, o: MaxPool2dOptions, v: &Tensor, device: Device) -> Tensor {
+    let x = x.to(device).detach();
+    x.requires_grad_(true);
+    let y = F::max_pool2d(&x, o);
+    autograd::grad(
+        &[&y],
+        &[&x],
+        GradOptions {
+            grad_outputs: vec![Some(v.reshape(y.shape()).to(device))],
+            ..Default::default()
+        },
+    )
+    .remove(0)
+    .expect("a gradient")
+    .to(Device::Cpu)
+}
+
+/// Sums whose value depends on the order of the additions: an input picked by several windows
+/// whose gradients in output order are 2048 and then ones, in `F16`, where 2048 + 1 rounds back
+/// to 2048. The CPU's order gives 2048, the reverse 2048 + the number of ones.
+#[test]
+fn max_pool2d_gradients_add_in_the_cpus_order() {
+    // A row of 5 with the maximum in the middle, picked by 3 windows of width 3; and the case of
+    // R157, a 9 × 9 plane whose centre all 9 windows (kernel 3, stride 2, dilation 2) pick.
+    let mut row = vec![0.0; 5];
+    row[2] = 1.0;
+    let mut plane = vec![0.0; 81];
+    plane[40] = 1.0;
+    let cases = [
+        (
+            Tensor::from_slice(&row, [1, 1, 1, 5]),
+            options([1, 3], [1, 1], [0, 0], [1, 1]),
+            3,
+            2,
+            2050.0,
+        ),
+        (
+            Tensor::from_slice(&plane, [1, 1, 9, 9]),
+            options([3, 3], [2, 2], [0, 0], [2, 2]),
+            9,
+            40,
+            2056.0,
+        ),
+    ];
+    for (x, o, windows, at, reversed) in cases {
+        let x = x.to(DType::F16);
+        let (_, indices) = F::max_pool2d_with_indices(&x, o);
+        assert_eq!(indices.to_vec::<i64>(), vec![at as i64; windows], "{o:?}");
+        let mut v = vec![1.0; windows];
+        v[0] = 2048.0;
+        let v = Tensor::from_slice(&v, [windows]).to(DType::F16);
+        let c = gradient_for(&x, o, &v, Device::Cpu);
+        let g = gradient_for(&x, o, &v, GPU);
+        assert_eq!(c.to(DType::F64).to_vec::<f64>()[at], 2048.0, "{o:?}");
+        assert_bitwise(&g.to(GPU), &c, &format!("{o:?}"));
+        // The reverse order would give another value, so the test sees the order.
+        let backwards: f64 = (0..windows).rev().fold(0.0, |acc, k| {
+            let term = if k == 0 { 2048.0 } else { 1.0 };
+            Tensor::from_slice(&[acc + term], [1])
+                .to(DType::F16)
+                .to(DType::F64)
+                .to_vec::<f64>()[0]
+        });
+        assert_eq!(backwards, reversed, "{o:?}");
+    }
+}
+
+/// The gradient of the gradient: with respect to the upstream gradient, it gathers at the
+/// indices; with respect to the input, zeros.
+#[test]
+fn max_pool2d_second_order_gradients_match_the_cpu() {
+    for (s, &dtype) in FLOATS.iter().enumerate() {
+        for (shape, o) in more_options().into_iter().step_by(2) {
+            let n: usize = shape.iter().product();
+            let x = tied(dtype, n, 100 + s as u64).reshape(shape);
+            let run = |device: Device| {
+                let x = x.to(device).detach();
+                x.requires_grad_(true);
+                let y = F::max_pool2d(&x, o);
+                let v = values(dtype, y.num_elements(), 110 + s as u64)
+                    .reshape(y.shape())
+                    .to(device);
+                v.requires_grad_(true);
+                let gx = autograd::grad(
+                    &[&y],
+                    &[&x],
+                    GradOptions {
+                        grad_outputs: vec![Some(v.clone())],
+                        create_graph: true,
+                        ..Default::default()
+                    },
+                )
+                .remove(0)
+                .expect("a gradient");
+                let w = values(dtype, n, 120 + s as u64).reshape(shape).to(device);
+                autograd::grad(
+                    &[&gx],
+                    &[&v, &x],
+                    GradOptions {
+                        grad_outputs: vec![Some(w)],
+                        allow_unused: true,
+                        ..Default::default()
+                    },
+                )
+                .into_iter()
+                .map(|g| g.map(|g| g.to(Device::Cpu)))
+                .collect::<Vec<_>>()
+            };
+            let (c, g) = (run(Device::Cpu), run(GPU));
+            let what = format!("{dtype} {shape:?} {o:?}");
+            assert_eq!(c.len(), g.len());
+            for (k, (c, g)) in c.iter().zip(&g).enumerate() {
+                match (c, g) {
+                    (Some(c), Some(g)) => assert_bitwise(&g.to(GPU), c, &format!("{what} {k}")),
+                    (None, None) => {}
+                    _ => panic!("{what} {k}: one gradient is missing"),
+                }
+            }
+        }
+    }
+}
+
+/// A window that covers only padding is rejected before any kernel runs, on the GPU as on the
+/// CPU (`tests/nn_pool.rs`), so the backward pass never sees one (review round 133, R158).
+#[test]
+fn max_pool2d_rejects_windows_of_padding_on_the_gpu() {
+    let columns = MaxPool2dOptions {
+        stride: Some([1, 1]),
+        padding: [0, 1],
+        dilation: [1, 2],
+        ..MaxPool2dOptions::new([2, 2])
+    };
+    let message = |device: Device| {
+        let x = homura::ones_with([1, 1, 3, 1], device);
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(F::max_pool2d(&x, columns))))
+            .expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("a message")
+    };
+    assert_eq!(message(GPU), message(Device::Cpu));
 }
 
 #[test]

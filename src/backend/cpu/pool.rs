@@ -100,12 +100,18 @@ fn max_pool2d_typed<T: Element>(
 
 /// The gradient of [`max_pool2d`]: `out`, zero-filled with the input's shape, gets each element
 /// of `grad` added at the plane position `indices` holds for it, one at a time in output order,
-/// in the dtype (`f16` and `bf16` round after each addition), like PyTorch's CPU kernel.
+/// in the dtype (`f16` and `bf16` round after each addition), like PyTorch's CPU kernel. The
+/// geometry isn't needed here (the GPU uses it to gather instead).
 ///
 /// # Panics
 ///
 /// Panics if an index is outside the plane.
-pub(crate) fn max_pool2d_backward(out: &TensorData, grad: &TensorData, indices: &TensorData) {
+pub(crate) fn max_pool2d_backward(
+    out: &TensorData,
+    grad: &TensorData,
+    indices: &TensorData,
+    _: &Pool2d,
+) {
     let (lo, lg, li) = (&out.layout, &grad.layout, &indices.layout);
     if lg.num_elements() == 0 {
         return;

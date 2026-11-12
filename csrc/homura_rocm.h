@@ -377,9 +377,10 @@ hmr_status hmr_scatter_add(hmr_context_t ctx, const hmr_tensor_desc *out,
                            const hmr_tensor_desc *src, const hmr_tensor_desc *index, int32_t dim,
                            void *workspace, int64_t workspace_bytes);
 
-/* cpu::max_pool2d_backward: each element of grad is added into the contiguous out at the plane
- * position `indices` (I64, grad's sizes, checked to lie in the plane) holds for it, in the dtype,
- * one at a time in row-major order of grad. The workspace has
+/* cpu::max_pool2d_backward for any indices inside the plane (hmr_max_pool2d_gather_backward is
+ * the path for indices inside their windows): each element of grad is added into
+ * the contiguous out at the plane position `indices` (I64, grad's sizes, checked to lie in the
+ * plane) holds for it, in the dtype, one at a time in row-major order of grad. The workspace has
  * hmr_max_pool2d_backward_workspace bytes for grad's number of elements. */
 hmr_status hmr_max_pool2d_backward_workspace(int64_t n, int64_t *bytes);
 hmr_status hmr_max_pool2d_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
@@ -405,6 +406,25 @@ hmr_status hmr_mask_coordinates(hmr_context_t ctx, const hmr_tensor_desc *mask, 
 hmr_status hmr_max_pool2d(hmr_context_t ctx, const hmr_tensor_desc *out,
                           const hmr_tensor_desc *indices, const hmr_tensor_desc *input,
                           const int64_t *geometry);
+
+/* The check of max_pool2d's indices (I64, the output's sizes) for its backward, in a plane of
+ * height x width: slot[0] gets the first position, in row-major order, whose index is outside
+ * the plane (UINT64_MAX for none), slot[1] that index, and slot[2] 1 if an index inside the
+ * plane is outside the window (of `geometry`, as in hmr_max_pool2d, positions in the padding
+ * included) of its output position, else 0. `slot` is three words of device memory. */
+hmr_status hmr_max_pool2d_check(hmr_context_t ctx, const hmr_tensor_desc *indices,
+                                int64_t height, int64_t width, const int64_t *geometry,
+                                uint64_t *slot);
+
+/* cpu::max_pool2d_backward for indices inside their windows of `geometry`
+ * (hmr_max_pool2d_check found none outside): each element of out (the input's shape, contiguous)
+ * gets, from zero, the elements of grad whose index in `indices` (I64, grad's sizes) is its
+ * position, added in the dtype in row-major order of grad. Every element of out is written;
+ * nothing is sorted. */
+hmr_status hmr_max_pool2d_gather_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
+                                          const hmr_tensor_desc *grad,
+                                          const hmr_tensor_desc *indices,
+                                          const int64_t *geometry);
 
 /* cpu::adaptive_avg_pool2d and its backward (out has the input's shape). */
 hmr_status hmr_adaptive_avg_pool2d(hmr_context_t ctx, const hmr_tensor_desc *out,
@@ -461,6 +481,13 @@ void hmr_abi_check(hmr_abi_info *out);
  * position of `index`, set by the caller) isn't UINT64_MAX, writes the value there to slot[1], to
  * test positions far beyond what a check could reach in a test (2^60 and more, in views with
  * zero strides).
+ * hmr_test_wide_pool(on): while `on` is nonzero, hmr_max_pool2d_check and
+ * hmr_max_pool2d_gather_backward on the calling thread use their int64_t coordinates even where
+ * int32_t ones fit, to test them on tensors of a testable size.
+ * hmr_test_pool_candidates(): the number of (output row, output column) pairs the gathering
+ * backward of max_pool2d visits over all input positions of a plane of height x width with this
+ * geometry and output size, counted on the host with the kernel's own walk, to test that it
+ * visits exactly the covering windows (review round 135, R159).
  * hmr_test_live_streams(): the number of streams the calling thread created and hasn't destroyed.
  * hmr_test_current_device(): the calling thread's current HIP device (hipGetDevice).
  * hmr_test_set_current_device(): hipSetDevice for the calling thread.
@@ -476,6 +503,9 @@ hmr_status hmr_test_softmax_plan(const hmr_tensor_desc *src_rows, int64_t n, int
                                  int32_t *split, int32_t *group, int32_t *cache);
 hmr_status hmr_test_index_value(hmr_context_t ctx, const hmr_tensor_desc *index,
                                 uint64_t *slot);
+void hmr_test_wide_pool(int32_t on);
+hmr_status hmr_test_pool_candidates(const int64_t *geometry, int64_t height, int64_t width,
+                                    int64_t out_h, int64_t out_w, int64_t *count);
 int32_t hmr_test_live_streams(void);
 hmr_status hmr_test_current_device(int32_t *device);
 hmr_status hmr_test_set_current_device(int32_t device);

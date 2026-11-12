@@ -61,7 +61,7 @@ fn pooling_output_size(n: usize, k: usize, p: usize, s: usize, d: usize, ceil_mo
 /// Checks the arguments of a max pooling of `input` like PyTorch, in its order, and those homura
 /// adds (bool inputs, windows that cover only padding), and returns the geometry.
 #[track_caller]
-fn max_pool2d_geometry(input: &Tensor, options: &MaxPool2dOptions) -> Pool2d {
+pub(crate) fn max_pool2d_geometry(input: &Tensor, options: &MaxPool2dOptions) -> Pool2d {
     let MaxPool2dOptions {
         kernel_size: kernel,
         stride,

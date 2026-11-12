@@ -225,6 +225,9 @@ fn normal_samples_stay_within_the_bound() {
 /// and passed the bound of F32's computation type.
 #[test]
 fn the_normal_bound_uses_f64() {
+    // Its GPU tensors would otherwise show up in the memory count of
+    // `integer_sampling_needs_no_more_memory_than_its_result`, run in parallel (512 bytes).
+    let _g = lock();
     let cpu = Tensor::from_slice(&[1f32], [1]);
     let off = Tensor::from_slice(&[1.0 + 16.0 * f32::EPSILON], [1]).to(GPU);
     let m = [1.0 + 2.0 * std::f64::consts::PI];

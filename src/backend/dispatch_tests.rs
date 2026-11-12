@@ -225,10 +225,13 @@ fn indexing_and_pooling() {
     });
     reaches("max_pool2d_backward", || {
         let indices = crate::zeros_with([1, 1, 2, 2], (DType::I64, GPU));
+        let input = gpu(&[1, 1, 4, 4]);
+        let g = F::max_pool2d_geometry(&input, &pool);
         drop(crate::ops::max_pool2d_backward(
             &gpu(&[1, 1, 2, 2]),
-            &gpu(&[1, 1, 4, 4]),
+            &input,
             &indices,
+            &g,
         ))
     });
     reaches("adaptive_avg_pool2d_backward", || {

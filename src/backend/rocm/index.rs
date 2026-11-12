@@ -1,6 +1,7 @@
 //! Indexing on ROCm (`csrc/index.hip`): the counterparts of the CPU backend's `index_select`,
 //! `gather`, `index_overwrite`, `index_add`, `scatter_add`, `mask_coordinates`,
-//! `index_positions` and `out_of_range`, and of `max_pool2d_backward`, a scatter of its gradient.
+//! `index_positions` and `out_of_range`, and of `max_pool2d_backward`, which gathers its gradient
+//! (`csrc/pool.hip`) or, for indices outside their windows, scatters it.
 //!
 //! The positions in an index tensor are checked on the device: the check kernels leave the first
 //! position out of range (in row-major order of the index's logical positions) and its value in
@@ -10,13 +11,15 @@
 //!
 //! Scatters that add group their elements by target with a stable radix sort on the device and
 //! add each group in the CPU's order, so the results are the CPU's bits. The workspaces they need
-//! are allocated here before the execution lock is taken.
+//! are allocated here before the execution lock is taken (that of `max_pool2d_backward`'s
+//! fallback, only when it is taken, inside it).
 
 use super::context::{Context, exec};
 use super::copy::{buffer, descs_with_dims, device_index, merge_dims};
 use super::{Failure, call, expect, ffi, workspace};
 use crate::backend::cpu::walk_strides;
 use crate::backend::{Bounds, out_of_bounds};
+use crate::ops::Pool2d;
 use crate::tensor::{Tensor, TensorData};
 use crate::{DType, Device, Shape};
 
@@ -411,9 +414,55 @@ pub(crate) fn scatter_add(out: &TensorData, dim: usize, index: &TensorData, src:
     );
 }
 
-/// See `cpu::max_pool2d_backward`.
+/// The two ways of `max_pool2d_backward`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PoolPath {
+    /// Each input position gathers the gradient of the windows that cover it.
+    Gather,
+    /// The gradient is sorted by target and added, for indices outside their windows.
+    Sort,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The path the tests force on `max_pool2d_backward` (`None`: chosen by the check).
+    pub(super) static FORCE_POOL_PATH: std::cell::Cell<Option<PoolPath>> =
+        const { std::cell::Cell::new(None) };
+    /// The path the last `max_pool2d_backward` of this thread took.
+    pub(super) static LAST_POOL_PATH: std::cell::Cell<Option<PoolPath>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The path of `max_pool2d_backward` when the check found the indices inside their windows
+/// (`in_windows`) or not, unless a test forces one.
+fn pool_path(in_windows: bool) -> PoolPath {
+    let path = if in_windows {
+        PoolPath::Gather
+    } else {
+        PoolPath::Sort
+    };
+    #[cfg(test)]
+    let path = FORCE_POOL_PATH.get().unwrap_or(path);
+    #[cfg(test)]
+    LAST_POOL_PATH.set(Some(path));
+    path
+}
+
+/// See `cpu::max_pool2d_backward`; `g` is the geometry of the forward pass. One kernel checks the
+/// indices, read back once: one outside the plane fails as on the CPU. If each lies in the window
+/// of `g` that selects it, as the forward pass gives them, each element of `out` gathers the
+/// gradient of the windows that cover it (at most the kernel's size of them, review round 135,
+/// R159), in the CPU's order, and every element is written.
+/// Otherwise (only internal callers can give such indices: the saved ones are protected by their
+/// version) the gradient is sorted by target and added into `out`, which must hold zeros. Both
+/// give the CPU's bits.
 #[track_caller]
-pub(crate) fn max_pool2d_backward(out: &TensorData, grad: &TensorData, indices: &TensorData) {
+pub(crate) fn max_pool2d_backward(
+    out: &TensorData,
+    grad: &TensorData,
+    indices: &TensorData,
+    g: &Pool2d,
+) {
     let n = grad.layout.num_elements();
     if n == 0 {
         return;
@@ -423,43 +472,82 @@ pub(crate) fn max_pool2d_backward(out: &TensorData, grad: &TensorData, indices: 
         "internal error: max_pool2d_backward into a strided tensor"
     );
     let nd = out.layout.shape.len();
-    let size = out.layout.shape[nd - 2] * out.layout.shape[nd - 1];
-    let descs = expect(full_desc("max_pool2d_backward", out).and_then(|o| {
+    let [height, width] = [out.layout.shape[nd - 2], out.layout.shape[nd - 1]];
+    let size = height * width;
+    let [o, gr, i] = expect(full_desc("max_pool2d_backward", out).and_then(|o| {
         Ok([
             o,
             full_desc("max_pool2d_backward", grad)?,
             full_desc("max_pool2d_backward", indices)?,
         ])
     }));
-    let check = expect(flat_desc("max_pool2d_backward", indices)).map(|d| Check {
-        index: d,
-        low: 0,
-        high: size as i64,
-        exempt: None,
-    });
+    let geometry = super::pool::geometry_words(g);
     let mut bytes = 0;
     // SAFETY: a valid output location.
     expect(call(unsafe {
         ffi::hmr_max_pool2d_backward_workspace(n as i64, &mut bytes)
     }));
-    let ws = workspace(bytes, out.device());
-    let (ptr, len) = raw("max_pool2d_backward", &ws);
-    let slots = status(1, out.device());
-    let [o, g, i] = descs;
-    let result = expect(checked(
-        "max_pool2d_backward",
-        out,
-        &slots,
-        &[check],
-        |ctx| {
-            // SAFETY: the descriptions and the workspace lie inside device memory of this
-            // device; the indices were checked in the same critical section.
-            call(unsafe { ffi::hmr_max_pool2d_backward(ctx.raw(), &o, &g, &i, ptr, len) })
-        },
-    ));
-    if let Err((_, index)) = result {
-        panic!("max_pool2d index {index} is outside a plane of {size} elements");
+    let device = out.device();
+    // Three words: the first index outside the plane, its value, and the window flag.
+    let slots = status(2, device);
+    let slot: *mut u64 = first_element("max_pool2d_backward", &slots.data());
+    let ctx = buffer("max_pool2d_backward", out).context();
+    let result = expect(exec(device_index(out), || -> Result<_, Failure> {
+        // SAFETY: the description lies inside device memory of this device; `slot` is three
+        // words of the status buffer.
+        call(unsafe {
+            ffi::hmr_max_pool2d_check(
+                ctx.raw(),
+                &i,
+                height as i64,
+                width as i64,
+                geometry.as_ptr(),
+                slot,
+            )
+        })?;
+        let mut words = [0u8; 24];
+        ctx.copy_to_host(&mut words, slot.cast())?;
+        let word = |k: usize| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&words[8 * k..8 * k + 8]);
+            u64::from_ne_bytes(w)
+        };
+        if word(0) != u64::MAX {
+            return Ok(Err(Rejected::Index(word(1) as i64)));
+        }
+        match pool_path(word(2) == 0) {
+            // SAFETY: the descriptions lie inside device memory of this device; the indices
+            // were checked to lie in their windows in the same critical section.
+            PoolPath::Gather => call(unsafe {
+                ffi::hmr_max_pool2d_gather_backward(ctx.raw(), &o, &gr, &i, geometry.as_ptr())
+            })?,
+            PoolPath::Sort => {
+                // Only this path needs the workspace, a few words per gradient element.
+                let shape = Shape::new(&[bytes as usize]);
+                let ws = match Tensor::try_empty_on(shape, DType::U8, device) {
+                    Ok(w) => Some(w),
+                    Err(e) => return Ok(Err(Rejected::Memory(e))),
+                };
+                let (ptr, len) = raw("max_pool2d_backward", &ws);
+                // SAFETY: as above; the indices were checked to lie in the plane.
+                call(unsafe { ffi::hmr_max_pool2d_backward(ctx.raw(), &o, &gr, &i, ptr, len) })?;
+            }
+        }
+        Ok(Ok(()))
+    }));
+    match result {
+        Ok(()) => {}
+        Err(Rejected::Index(index)) => {
+            panic!("max_pool2d index {index} is outside a plane of {size} elements")
+        }
+        Err(Rejected::Memory(e)) => e.raise(),
     }
+}
+
+/// Why `max_pool2d_backward` stopped: an index outside the plane, or no memory for the sort.
+enum Rejected {
+    Index(i64),
+    Memory(crate::storage::AllocError),
 }
 
 /// See `cpu::mask_coordinates`: counts the true elements, reads their number back, then

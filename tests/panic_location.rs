@@ -349,9 +349,9 @@ fn rocm_kernel_failures() {
     finish();
 }
 
-/// Failures of the GPU in indexing and pooling, positions out of range checked on the GPU, and
-/// operands with more dimensions than the kernels take: all reported at the caller's line (M4
-/// step 4b).
+/// Failures of the GPU in indexing and pooling, positions out of range checked on the GPU,
+/// operands with more dimensions than the kernels take, and a pooling window that covers only
+/// padding: all reported at the caller's line (M4 steps 4b and 4c).
 #[cfg(feature = "rocm")]
 #[test]
 fn rocm_index_failures() {
@@ -412,6 +412,15 @@ fn rocm_index_failures() {
         -100,
         F::Reduction::Mean
     ));
+    // A window that covers only padding, rejected before the GPU runs (review round 133, R158).
+    let column = homura::ones_with([1, 1, 3, 1], gpu);
+    let padded = F::MaxPool2dOptions {
+        stride: Some([1, 1]),
+        padding: [0, 1],
+        dilation: [1, 2],
+        ..F::MaxPool2dOptions::new([2, 2])
+    };
+    at!(F::max_pool2d(&column, padded));
     // More dimensions than the kernels take.
     let deep = homura::zeros_with(vec![2usize; 26], (DType::F32, gpu))
         .permute((0..26).rev().collect::<Vec<i64>>());

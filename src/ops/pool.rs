@@ -64,8 +64,8 @@ impl AdaptiveWindows {
 
 /// The maxima of the windows of `input` and their positions in the plane (`I64`), PyTorch's
 /// `max_pool2d_with_indices`; see `cpu::max_pool2d`. The values are recorded as
-/// `MaxPool2DWithIndicesBackward0`, which saves `input` and the indices; the indices have no
-/// history.
+/// `MaxPool2DWithIndicesBackward0`, which saves `input`, the indices and the geometry, like
+/// PyTorch's; the indices have no history.
 #[track_caller]
 pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Tensor) {
     let x = input.data();
@@ -75,18 +75,24 @@ pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Ten
     if x.device() != Device::Meta {
         backend::max_pool2d(&out.data(), &indices.data(), &x, &g);
     }
-    formulas::max_pool2d(input, &indices, &out);
+    formulas::max_pool2d(input, &indices, &out, g);
     (out, indices)
 }
 
-/// The gradient of [`max_pool2d_with_indices`] for the upstream gradient `grad`, PyTorch's
-/// `max_pool2d_with_indices_backward`: a tensor of the shape of `input` that adds each element
-/// of `grad` at its index. Recorded as `MaxPool2DWithIndicesBackwardBackward0`.
-pub(crate) fn max_pool2d_backward(grad: &Tensor, input: &Tensor, indices: &Tensor) -> Tensor {
+/// The gradient of [`max_pool2d_with_indices`] with the geometry `geometry` for the upstream
+/// gradient `grad`, PyTorch's `max_pool2d_with_indices_backward`: a tensor of the shape of
+/// `input` that adds each element of `grad` at its index. Recorded as
+/// `MaxPool2DWithIndicesBackwardBackward0`.
+pub(crate) fn max_pool2d_backward(
+    grad: &Tensor,
+    input: &Tensor,
+    indices: &Tensor,
+    geometry: &Pool2d,
+) -> Tensor {
     let g = grad.data();
     let out = Tensor::empty_on(input.shape(), g.dtype, g.device());
     if g.device() != Device::Meta {
-        backend::max_pool2d_backward(&out.data(), &g, &indices.data());
+        backend::max_pool2d_backward(&out.data(), &g, &indices.data(), geometry);
     }
     formulas::max_pool2d_backward(grad, input, indices, &out);
     out

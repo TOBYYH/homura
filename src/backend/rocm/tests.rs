@@ -1119,6 +1119,23 @@ fn values_are_read_at_large_logical_positions() {
     }
 }
 
+/// The geometry of a max pooling of `input` with these options (no ceil mode).
+fn pool_geometry(
+    input: &crate::Tensor,
+    kernel: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+) -> crate::ops::Pool2d {
+    let o = crate::nn::functional::MaxPool2dOptions {
+        stride: Some(stride),
+        padding,
+        dilation,
+        ..crate::nn::functional::MaxPool2dOptions::new(kernel)
+    };
+    crate::nn::functional::max_pool2d_geometry(input, &o)
+}
+
 /// The backward of max_pool2d checks the indices on the GPU and reports the first offending one
 /// in row-major order, with the CPU's message.
 #[test]
@@ -1130,13 +1147,223 @@ fn max_pool2d_backward_checks_its_indices() {
         let indices = crate::tensor([0i64, 5, 16, 3, 1, -1, 2, 99])
             .reshape([1, 2, 2, 2])
             .to(device);
+        let g = pool_geometry(&input, [2, 2], [2, 2], [0, 0], [1, 1]);
         let message =
-            panic_message(|| drop(crate::ops::max_pool2d_backward(&grad, &input, &indices)));
+            panic_message(|| drop(crate::ops::max_pool2d_backward(&grad, &input, &indices, &g)));
         assert_eq!(
             message, "max_pool2d index 16 is outside a plane of 16 elements",
             "{device}"
         );
     }
+}
+
+/// The backward of max_pool2d takes the gather path for the indices of the forward pass, and the
+/// sort path for indices inside the plane but outside their windows, which only
+/// internal callers can give; forced on the same input, both paths give the CPU's bits (step
+/// 4c). The check and the gather are run with both their coordinate types.
+#[test]
+fn max_pool2d_backward_chooses_its_path() {
+    for wide in [false, true] {
+        // SAFETY: a testing hook without preconditions.
+        unsafe { ffi::hmr_test_wide_pool(wide as i32) };
+        let result = std::panic::catch_unwind(pool_paths);
+        // SAFETY: as above.
+        unsafe { ffi::hmr_test_wide_pool(0) };
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn pool_paths() {
+    use super::index::{FORCE_POOL_PATH, LAST_POOL_PATH, PoolPath};
+    use crate::{DType, Device, Tensor};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let bits = |t: &Tensor| t.to(Device::Cpu).to(DType::F64).to_vec::<f64>();
+    let run = |grad: &Tensor, x: &Tensor, indices: &Tensor, g: &crate::ops::Pool2d, force| {
+        FORCE_POOL_PATH.set(force);
+        LAST_POOL_PATH.set(None);
+        let out = crate::ops::max_pool2d_backward(grad, x, indices, g);
+        FORCE_POOL_PATH.set(None);
+        (bits(&out), LAST_POOL_PATH.get())
+    };
+    let geometries = [
+        ([3, 3], [2, 2], [1, 1], [1, 1]),
+        ([2, 3], [1, 2], [1, 0], [2, 1]),
+        ([3, 3], [2, 2], [0, 0], [2, 2]),
+        ([2, 2], [3, 3], [0, 0], [1, 1]),
+    ];
+    for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+        for (kernel, stride, padding, dilation) in geometries {
+            let what = format!("{dtype} {kernel:?} {stride:?} {padding:?} {dilation:?}");
+            // Few distinct values: ties, so windows overlap on the same maxima.
+            let x = crate::randint_with(0, 3, [2, 3, 11, 13], gpu).to(dtype);
+            let g = pool_geometry(&x, kernel, stride, padding, dilation);
+            let (y, indices) = crate::ops::max_pool2d_with_indices(&x, g);
+            let grad = crate::randn_with(y.shape(), gpu).to(dtype);
+            let cpu = crate::ops::max_pool2d_backward(
+                &grad.to(Device::Cpu),
+                &x.to(Device::Cpu),
+                &indices.to(Device::Cpu),
+                &g,
+            );
+            let (chosen, path) = run(&grad, &x, &indices, &g, None);
+            assert_eq!(path, Some(PoolPath::Gather), "{what}");
+            assert_eq!(chosen, bits(&cpu), "{what}");
+            let (sorted, path) = run(&grad, &x, &indices, &g, Some(PoolPath::Sort));
+            assert_eq!(path, Some(PoolPath::Sort), "{what}");
+            assert_eq!(sorted, chosen, "{what}");
+            // The gather writes every element from zero: it doesn't need a zero-filled output.
+            let out = crate::full_with(x.shape(), f64::NAN, (dtype, gpu));
+            crate::backend::max_pool2d_backward(&out.data(), &grad.data(), &indices.data(), &g);
+            assert_eq!(LAST_POOL_PATH.get(), Some(PoolPath::Gather), "{what}");
+            assert_eq!(bits(&out), chosen, "{what}: into NaNs");
+        }
+    }
+    // One index inside the plane but outside its window, before or after it along the
+    // rows or the columns (the windows of 2 x 2 / 2 over 4 x 4 start at 0, 2, 8 and 10): the
+    // check sends it to the sort path, which matches the CPU; gathering would drop it.
+    for device in [Device::Cpu, gpu] {
+        let x = crate::zeros_with([1, 1, 4, 4], device);
+        let g = pool_geometry(&x, [2, 2], [2, 2], [0, 0], [1, 1]);
+        let grad = crate::tensor([1.0f32, 2.0, 3.0, 4.0])
+            .reshape([1, 1, 2, 2])
+            .to(device);
+        for picked in [
+            [2i64, 2, 8, 10],
+            [0, 1, 8, 10],
+            [8, 2, 8, 10],
+            [0, 2, 4, 10],
+        ] {
+            let indices = crate::tensor(picked).reshape([1, 1, 2, 2]).to(device);
+            let mut expected = vec![0.0; 16];
+            for (k, i) in picked.into_iter().enumerate() {
+                expected[i as usize] += (k + 1) as f64;
+            }
+            if device == Device::Cpu {
+                let out = crate::ops::max_pool2d_backward(&grad, &x, &indices, &g);
+                assert_eq!(bits(&out), expected, "{picked:?}");
+                continue;
+            }
+            let (chosen, path) = run(&grad, &x, &indices, &g, None);
+            assert_eq!(path, Some(PoolPath::Sort), "{picked:?}");
+            assert_eq!(chosen, expected, "{picked:?}");
+            let (gathered, _) = run(&grad, &x, &indices, &g, Some(PoolPath::Gather));
+            assert_ne!(
+                gathered, expected,
+                "{picked:?}: the case must tell the paths apart"
+            );
+        }
+        if device == Device::Cpu {
+            continue;
+        }
+        // Between the positions of a dilated window (0, 2, 4): the gather visits only the
+        // windows that cover a position, so this goes to the sort too (review round 135, R159).
+        let row = crate::zeros_with([1, 1, 1, 5], device);
+        let dilated = pool_geometry(&row, [1, 3], [1, 1], [0, 0], [1, 2]);
+        let one = crate::tensor([5.0f32]).reshape([1, 1, 1, 1]);
+        let between = crate::tensor([1i64]).reshape([1, 1, 1, 1]);
+        let (got, path) = run(&one.to(device), &row, &between.to(device), &dilated, None);
+        assert_eq!(path, Some(PoolPath::Sort));
+        assert_eq!(got, [0.0, 5.0, 0.0, 0.0, 0.0]);
+        let cpu = crate::ops::max_pool2d_backward(&one, &row.to(Device::Cpu), &between, &dilated);
+        assert_eq!(bits(&cpu), got);
+        let (gathered, _) = run(
+            &one.to(device),
+            &row,
+            &between.to(device),
+            &dilated,
+            Some(PoolPath::Gather),
+        );
+        assert_ne!(gathered, got, "the case must tell the paths apart");
+        // With an index outside the plane as well, that one is reported, as on the CPU.
+        let bad = crate::tensor([15i64, 16, 5, 10])
+            .reshape([1, 1, 2, 2])
+            .to(device);
+        let message = panic_message(|| drop(crate::ops::max_pool2d_backward(&grad, &x, &bad, &g)));
+        assert_eq!(
+            message,
+            "max_pool2d index 16 is outside a plane of 16 elements"
+        );
+    }
+}
+
+/// The gather visits exactly the windows that cover each input position, however large the
+/// dilation (review round 135, R159): its own walk, counted on the host over a plane, against the
+/// windows of `Pool2d::window` that hold each position. The span of a dilated window would visit
+/// 4,328,587,264 pairs for 512 x 512 with kernel 2 and dilation 256, against 262,144.
+#[test]
+fn max_pool2d_gather_visits_only_covering_windows() {
+    let covering = |g: &crate::ops::Pool2d, d: usize, n: usize| -> i64 {
+        (0..g.output[d])
+            .map(|o| {
+                let (first, end) = g.window(d, o, n);
+                (first..end).step_by(g.dilation[d]).count() as i64
+            })
+            .sum()
+    };
+    let mut cases = vec![
+        (
+            [512, 512],
+            [2, 2],
+            [1, 1],
+            [0, 0],
+            [256, 256],
+            Some(262_144),
+        ),
+        ([64, 64], [3, 3], [1, 1], [0, 0], [16, 16], Some(9_216)),
+        ([9, 9], [3, 3], [2, 2], [0, 0], [2, 2], Some(81)),
+        ([112, 112], [3, 3], [2, 2], [1, 1], [1, 1], Some(27_889)),
+        ([9, 17], [2, 3], [1, 2], [1, 1], [1, 3], None),
+        ([20, 30], [5, 4], [3, 2], [2, 1], [7, 1], None),
+    ];
+    for kernel in [[2, 2], [3, 2], [3, 3]] {
+        for stride in [[1, 2], [2, 1], [3, 3]] {
+            for padding in [[0, 0], [1, 0], [1, 1]] {
+                for dilation in [[1, 1], [2, 1], [3, 4]] {
+                    cases.push(([9, 11], kernel, stride, padding, dilation, None));
+                }
+            }
+        }
+    }
+    let mut counted = 0;
+    for (shape, kernel, stride, padding, dilation, expected) in cases {
+        let what = format!("{shape:?} {kernel:?} {stride:?} {padding:?} {dilation:?}");
+        let x = crate::zeros_with([1, 1, shape[0], shape[1]], crate::Device::Meta);
+        let o = crate::nn::functional::MaxPool2dOptions {
+            stride: Some(stride),
+            padding,
+            dilation,
+            ..crate::nn::functional::MaxPool2dOptions::new(kernel)
+        };
+        // Geometries PyTorch rejects, or with windows of only padding, are skipped.
+        let Ok(g) = std::panic::catch_unwind(|| crate::nn::functional::max_pool2d_geometry(&x, &o))
+        else {
+            assert!(expected.is_none(), "{what}: rejected");
+            continue;
+        };
+        let exact = covering(&g, 0, shape[0]) * covering(&g, 1, shape[1]);
+        if let Some(e) = expected {
+            assert_eq!(exact, e, "{what}");
+        }
+        let words = super::pool::geometry_words(&g);
+        let mut count = 0;
+        // SAFETY: valid pointers; a host-only testing hook.
+        expect(call(unsafe {
+            ffi::hmr_test_pool_candidates(
+                words.as_ptr(),
+                shape[0] as i64,
+                shape[1] as i64,
+                g.output[0] as i64,
+                g.output[1] as i64,
+                &mut count,
+            )
+        }));
+        assert_eq!(count, exact, "{what}");
+        counted += 1;
+    }
+    assert!(counted >= 60, "{counted} geometries counted");
 }
 
 /// The coordinates of a mask with more tiles than one chunk of the device scan (4096 tiles of
@@ -1229,21 +1456,43 @@ fn indexing_timings() {
     time("scatter_add [2048, 1] into [2048, 32000] f32", &|| {
         crate::backend::scatter_add(&logits.data(), 1, &target.data(), &one.data())
     });
-    // ResNet-50's max pooling (3x3, stride 2, padding 1) and its backward.
-    let x = crate::randn_with([32, 64, 112, 112], gpu);
+    // The max pooling of ResNet-50's stem (3x3, stride 2, padding 1; batch 32) and of
+    // ResNet-18's at batch 1, and its backward on both paths.
+    use super::index::{FORCE_POOL_PATH, PoolPath};
     let o = crate::nn::functional::MaxPool2dOptions {
         stride: Some([2, 2]),
         padding: [1, 1],
         ..crate::nn::functional::MaxPool2dOptions::new([3, 3])
     };
-    let (y, indices) = crate::nn::functional::max_pool2d_with_indices(&x, o);
-    time("max_pool2d [32, 64, 112, 112] f32 3x3/2", &|| {
-        drop(crate::nn::functional::max_pool2d_with_indices(&x, o))
-    });
-    let g = crate::ones_like(&y);
-    time("max_pool2d backward (check, sort, add)", &|| {
-        drop(crate::ops::max_pool2d_backward(&g, &x, &indices))
-    });
+    // And the case of review round 135 (R159): a dilation far larger than the kernel.
+    let r159 = crate::nn::functional::MaxPool2dOptions {
+        stride: Some([1, 1]),
+        dilation: [256, 256],
+        ..crate::nn::functional::MaxPool2dOptions::new([2, 2])
+    };
+    for (shape, o, name) in [
+        ([32usize, 64, 112, 112], o, "3x3/2"),
+        ([1, 64, 112, 112], o, "3x3/2"),
+        ([1, 1, 512, 512], r159, "2x2/1, dilation 256"),
+    ] {
+        let x = crate::randn_with(shape, gpu);
+        let (y, indices) = crate::nn::functional::max_pool2d_with_indices(&x, o);
+        let geometry = crate::nn::functional::max_pool2d_geometry(&x, &o);
+        time(&format!("max_pool2d {shape:?} f32 {name}"), &|| {
+            drop(crate::nn::functional::max_pool2d_with_indices(&x, o))
+        });
+        let g = crate::randn_with(y.shape(), gpu);
+        for (path, name) in [
+            (PoolPath::Gather, "check, gather"),
+            (PoolPath::Sort, "check, sort, add"),
+        ] {
+            FORCE_POOL_PATH.set(Some(path));
+            time(&format!("  its backward ({name})"), &|| {
+                drop(crate::ops::max_pool2d_backward(&g, &x, &indices, &geometry))
+            });
+            FORCE_POOL_PATH.set(None);
+        }
+    }
     time("adaptive_avg_pool2d [32, 2048, 7, 7] -> [2, 3]", &|| {
         drop(crate::nn::functional::adaptive_avg_pool2d(
             &crate::zeros_with([32, 2048, 7, 7], gpu),

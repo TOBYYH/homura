@@ -1,6 +1,6 @@
 //! Pooling on ROCm (`csrc/pool.hip`): the counterparts of the CPU backend's `max_pool2d`,
 //! `adaptive_avg_pool2d`, `adaptive_avg_pool2d_backward` and `unfold_backward`, with the CPU's
-//! bits. (The backward of `max_pool2d` is a scatter, in `index.rs`.)
+//! bits. (The backward of `max_pool2d`, which checks its indices, is in `index.rs`.)
 
 use super::context::exec;
 use super::copy::{buffer, device_index};
@@ -29,14 +29,10 @@ fn full<const N: usize>(kernel: &str, operands: [&TensorData; N]) -> [ffi::hmr_t
     out
 }
 
-/// See `cpu::max_pool2d`.
-#[track_caller]
-pub(crate) fn max_pool2d(out: &TensorData, indices: &TensorData, input: &TensorData, g: &Pool2d) {
-    if out.layout.num_elements() == 0 {
-        return;
-    }
-    let [o, i, x] = full("max_pool2d", [out, indices, input]);
-    let geometry: [i64; 8] = [
+/// The geometry `g` for the C ABI: kernel size, stride, padding and dilation, each for the height
+/// and the width.
+pub(super) fn geometry_words(g: &Pool2d) -> [i64; 8] {
+    [
         g.kernel[0],
         g.kernel[1],
         g.stride[0],
@@ -46,7 +42,17 @@ pub(crate) fn max_pool2d(out: &TensorData, indices: &TensorData, input: &TensorD
         g.dilation[0],
         g.dilation[1],
     ]
-    .map(|v| v as i64);
+    .map(|v| v as i64)
+}
+
+/// See `cpu::max_pool2d`.
+#[track_caller]
+pub(crate) fn max_pool2d(out: &TensorData, indices: &TensorData, input: &TensorData, g: &Pool2d) {
+    if out.layout.num_elements() == 0 {
+        return;
+    }
+    let [o, i, x] = full("max_pool2d", [out, indices, input]);
+    let geometry = geometry_words(g);
     // SAFETY: the descriptions lie inside device memory of `out`'s device; `out` and `indices`
     // are new tensors.
     run("max_pool2d", out, |ctx| unsafe {

@@ -29,4 +29,6 @@ pub use loss::{
 };
 pub use norm::{BatchNormOptions, batch_norm, layer_norm, rms_norm};
 pub use pad::pad;
+#[cfg(test)]
+pub(crate) use pool::max_pool2d_geometry;
 pub use pool::{MaxPool2dOptions, adaptive_avg_pool2d, max_pool2d, max_pool2d_with_indices};

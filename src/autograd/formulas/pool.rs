@@ -6,15 +6,17 @@ use super::only;
 use crate::autograd::node::{ApplyContext, Node};
 use crate::autograd::record::record;
 use crate::autograd::saved::SavedId;
+use crate::ops::Pool2d;
 use crate::{Shape, Tensor};
 
 /// Records the backward node of `out`, the values of `max_pool2d_with_indices(x)` with the
-/// positions `indices`.
+/// geometry `geometry` and the positions `indices`.
 #[track_caller]
-pub(crate) fn max_pool2d(x: &Tensor, indices: &Tensor, out: &Tensor) {
+pub(crate) fn max_pool2d(x: &Tensor, indices: &Tensor, out: &Tensor, geometry: Pool2d) {
     record(&[Some(x)], &[out], |b| MaxPool2DWithIndicesBackward0 {
         input: b.save(x),
         indices: b.save(indices),
+        geometry,
     });
 }
 
@@ -51,10 +53,12 @@ pub(crate) fn adaptive_avg_pool2d_backward(grad: &Tensor, input: &Tensor, out: &
 }
 
 /// `max_pool2d_with_indices(x)`: each element of the gradient goes to the position it selected,
-/// see `ops::max_pool2d_backward`.
+/// see `ops::max_pool2d_backward`. Like PyTorch's node it keeps the geometry, with which the GPU
+/// gathers the gradient of each input position from the windows that cover it.
 struct MaxPool2DWithIndicesBackward0 {
     input: SavedId,
     indices: SavedId,
+    geometry: Pool2d,
 }
 
 impl Node for MaxPool2DWithIndicesBackward0 {
@@ -68,6 +72,7 @@ impl Node for MaxPool2DWithIndicesBackward0 {
             &only(grads),
             &x,
             &indices,
+            &self.geometry,
         ))]
     }
 }

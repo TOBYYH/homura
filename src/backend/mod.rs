@@ -477,8 +477,13 @@ pub(crate) fn max_pool2d(out: &TensorData, indices: &TensorData, input: &TensorD
 }
 
 #[track_caller]
-pub(crate) fn max_pool2d_backward(out: &TensorData, grad: &TensorData, indices: &TensorData) {
-    dispatch_rocm!(out, max_pool2d_backward(out, grad, indices))
+pub(crate) fn max_pool2d_backward(
+    out: &TensorData,
+    grad: &TensorData,
+    indices: &TensorData,
+    g: &Pool2d,
+) {
+    dispatch_rocm!(out, max_pool2d_backward(out, grad, indices, g))
 }
 
 #[track_caller]

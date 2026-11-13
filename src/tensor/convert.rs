@@ -177,7 +177,7 @@ pub(crate) fn try_convert_data(
     }
     let from = data.device();
     if device == Device::Meta {
-        return Ok(Tensor::try_empty_on(data.layout.shape.clone(), dtype, device)?.data());
+        return Ok(Tensor::try_uninit_on(data.layout.shape.clone(), dtype, device)?.data());
     }
     if from == device {
         return if dtype == data.dtype {
@@ -187,7 +187,7 @@ pub(crate) fn try_convert_data(
         };
     }
     // The result first: a request that the target device can't hold fails before any staging.
-    let out = Tensor::try_empty_on(data.layout.shape.clone(), dtype, device)?.data();
+    let out = Tensor::try_uninit_on(data.layout.shape.clone(), dtype, device)?.data();
     if from == Device::Cpu {
         // `try_cast_data` keeps `data` when the dtype doesn't change.
         backend::try_transfer_into(&out, &try_cast_data(data, dtype)?)?;

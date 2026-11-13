@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use crate::autograd::{AutogradMeta, ViewInfo};
 use crate::backend;
 use crate::shape::{contiguous_strides, is_contiguous};
-use crate::storage::Storage;
+use crate::storage::{Fill, Storage};
 use crate::{DType, Device, Element, Shape, Strides};
 
 mod convert;
@@ -401,36 +401,68 @@ impl Tensor {
             .clone()
     }
 
-    /// A new contiguous, zero-filled tensor.
+    /// A new contiguous tensor for an operation that writes every element before anything reads
+    /// it: on a ROCm device its memory isn't zeroed first (zero on the CPU). Debug builds fill it
+    /// with NaN for floating point dtypes, -1 (255 for `U8`) for integers and `true` for `Bool`,
+    /// so that an element left unwritten shows in the tests. Use
+    /// [`try_zeroed_on`](Tensor::try_zeroed_on) for an operation that relies on zeros.
     ///
     /// # Panics
     ///
     /// Panics if the size in bytes exceeds `isize::MAX`, on every device.
     #[track_caller]
-    pub(crate) fn empty_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
-        match Tensor::try_empty_on(shape, dtype, device) {
+    pub(crate) fn uninit_on(shape: Shape, dtype: DType, device: Device) -> Tensor {
+        match Tensor::try_uninit_on(shape, dtype, device) {
             Ok(t) => t,
             Err(e) => e.raise(),
         }
     }
 
-    /// Like [`empty_on`](Tensor::empty_on), returning the device's refusal of the memory instead
-    /// of panicking for it.
+    /// Like [`uninit_on`](Tensor::uninit_on), returning the device's refusal of the memory
+    /// instead of panicking for it.
     ///
     /// # Panics
     ///
     /// Panics if the size in bytes exceeds `isize::MAX` (an argument error, not a refusal).
     #[track_caller]
-    pub(crate) fn try_empty_on(
+    pub(crate) fn try_uninit_on(
         shape: Shape,
         dtype: DType,
         device: Device,
+    ) -> Result<Tensor, crate::storage::AllocError> {
+        // Every byte 0xff is a NaN of each floating point dtype and -1 of each signed integer
+        // one; a `Bool` byte must be 0 or 1.
+        let poison = if dtype == DType::Bool { 1 } else { 0xff };
+        Tensor::try_alloc_on(shape, dtype, device, Fill::Unset { poison })
+    }
+
+    /// A new contiguous, zero-filled tensor, on every device, or the device's refusal of the
+    /// memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size in bytes exceeds `isize::MAX` (an argument error, not a refusal).
+    #[track_caller]
+    pub(crate) fn try_zeroed_on(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+    ) -> Result<Tensor, crate::storage::AllocError> {
+        Tensor::try_alloc_on(shape, dtype, device, Fill::Zero)
+    }
+
+    #[track_caller]
+    fn try_alloc_on(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+        fill: Fill,
     ) -> Result<Tensor, crate::storage::AllocError> {
         let nbytes = match checked_nbytes(&shape, dtype) {
             Ok(nbytes) => nbytes,
             Err(e) => panic!("{e}"),
         };
-        let storage = Arc::new(Storage::try_new(nbytes, device)?);
+        let storage = Arc::new(Storage::try_new(nbytes, device, fill)?);
         Ok(Tensor::from_data(TensorData {
             storage,
             layout: Layout::contiguous(shape),
@@ -478,7 +510,7 @@ impl Tensor {
             values.len(),
             shape
         );
-        let t = Tensor::empty_on(shape, T::DTYPE, device);
+        let t = Tensor::uninit_on(shape, T::DTYPE, device);
         if device != Device::Meta {
             backend::write_host(&t.data(), values);
         }

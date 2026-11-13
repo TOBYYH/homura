@@ -29,11 +29,11 @@ hmr_status hmr_free(int32_t device, void *ptr) {
     });
 }
 
-hmr_status hmr_memset_zero(hmr_context_t ctx, void *ptr, uint64_t nbytes) {
+hmr_status hmr_memset(hmr_context_t ctx, void *ptr, uint8_t value, uint64_t nbytes) {
     return guarded([&] {
         hmr::DeviceGuard guard;
         if (hmr_status s = guard.enter(ctx->device)) return s;
-        HMR_HIP(hipMemsetAsync(ptr, 0, nbytes, ctx->stream));
+        HMR_HIP(hipMemsetAsync(ptr, value, nbytes, ctx->stream));
         return HMR_OK;
     });
 }

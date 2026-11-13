@@ -70,8 +70,8 @@ impl AdaptiveWindows {
 pub(crate) fn max_pool2d_with_indices(input: &Tensor, g: Pool2d) -> (Tensor, Tensor) {
     let x = input.data();
     let shape = g.output_shape(&x.layout.shape);
-    let out = Tensor::empty_on(shape.clone(), x.dtype, x.device());
-    let indices = Tensor::empty_on(shape, DType::I64, x.device());
+    let out = Tensor::uninit_on(shape.clone(), x.dtype, x.device());
+    let indices = Tensor::uninit_on(shape, DType::I64, x.device());
     if x.device() != Device::Meta {
         backend::max_pool2d(&out.data(), &indices.data(), &x, &g);
     }
@@ -90,7 +90,7 @@ pub(crate) fn max_pool2d_backward(
     geometry: &Pool2d,
 ) -> Tensor {
     let g = grad.data();
-    let out = Tensor::empty_on(input.shape(), g.dtype, g.device());
+    let out = Tensor::uninit_on(input.shape(), g.dtype, g.device());
     if g.device() != Device::Meta {
         backend::max_pool2d_backward(&out.data(), &g, &indices.data(), geometry);
     }
@@ -110,7 +110,7 @@ pub(crate) fn adaptive_avg_pool2d(input: &Tensor, output: [usize; 2]) -> Tensor 
         .copied()
         .chain(output)
         .collect();
-    let out = Tensor::empty_on(shape, x.dtype, x.device());
+    let out = Tensor::uninit_on(shape, x.dtype, x.device());
     if x.device() != Device::Meta {
         backend::adaptive_avg_pool2d(&out.data(), &x);
     }
@@ -123,7 +123,7 @@ pub(crate) fn adaptive_avg_pool2d(input: &Tensor, output: [usize; 2]) -> Tensor 
 /// `AdaptiveAvgPool2DBackwardBackward0`.
 pub(crate) fn adaptive_avg_pool2d_backward(grad: &Tensor, input: &Tensor) -> Tensor {
     let g = grad.data();
-    let out = Tensor::empty_on(input.shape(), g.dtype, g.device());
+    let out = Tensor::uninit_on(input.shape(), g.dtype, g.device());
     if g.device() != Device::Meta {
         backend::adaptive_avg_pool2d_backward(&out.data(), &g);
     }

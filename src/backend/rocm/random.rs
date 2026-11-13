@@ -56,7 +56,7 @@ pub(crate) fn normal(out: &TensorData, seed: u64, offset: u64, mean: f64, std: f
 #[track_caller]
 pub(crate) fn int_workspace(device: Device, blocks: usize) -> Tensor {
     let tiles = blocks.div_ceil(ffi::HMR_RANDOM_INT_TILE as usize);
-    Tensor::empty_on(crate::Shape::new(&[2 * tiles + 1]), DType::I64, device)
+    Tensor::uninit_on(crate::Shape::new(&[2 * tiles + 1]), DType::I64, device)
 }
 
 /// One batch of integer rejection sampling into the contiguous I64 tensor `out` (the elements

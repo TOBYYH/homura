@@ -18,10 +18,12 @@ All notable changes to this project are documented in this file. The format is b
   for a ROCm device's work. On the CPU and meta devices the queries return `None`.
 - ROCm device memory, from a caching allocator in the style of PyTorch's: requests up to 1 MiB
   round up to 512 bytes and share 2 MiB segments, larger ones round up to 2 MiB; freed memory
-  is cached for reuse, and released (then tried again) when the GPU runs out. New memory is
-  zero, as on the CPU, so `zeros_with(.., Device::Rocm(0))` and other tensors without data
-  work; operations on them don't yet. A request the GPU can't hold panics with a message like
-  PyTorch's ("ROCm out of memory. Tried to allocate ...").
+  is cached for reuse, and released (then tried again) when the GPU runs out. New memory isn't
+  zeroed when an operation writes all of it (its result), which saves a pass over the memory;
+  debug builds fill it with NaN (-1 for integers) instead, so that an element left unwritten
+  shows. `zeros_with` and the other creation functions give the same values as on the CPU. A
+  request the GPU can't hold panics with a message like PyTorch's ("ROCm out of memory. Tried to
+  allocate ...").
 - `Device::memory_stats` (`MemoryStats`: allocated, reserved and peak bytes),
   `Device::reset_peak_memory_stats` and `Device::empty_cache`. The CPU counts the buffers homura
   allocates (not file mappings); the meta device reports zeros.

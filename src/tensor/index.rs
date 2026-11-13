@@ -717,7 +717,7 @@ impl Tensor {
         let device = crate::ops::common_device([&src, &idx]);
         let mut shape = src.layout.shape.clone();
         shape[dim] = idx.layout.num_elements();
-        let out = Tensor::empty_on(shape, src.dtype, device);
+        let out = Tensor::uninit_on(shape, src.dtype, device);
         if device != Device::Meta {
             let bounds = if allow_negative {
                 backend::Bounds::AllowNegative

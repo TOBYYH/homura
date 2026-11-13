@@ -266,7 +266,7 @@ impl AdvancedIndex {
     #[track_caller]
     fn positions(&self, device: Device) -> TensorData {
         let n = self.broadcast.num_elements();
-        let out = Tensor::empty_on(Shape::new(&[n]), DType::I64, device).data();
+        let out = Tensor::uninit_on(Shape::new(&[n]), DType::I64, device).data();
         let shaped = TensorData {
             layout: Layout::contiguous(self.broadcast.clone()),
             ..out.clone()
@@ -291,7 +291,7 @@ impl AdvancedIndex {
     /// The indexing result for a target with data: a new contiguous tensor of `out_shape`.
     #[track_caller]
     fn gather(&self, target: &TensorData) -> Tensor {
-        let out = Tensor::empty_on(self.out_shape.clone(), target.dtype, target.device());
+        let out = Tensor::uninit_on(self.out_shape.clone(), target.dtype, target.device());
         if self.out_shape.num_elements() == 0 {
             self.check_bounds();
             return out;
@@ -408,7 +408,7 @@ impl Tensor {
             info.gather(&data)
         } else {
             info.check_bounds();
-            Tensor::empty_on(info.out_shape.clone(), data.dtype, data.device())
+            Tensor::uninit_on(info.out_shape.clone(), data.dtype, data.device())
         };
         formulas::index(self, indices, &out);
         out
@@ -431,7 +431,7 @@ impl Tensor {
             info.scatter(&data, &vals, accumulate)
         } else {
             info.check_bounds();
-            Tensor::empty_on(data.layout.shape.clone(), data.dtype, data.device())
+            Tensor::uninit_on(data.layout.shape.clone(), data.dtype, data.device())
         };
         formulas::index_put(self, indices, values, accumulate, &out);
         out

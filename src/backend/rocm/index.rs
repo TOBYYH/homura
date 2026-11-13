@@ -111,7 +111,7 @@ fn raw(kernel: &str, ws: &Option<Tensor>) -> (*mut std::ffi::c_void, i64) {
 /// The status buffer of `n` checks on `device`: two words per check.
 #[track_caller]
 fn status(n: usize, device: Device) -> Tensor {
-    Tensor::empty_on(Shape::new(&[2 * n.max(1)]), DType::I64, device)
+    Tensor::uninit_on(Shape::new(&[2 * n.max(1)]), DType::I64, device)
 }
 
 /// Inside the execution lock of `data`'s device: queues `checks` (each writing its slot of
@@ -454,8 +454,8 @@ fn pool_path(in_windows: bool) -> PoolPath {
 /// gradient of the windows that cover it (at most the kernel's size of them, review round 135,
 /// R159), in the CPU's order, and every element is written.
 /// Otherwise (only internal callers can give such indices: the saved ones are protected by their
-/// version) the gradient is sorted by target and added into `out`, which must hold zeros. Both
-/// give the CPU's bits.
+/// version) `out` is zeroed and the gradient, sorted by target, added into it. Both give the
+/// CPU's bits.
 #[track_caller]
 pub(crate) fn max_pool2d_backward(
     out: &TensorData,
@@ -524,11 +524,18 @@ pub(crate) fn max_pool2d_backward(
             PoolPath::Sort => {
                 // Only this path needs the workspace, a few words per gradient element.
                 let shape = Shape::new(&[bytes as usize]);
-                let ws = match Tensor::try_empty_on(shape, DType::U8, device) {
+                let ws = match Tensor::try_uninit_on(shape, DType::U8, device) {
                     Ok(w) => Some(w),
                     Err(e) => return Ok(Err(Rejected::Memory(e))),
                 };
                 let (ptr, len) = raw("max_pool2d_backward", &ws);
+                // The sums start from zero; new outputs aren't zeroed (`Tensor::uninit_on`).
+                let target: *mut u8 = first_element("max_pool2d_backward", out);
+                ctx.memset(
+                    target,
+                    0,
+                    out.layout.num_elements() * out.dtype.size_in_bytes(),
+                )?;
                 // SAFETY: as above; the indices were checked to lie in the plane.
                 call(unsafe { ffi::hmr_max_pool2d_backward(ctx.raw(), &o, &gr, &i, ptr, len) })?;
             }
@@ -561,7 +568,7 @@ pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<TensorData> {
     if n == 0 {
         let mut coords = vec![];
         for _ in 0..nd {
-            coords.push(Tensor::empty_on(Shape::new(&[0]), DType::I64, device).data());
+            coords.push(Tensor::uninit_on(Shape::new(&[0]), DType::I64, device).data());
         }
         return coords;
     }
@@ -582,7 +589,7 @@ pub(crate) fn mask_coordinates(mask: &TensorData) -> Vec<TensorData> {
         let total = unsafe { ptr.cast::<u64>().add(total_word as usize) };
         ctx.copy_to_host(&mut word, total.cast())?;
         let count = u64::from_ne_bytes(word) as usize;
-        let coords = match Tensor::try_empty_on(Shape::new(&[nd, count]), DType::I64, device) {
+        let coords = match Tensor::try_uninit_on(Shape::new(&[nd, count]), DType::I64, device) {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };

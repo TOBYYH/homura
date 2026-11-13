@@ -48,7 +48,7 @@ fn unary_op(op: UnaryOp, x: &Tensor) -> Tensor {
     } else {
         compute
     };
-    let out = Tensor::empty_on(src.layout.shape.clone(), out_dtype, src.device());
+    let out = Tensor::uninit_on(src.layout.shape.clone(), out_dtype, src.device());
     if src.device() != Device::Meta {
         backend::unary(op, &out.data(), &cast_data(&src, compute));
     }

@@ -187,7 +187,7 @@ pub(crate) fn try_cast_data(data: &TensorData, dtype: DType) -> Result<TensorDat
     if data.dtype == dtype {
         return Ok(data.clone());
     }
-    let out = Tensor::try_empty_on(data.layout.shape.clone(), dtype, data.device())?.data();
+    let out = Tensor::try_uninit_on(data.layout.shape.clone(), dtype, data.device())?.data();
     if data.device() != Device::Meta {
         backend::try_copy(&out, data)?;
     }
@@ -207,7 +207,7 @@ pub(crate) fn clone_data(data: &TensorData) -> TensorData {
 /// [`clone_data`], returning the device's refusal of the memory instead of panicking for it.
 #[track_caller]
 pub(crate) fn try_clone_data(data: &TensorData) -> Result<TensorData, AllocError> {
-    let out = Tensor::try_empty_on(data.layout.shape.clone(), data.dtype, data.device())?.data();
+    let out = Tensor::try_uninit_on(data.layout.shape.clone(), data.dtype, data.device())?.data();
     if data.device() != Device::Meta {
         backend::try_copy(&out, data)?;
     }
@@ -270,7 +270,7 @@ pub(crate) fn scalar_value(t: &Tensor) -> Scalar {
 /// A zero-dimensional tensor holding `value`.
 #[track_caller]
 pub(crate) fn scalar_data(value: Scalar, dtype: DType, device: Device) -> TensorData {
-    let out = Tensor::empty_on(Shape::scalar(), dtype, device).data();
+    let out = Tensor::uninit_on(Shape::scalar(), dtype, device).data();
     if device != Device::Meta {
         backend::fill(&out, value);
     }

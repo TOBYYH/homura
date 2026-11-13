@@ -12,7 +12,7 @@ use super::zip::{self, Archive, Entry, ZipWriter};
 use crate::backend;
 use crate::nn::StateDict;
 use crate::shape::checked_num_elements;
-use crate::storage::{FileMap, Storage};
+use crate::storage::{FileMap, Fill, Storage};
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Error, Result, Shape, Strides, Tensor};
 
@@ -319,14 +319,14 @@ impl<R: Read + Seek> Storages<'_, R> {
         let nbytes = usize::try_from(entry.size).map_err(|_| bad("a storage is too large"))?;
         let big_endian = self.archive.big_endian;
         let Some(map) = &self.map else {
-            let mut storage = Storage::new(nbytes, Device::Cpu);
+            let mut storage = Storage::new(nbytes, Device::Cpu, Fill::Zero);
             let bytes = storage.cpu_bytes_mut();
             zip::read_entry_into(self.r, entry, bytes)?;
             fix_bytes(bytes, dtype, big_endian);
             return Ok(storage);
         };
         if nbytes == 0 {
-            return Ok(Storage::new(0, Device::Cpu));
+            return Ok(Storage::new(0, Device::Cpu, Fill::Zero));
         }
         // The archive was checked against the file's length when it was read; the mapping must
         // still cover the record.
@@ -346,7 +346,7 @@ impl<R: Read + Seek> Storages<'_, R> {
         if dtype != DType::Bool && !swap && offset.is_multiple_of(size) {
             return Ok(mapped);
         }
-        let mut copy = Storage::new(nbytes, Device::Cpu);
+        let mut copy = Storage::new(nbytes, Device::Cpu, Fill::Zero);
         let bytes = copy.cpu_bytes_mut();
         bytes.copy_from_slice(mapped.cpu_bytes_mut());
         fix_bytes(bytes, dtype, big_endian);

@@ -163,9 +163,10 @@ unsafe extern "C" {
     pub fn hmr_context_synchronize(ctx: hmr_context_t) -> hmr_status;
     pub fn hmr_malloc(device: i32, nbytes: u64, out: *mut *mut ::core::ffi::c_void) -> hmr_status;
     pub fn hmr_free(device: i32, ptr: *mut ::core::ffi::c_void) -> hmr_status;
-    pub fn hmr_memset_zero(
+    pub fn hmr_memset(
         ctx: hmr_context_t,
         ptr: *mut ::core::ffi::c_void,
+        value: u8,
         nbytes: u64,
     ) -> hmr_status;
     pub fn hmr_copy_to_host(

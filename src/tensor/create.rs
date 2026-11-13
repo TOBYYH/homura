@@ -248,14 +248,18 @@ fn try_filled(
     device: Device,
 ) -> Result<Tensor, crate::storage::AllocError> {
     let value = crate::ops::fill_value(value, dtype, device);
-    let t = Tensor::try_empty_on(shape, dtype, device)?;
-    // New memory is zeroed; `-0.0` still needs filling to keep its sign bit.
+    // A value of zero bits takes zeroed memory and no fill; any other (`-0.0` too, for its sign
+    // bit) is written over memory that isn't zeroed first.
     let zero_bits = match value {
         Scalar::Bool(v) => !v,
         Scalar::Int(v) => v == 0,
         Scalar::Float(v) => v.to_bits() == 0,
     };
-    if device != Device::Meta && !zero_bits {
+    if zero_bits {
+        return Tensor::try_zeroed_on(shape, dtype, device);
+    }
+    let t = Tensor::try_uninit_on(shape, dtype, device)?;
+    if device != Device::Meta {
         backend::try_fill(&t.data(), value)?;
     }
     Ok(t)
@@ -411,7 +415,7 @@ pub fn full_like(t: &Tensor, value: impl Into<Scalar>) -> Tensor {
 #[track_caller]
 fn from_values(n: usize, dtype: DType, device: Device, f: impl Fn(usize) -> Scalar) -> Tensor {
     // Allocating first rejects sizes that are too large before computing any values.
-    let t = Tensor::empty_on(Shape::new(&[n]), dtype, device);
+    let t = Tensor::uninit_on(Shape::new(&[n]), dtype, device);
     if device != Device::Meta {
         dispatch_all!(dtype, T => {
             let values: Vec<T> = (0..n).map(|i| T::from_scalar(f(i))).collect();

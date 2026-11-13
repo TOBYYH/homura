@@ -269,7 +269,7 @@ fn memory_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn rocm_storage(nbytes: usize) -> crate::storage::Storage {
-    crate::storage::Storage::new(nbytes, crate::Device::Rocm(0))
+    crate::storage::Storage::new(nbytes, crate::Device::Rocm(0), crate::storage::Fill::Zero)
 }
 
 fn read_back(s: &crate::storage::Storage) -> Vec<u8> {
@@ -295,6 +295,126 @@ fn rocm_storage_is_zeroed_also_when_its_block_is_reused() {
     let second = rocm_storage(4000);
     assert_eq!(second.rocm_buffer().ptr(), ptr);
     assert_eq!(read_back(&second), vec![0; 4000]);
+}
+
+/// Unset storage queues nothing in release builds (the block keeps what it held) and the poison
+/// byte in debug builds; zeroed storage on the same block reads as zero again.
+#[test]
+fn unset_rocm_storage_is_poisoned_in_debug_builds_and_left_as_it_was_otherwise() {
+    use crate::storage::{Fill, Storage};
+    let _lock = memory_lock();
+    let first = rocm_storage(4096);
+    let ptr = first.rocm_buffer().ptr();
+    let b = first.rocm_buffer();
+    b.context().copy_from_host(b.ptr(), &[0xab; 4096]).unwrap();
+    drop(first);
+    let unset = Storage::new(4096, crate::Device::Rocm(0), Fill::Unset { poison: 0xcd });
+    assert_eq!(unset.rocm_buffer().ptr(), ptr);
+    let expected = if cfg!(debug_assertions) { 0xcd } else { 0xab };
+    assert_eq!(read_back(&unset), vec![expected; 4096]);
+    drop(unset);
+    let zeroed = rocm_storage(4096);
+    assert_eq!(zeroed.rocm_buffer().ptr(), ptr);
+    assert_eq!(read_back(&zeroed), vec![0; 4096]);
+}
+
+/// `Tensor::uninit_on` poisons by dtype in debug builds: NaN for floats, -1 / 255 for
+/// integers, `true` for Bool (a valid bool byte).
+#[test]
+fn uninit_tensors_are_poisoned_by_dtype_in_debug_builds() {
+    use crate::{DType, Device, Shape, Tensor};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    let new = |dtype| Tensor::uninit_on(Shape::new(&[3]), dtype, gpu);
+    assert!(new(DType::F32).to_vec::<f32>().iter().all(|v| v.is_nan()));
+    assert!(new(DType::F64).to_vec::<f64>().iter().all(|v| v.is_nan()));
+    assert!(
+        new(DType::F16)
+            .to_vec::<half::f16>()
+            .iter()
+            .all(|v| v.is_nan())
+    );
+    assert!(
+        new(DType::BF16)
+            .to_vec::<half::bf16>()
+            .iter()
+            .all(|v| v.is_nan())
+    );
+    assert_eq!(new(DType::I64).to_vec::<i64>(), vec![-1; 3]);
+    assert_eq!(new(DType::I32).to_vec::<i32>(), vec![-1; 3]);
+    assert_eq!(new(DType::U8).to_vec::<u8>(), vec![255; 3]);
+    assert_eq!(new(DType::Bool).to_vec::<bool>(), vec![true; 3]);
+}
+
+/// Creating zeros never relies on what a reused block held: `zeros` and `full(0)` skip the fill
+/// on zeroed memory, `full(-0.0)` keeps its sign.
+#[test]
+fn zeros_are_zero_on_blocks_that_held_data() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    for dtype in [DType::F32, DType::F16, DType::I64, DType::U8, DType::Bool] {
+        let dirty = crate::full_with([1024], 1, (dtype, gpu));
+        let ptr = dirty.data().storage.rocm_buffer().ptr();
+        drop(dirty);
+        let z = crate::zeros_with([1024], (dtype, gpu));
+        assert_eq!(z.data().storage.rocm_buffer().ptr(), ptr, "{dtype}");
+        assert!(
+            z.to(DType::F64).to_vec::<f64>().iter().all(|&v| v == 0.0),
+            "{dtype}"
+        );
+        drop(z);
+        let f = crate::full_with([1024], 0, (dtype, gpu));
+        assert!(
+            f.to(DType::F64).to_vec::<f64>().iter().all(|&v| v == 0.0),
+            "{dtype}"
+        );
+    }
+    let n = crate::full_with([1024], -0.0, (DType::F32, gpu)).to_vec::<f32>();
+    assert!(n.iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
+}
+
+/// Non-zero values are written over memory that isn't zeroed first (poisoned in debug builds):
+/// every element of a reused block holds the value, and `-0.0` its sign.
+#[test]
+fn nonzero_creation_overwrites_every_element_of_a_reused_block() {
+    use crate::{DType, Device};
+    let _lock = memory_lock();
+    let gpu = Device::Rocm(0);
+    for dtype in [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::F64,
+        DType::I64,
+        DType::U8,
+    ] {
+        let dirty = crate::full_with([1000], 7, (dtype, gpu));
+        let ptr = dirty.data().storage.rocm_buffer().ptr();
+        drop(dirty);
+        let t = crate::full_with([1000], 3, (dtype, gpu));
+        assert_eq!(t.data().storage.rocm_buffer().ptr(), ptr, "{dtype}");
+        assert_eq!(t.to(DType::F64).to_vec::<f64>(), vec![3.0; 1000], "{dtype}");
+        drop(t);
+        let ones = crate::ones_with([1000], (dtype, gpu));
+        assert_eq!(
+            ones.to(DType::F64).to_vec::<f64>(),
+            vec![1.0; 1000],
+            "{dtype}"
+        );
+    }
+    let dirty = crate::full_with([1000], false, (DType::Bool, gpu));
+    drop(dirty);
+    assert_eq!(
+        crate::full_with([1000], true, (DType::Bool, gpu)).to_vec::<bool>(),
+        vec![true; 1000]
+    );
+    drop(crate::full_with([1000], 5.0, (DType::F32, gpu)));
+    let n = crate::full_with([1000], -0.0, (DType::F32, gpu)).to_vec::<f32>();
+    assert!(n.iter().all(|v| v.to_bits() == (-0.0f32).to_bits()));
 }
 
 #[test]
@@ -334,7 +454,11 @@ fn a_request_larger_than_the_device_is_out_of_memory() {
     let _lock = memory_lock();
     let total = properties(0).total_memory as usize;
     let before = memory_stats(0);
-    let r = crate::storage::Storage::try_new(2 * total, crate::Device::Rocm(0));
+    let r = crate::storage::Storage::try_new(
+        2 * total,
+        crate::Device::Rocm(0),
+        crate::storage::Fill::Zero,
+    );
     assert_eq!(
         r.map(drop),
         Err(crate::storage::AllocError::OutOfMemory {
@@ -350,7 +474,11 @@ fn a_request_larger_than_the_device_is_out_of_memory() {
     assert_eq!(read_back(&rocm_storage(512)), vec![0; 512]);
     // The refused hipMalloc doesn't linger as this thread's last HIP error, which the probe of a
     // new context (a kernel launch, checked with hipGetLastError) would otherwise report.
-    let _ = crate::storage::Storage::try_new(2 * total, crate::Device::Rocm(0));
+    let _ = crate::storage::Storage::try_new(
+        2 * total,
+        crate::Device::Rocm(0),
+        crate::storage::Fill::Zero,
+    );
     let slot: TestSlot = Mutex::new(None);
     let ctx = create_in(&slot, 0).unwrap();
     ctx.synchronize();
@@ -365,7 +493,8 @@ fn a_zeroing_that_runs_out_of_memory_is_out_of_memory() {
     drop(rocm_storage(8192));
     let before = memory_stats(0);
     memory::inject_memset_failures(1);
-    let r = crate::storage::Storage::try_new(8192, crate::Device::Rocm(0));
+    let r =
+        crate::storage::Storage::try_new(8192, crate::Device::Rocm(0), crate::storage::Fill::Zero);
     assert_eq!(
         r.map(drop),
         Err(crate::storage::AllocError::OutOfMemory {
@@ -378,6 +507,13 @@ fn a_zeroing_that_runs_out_of_memory_is_out_of_memory() {
     let s = rocm_storage(8192);
     assert_eq!(memory_stats(0).reserved, before.reserved);
     assert_eq!(read_back(&s), vec![0; 8192]);
+    drop(s);
+    // Unset storage queues no fill in release builds, so it can't fail this way there.
+    memory::inject_memset_failures(1);
+    let unset = crate::storage::Fill::Unset { poison: 0xff };
+    let r = crate::storage::Storage::try_new(8192, crate::Device::Rocm(0), unset);
+    assert_eq!(r.is_err(), cfg!(debug_assertions));
+    memory::inject_memset_failures(0);
 }
 
 /// The injected failures of `alloc_faults` apply to real ROCm allocations too.
@@ -385,8 +521,10 @@ fn a_zeroing_that_runs_out_of_memory_is_out_of_memory() {
 fn injected_allocation_failures_reach_rocm() {
     let _lock = memory_lock();
     crate::storage::alloc_faults::fail_nth(crate::Device::Rocm(0), 2);
-    let first = crate::storage::Storage::try_new(512, crate::Device::Rocm(0));
-    let second = crate::storage::Storage::try_new(512, crate::Device::Rocm(0));
+    let first =
+        crate::storage::Storage::try_new(512, crate::Device::Rocm(0), crate::storage::Fill::Zero);
+    let second =
+        crate::storage::Storage::try_new(512, crate::Device::Rocm(0), crate::storage::Fill::Zero);
     assert!(first.is_ok());
     assert!(matches!(
         second,
@@ -509,7 +647,7 @@ fn transfers_between_rocm_devices_go_through_the_host() {
     let src = crate::arange_with(12, (DType::F32, gpu))
         .reshape([3, 4])
         .transpose(0, 1);
-    let dst = Tensor::empty_on(src.data().layout.shape.clone(), DType::F32, gpu).data();
+    let dst = Tensor::uninit_on(src.data().layout.shape.clone(), DType::F32, gpu).data();
     crate::backend::try_transfer_into(&dst, &src.data()).unwrap();
     assert_eq!(
         Tensor::from_data(dst.clone()).to_vec::<f32>(),
@@ -735,8 +873,8 @@ fn scalar_products_and_quotients_match_the_cpu() {
                 (BinaryOp::Div, true),
             ] {
                 let (out, outg) = (
-                    Tensor::empty_on(a.shape(), dtype, Device::Cpu),
-                    Tensor::empty_on(a.shape(), dtype, gpu),
+                    Tensor::uninit_on(a.shape(), dtype, Device::Cpu),
+                    Tensor::uninit_on(a.shape(), dtype, gpu),
                 );
                 cpu::binary_scalar(op, &out.data(), &a.data(), s, first);
                 super::binary_scalar(op, &outg.data(), &ag.data(), s, first);
@@ -777,8 +915,8 @@ fn fused_steps_match_the_cpu() {
                 Fused::Addcdiv(v),
             ] {
                 let three = matches!(op, Fused::Addcmul(_) | Fused::Addcdiv(_));
-                let out = Tensor::empty_on(a.shape(), dtype, Device::Cpu);
-                let outg = Tensor::empty_on(a.shape(), dtype, gpu);
+                let out = Tensor::uninit_on(a.shape(), dtype, Device::Cpu);
+                let outg = Tensor::uninit_on(a.shape(), dtype, gpu);
                 let (cd, cgd) = (c.data(), cg.data());
                 cpu::fused(op, &out.data(), &a.data(), &b.data(), three.then_some(&cd));
                 super::fused(
@@ -854,7 +992,7 @@ fn reduction_plans_cover_every_path() {
         (&[5, 1], &[1], 1, 1, false),
     ];
     for (shape, dims, group, splits, many_rounds) in cases {
-        let t = crate::Tensor::empty_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
+        let t = crate::Tensor::uninit_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
         let mask: Vec<bool> = (0..shape.len())
             .map(|d| dims.contains(&(d as i64)))
             .collect();
@@ -875,7 +1013,7 @@ fn reduction_plans_cover_every_path() {
     }
     // Chunks that cut rows: [9, 2, 3000] folds rows of 3000 in chunks of 4500, [64, 3, 100] rows
     // of 100 in chunks of 534.
-    let t = crate::Tensor::empty_on(
+    let t = crate::Tensor::uninit_on(
         crate::Shape::new(&[64, 3, 100]),
         DType::F32,
         Device::Rocm(0),
@@ -942,7 +1080,7 @@ fn softmax_plans_cover_every_path() {
         (&[], 0, false, 1, 1),
     ];
     for (shape, dim, split, group, cache) in cases {
-        let t = crate::Tensor::empty_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
+        let t = crate::Tensor::uninit_on(crate::Shape::new(shape), DType::F32, Device::Rocm(0));
         let (s, g, c) = super::reduce::softmax_plan(&t.data(), dim);
         assert_eq!(s, split, "{shape:?} {dim}");
         assert_eq!(g, group, "{shape:?} {dim}");
@@ -1096,7 +1234,7 @@ fn values_are_read_at_large_logical_positions() {
         (&[1 << 62, 2], &[0, 1], (1 << 63) - 1, 22),
         (&[1 << 62, 2], &[0, 1], (1 << 63) - 2, 11),
     ];
-    let slots = crate::Tensor::empty_on(crate::Shape::new(&[2]), crate::DType::I64, base.device());
+    let slots = crate::Tensor::uninit_on(crate::Shape::new(&[2]), crate::DType::I64, base.device());
     for (shape, strides, position, expected) in cases {
         let index = view(shape, strides);
         let [desc] = expect(copy::descs_with_dims(
@@ -1419,7 +1557,7 @@ fn indexing_timings() {
     let tokens = crate::randint_with(0, 32000, [2048], gpu);
     // Embedding lookup: Llama's table, 2048 tokens.
     let table = crate::zeros_with([32000, 4096], (DType::F16, gpu));
-    let picked = Tensor::empty_on(Shape::new(&[2048, 4096]), DType::F16, gpu);
+    let picked = Tensor::uninit_on(Shape::new(&[2048, 4096]), DType::F16, gpu);
     for bounds in [Bounds::NonNegative, Bounds::Valid] {
         time(
             &format!("index_select [32000, 4096] f16, 2048 rows, {bounds:?}"),
@@ -1452,7 +1590,7 @@ fn indexing_timings() {
     // NLL over Llama's logits: gather and its backward, a scatter_add.
     let logits = crate::zeros_with([2048, 32000], (DType::F32, gpu));
     let target = tokens.reshape([2048, 1]);
-    let one = Tensor::empty_on(Shape::new(&[2048, 1]), DType::F32, gpu);
+    let one = Tensor::uninit_on(Shape::new(&[2048, 1]), DType::F32, gpu);
     time("gather [2048, 32000] f32 at [2048, 1]", &|| {
         crate::backend::gather(&one.data(), &logits.data(), 1, &target.data())
     });
@@ -1513,7 +1651,7 @@ fn indexing_timings() {
 
 /// The description of `x @ y` (3-D GPU tensors) for the library.
 fn gemm_desc(x: &crate::Tensor, y: &crate::Tensor) -> ffi::hmr_gemm_desc {
-    let out = crate::Tensor::empty_on(
+    let out = crate::Tensor::uninit_on(
         crate::Shape::new(&[x.size(0), x.size(1), y.size(2)]),
         x.dtype(),
         x.device(),

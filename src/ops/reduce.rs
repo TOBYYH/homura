@@ -78,7 +78,7 @@ fn reduce_op(op: ReduceOp, x: &Tensor, dims: &[i64], keepdim: bool, name: &str) 
              the reduction dim with the 'dim' argument."
         );
     }
-    let out = Tensor::empty_on(
+    let out = Tensor::uninit_on(
         reduced_shape(&src.layout.shape, &mask, keepdim),
         out_dtype,
         src.device(),
@@ -122,11 +122,11 @@ fn arg_op(
     // Not `bool::then`: a closure would hide the caller's location from an allocation failure
     // (review round 131).
     let vals = if values {
-        Some(Tensor::empty_on(shape.clone(), src.dtype, device))
+        Some(Tensor::uninit_on(shape.clone(), src.dtype, device))
     } else {
         None
     };
-    let indices = Tensor::empty_on(shape, DType::I64, device);
+    let indices = Tensor::uninit_on(shape, DType::I64, device);
     if device != Device::Meta {
         let vd = vals.as_ref().map(Tensor::data);
         backend::arg_reduce(vd.as_ref(), &indices.data(), &src, dim, is_max);
@@ -144,7 +144,7 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
         );
     }
     let mask = dims_mask(dims, src.layout.shape.len());
-    let out = Tensor::empty_on(
+    let out = Tensor::uninit_on(
         reduced_shape(&src.layout.shape, &mask, keepdim),
         src.dtype,
         src.device(),
@@ -161,7 +161,7 @@ fn var_op(x: &Tensor, dims: &[i64], correction: i64, keepdim: bool, take_sqrt: b
 /// user, is first-order only.
 pub(crate) fn exclusive_cumprod(x: &Tensor, dim: usize, reverse: bool) -> Tensor {
     let src = x.data();
-    let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+    let out = Tensor::uninit_on(src.layout.shape.clone(), src.dtype, src.device());
     if src.device() != Device::Meta {
         backend::exclusive_cumprod(&out.data(), &src, dim, reverse);
     }

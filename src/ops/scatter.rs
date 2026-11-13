@@ -158,7 +158,7 @@ impl Tensor {
                 idx.layout.shape, data.layout.shape
             );
         }
-        let out = Tensor::empty_on(idx.layout.shape.clone(), data.dtype, device);
+        let out = Tensor::uninit_on(idx.layout.shape.clone(), data.dtype, device);
         if device != Device::Meta {
             backend::gather(&at_least_1d(&out.data()), &src, d, &index_1d);
         }

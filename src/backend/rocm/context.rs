@@ -38,12 +38,12 @@ impl Context {
         call(unsafe { ffi::hmr_context_synchronize(self.raw) })
     }
 
-    /// Queues the zeroing of `nbytes` of device memory at `ptr` on the stream. Call it inside
-    /// the device's execution lock.
-    pub(super) fn memset_zero(&self, ptr: *mut u8, nbytes: usize) -> Result<(), Failure> {
+    /// Queues setting `nbytes` of device memory at `ptr` to the byte `value` on the stream.
+    /// Call it inside the device's execution lock.
+    pub(super) fn memset(&self, ptr: *mut u8, value: u8, nbytes: usize) -> Result<(), Failure> {
         // SAFETY: `raw` is a live context, and the caller passes device memory of this device
         // that the bytes fit in.
-        call(unsafe { ffi::hmr_memset_zero(self.raw, ptr.cast(), nbytes as u64) })
+        call(unsafe { ffi::hmr_memset(self.raw, ptr.cast(), value, nbytes as u64) })
     }
 
     /// Copies `dst.len()` bytes of device memory at `src` into `dst`, after the work queued

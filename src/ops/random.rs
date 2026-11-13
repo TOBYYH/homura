@@ -260,7 +260,7 @@ fn sample_int(n: usize, low: i64, high: i64) -> Vec<i64> {
 fn random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) -> Tensor {
     dist.validate(dtype);
     match device {
-        Device::Meta => return Tensor::empty_on(shape, dtype, device),
+        Device::Meta => return Tensor::uninit_on(shape, dtype, device),
         #[cfg(feature = "rocm")]
         Device::Rocm(_) => return rocm_random_tensor(shape, dtype, device, dist),
         _ => {}
@@ -301,20 +301,20 @@ fn rocm_random_tensor(shape: Shape, dtype: DType, device: Device, dist: Dist) ->
     let n = shape.num_elements();
     match dist {
         Dist::Uniform(from, to) => {
-            let out = Tensor::empty_on(shape, dtype, device);
+            let out = Tensor::uninit_on(shape, dtype, device);
             let per_block = if dtype == DType::F64 { 2 } else { 4 };
             let (seed, start) = reserve_blocks(n.div_ceil(per_block) as u64);
             random::uniform(&out.data(), seed, start, from, to);
             out
         }
         Dist::Normal(mean, std) => {
-            let out = Tensor::empty_on(shape, dtype, device);
+            let out = Tensor::uninit_on(shape, dtype, device);
             let (seed, start) = reserve_blocks(n.div_ceil(2) as u64);
             random::normal(&out.data(), seed, start, mean, std);
             out
         }
         Dist::Int(low, high) => {
-            let out = Tensor::empty_on(shape, DType::I64, device);
+            let out = Tensor::uninit_on(shape, DType::I64, device);
             let (range, threshold) = int_range(low, high);
             // Batches never need more blocks than the first, which needs one per two values.
             // Not `bool::then`: a closure would hide the caller's location from an allocation

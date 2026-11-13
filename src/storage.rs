@@ -12,6 +12,18 @@ use crate::device::MemoryStats;
 /// Alignment of CPU allocations, enough for any SIMD width.
 const CPU_ALIGN: usize = 64;
 
+/// What new tensor memory holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fill {
+    /// Zero bytes, on every device.
+    Zero,
+    /// Bytes the caller overwrites before anything reads them: on a ROCm device whatever the
+    /// cached block held, nothing being queued; zero on the CPU, where Rust needs initialized
+    /// bytes. Debug builds set ROCm memory to `poison` instead, so that a byte left unwritten
+    /// shows (as a NaN or -1 for the dtypes, see `Tensor::uninit_on`).
+    Unset { poison: u8 },
+}
+
 /// A block of tensor memory together with its device and version counter.
 #[derive(Debug)]
 pub(crate) struct Storage {
@@ -198,34 +210,39 @@ impl FileMap {
     }
 }
 
-/// Zeroed ROCm memory from the device's caching allocator. Unit tests can make it return a
-/// placeholder without data instead ([`fake_rocm`]), to reach the ROCm arms of the operations.
+/// ROCm memory from the device's caching allocator, filled as `fill` says. Unit tests can make it
+/// return a placeholder without data instead ([`fake_rocm`]), to reach the ROCm arms of the operations.
 ///
 /// # Panics
 ///
 /// Panics if the device doesn't exist, if homura was built without the `rocm` feature, and for
 /// failures of the device other than running out of memory.
 #[track_caller]
-fn rocm_buffer(nbytes: usize, index: u32) -> Result<Buffer, AllocError> {
+fn rocm_buffer(nbytes: usize, index: u32, fill: Fill) -> Result<Buffer, AllocError> {
     #[cfg(test)]
     if fake_rocm::enabled() {
         return Ok(Buffer::Meta { nbytes });
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = nbytes;
+        let _ = (nbytes, fill);
         crate::device::without_rocm(index);
     }
     #[cfg(feature = "rocm")]
     {
         crate::backend::rocm::check_index(index);
-        crate::backend::rocm::allocate(index, nbytes).map(Buffer::Rocm)
+        let byte = match fill {
+            Fill::Zero => Some(0),
+            Fill::Unset { poison } if cfg!(debug_assertions) => Some(poison),
+            Fill::Unset { .. } => None,
+        };
+        crate::backend::rocm::allocate(index, nbytes, byte).map(Buffer::Rocm)
     }
 }
 
 impl Storage {
-    /// Allocates `nbytes` of zeroed memory on `device`, or reports that the device's allocator
-    /// refused them. This is the only primitive that allocates tensor memory.
+    /// Allocates `nbytes` of memory on `device` holding what `fill` says, or reports that the
+    /// device's allocator refused them. This is the only primitive that allocates tensor memory.
     ///
     /// # Panics
     ///
@@ -233,7 +250,7 @@ impl Storage {
     /// `checked_nbytes`), for a ROCm device that doesn't exist or in a build without the `rocm`
     /// feature, and for device failures other than running out of memory.
     #[track_caller]
-    pub fn try_new(nbytes: usize, device: Device) -> Result<Storage, AllocError> {
+    pub fn try_new(nbytes: usize, device: Device, fill: Fill) -> Result<Storage, AllocError> {
         #[cfg(test)]
         alloc_faults::check(nbytes, device)?;
         let out_of_memory = AllocError::OutOfMemory {
@@ -243,7 +260,7 @@ impl Storage {
         let buffer = match device {
             Device::Cpu => Buffer::Cpu(CpuBuffer::try_zeroed(nbytes).ok_or(out_of_memory)?),
             Device::Meta => Buffer::Meta { nbytes },
-            Device::Rocm(i) => rocm_buffer(nbytes, i)?,
+            Device::Rocm(i) => rocm_buffer(nbytes, i, fill)?,
         };
         Ok(Storage {
             buffer,
@@ -252,7 +269,7 @@ impl Storage {
         })
     }
 
-    /// Allocates `nbytes` of zeroed memory on `device`.
+    /// Allocates `nbytes` of memory on `device` holding what `fill` says.
     ///
     /// # Panics
     ///
@@ -261,8 +278,8 @@ impl Storage {
     /// holds. On the CPU, the process aborts as for any failed allocation of Rust
     /// (`handle_alloc_error`).
     #[track_caller]
-    pub fn new(nbytes: usize, device: Device) -> Storage {
-        match Storage::try_new(nbytes, device) {
+    pub fn new(nbytes: usize, device: Device, fill: Fill) -> Storage {
+        match Storage::try_new(nbytes, device, fill) {
             Ok(s) => s,
             Err(e) => e.raise(),
         }
@@ -525,31 +542,32 @@ mod tests {
     #[test]
     fn injected_failures_hit_the_nth_allocation_of_their_kind() {
         alloc_faults::fail_nth(Device::Cpu, 2);
-        assert!(Storage::try_new(8, Device::Cpu).is_ok());
+        assert!(Storage::try_new(8, Device::Cpu, Fill::Zero).is_ok());
         // Other kinds don't count.
-        assert!(Storage::try_new(8, Device::Meta).is_ok());
-        fake_rocm::with(|| assert!(Storage::try_new(8, Device::Rocm(0)).is_ok()));
+        assert!(Storage::try_new(8, Device::Meta, Fill::Zero).is_ok());
+        fake_rocm::with(|| assert!(Storage::try_new(8, Device::Rocm(0), Fill::Zero).is_ok()));
         assert_eq!(
-            Storage::try_new(24, Device::Cpu).map(drop),
+            Storage::try_new(24, Device::Cpu, Fill::Zero).map(drop),
             oom(Device::Cpu, 24)
         );
-        assert!(Storage::try_new(24, Device::Cpu).is_ok());
+        assert!(Storage::try_new(24, Device::Cpu, Fill::Zero).is_ok());
         // ROCm devices count apart from the CPU, all of them together.
         alloc_faults::fail_nth(Device::Rocm(0), 1);
-        assert!(Storage::try_new(8, Device::Cpu).is_ok());
-        let failed = fake_rocm::with(|| Storage::try_new(16, Device::Rocm(3)).map(drop));
+        assert!(Storage::try_new(8, Device::Cpu, Fill::Zero).is_ok());
+        let failed =
+            fake_rocm::with(|| Storage::try_new(16, Device::Rocm(3), Fill::Zero).map(drop));
         assert_eq!(failed, oom(Device::Rocm(3), 16));
-        fake_rocm::with(|| assert!(Storage::try_new(16, Device::Rocm(3)).is_ok()));
+        fake_rocm::with(|| assert!(Storage::try_new(16, Device::Rocm(3), Fill::Zero).is_ok()));
         alloc_faults::fail_nth(Device::Cpu, 1);
         alloc_faults::clear();
-        assert!(Storage::try_new(8, Device::Cpu).is_ok());
+        assert!(Storage::try_new(8, Device::Cpu, Fill::Zero).is_ok());
     }
 
     #[test]
     fn cpu_buffers_count_in_the_cpu_statistics() {
         // Other tests allocate concurrently: only check what this thread's buffer adds while it
         // lives, through the peak, which never goes down without a reset.
-        let s = Storage::new(1 << 20, Device::Cpu);
+        let s = Storage::new(1 << 20, Device::Cpu, Fill::Zero);
         assert!(cpu_memory_counters().stats().peak >= 1 << 20);
         drop(s);
         let mapped = MemoryCounters::new();
@@ -642,6 +660,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "allocation too large")]
     fn a_size_that_cant_form_a_cpu_layout_is_not_out_of_memory() {
-        let _ = Storage::try_new(isize::MAX as usize, Device::Cpu);
+        let _ = Storage::try_new(isize::MAX as usize, Device::Cpu, Fill::Zero);
     }
 }

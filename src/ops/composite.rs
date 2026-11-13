@@ -18,7 +18,7 @@ fn softmax_op(x: &Tensor, dim: i64, log: bool) -> Tensor {
         );
     }
     let dim = normalize_dim(dim, src.layout.shape.len());
-    let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+    let out = Tensor::uninit_on(src.layout.shape.clone(), src.dtype, src.device());
     if src.device() != Device::Meta {
         backend::softmax(&out.data(), &src, dim, log);
     }
@@ -184,7 +184,7 @@ fn scaled_matrix_product(
             scale(input.clone(), beta).expand(&shape).deep_clone()
         };
     }
-    let out = Tensor::empty_on(Shape::new(&[batches, m, n]), dtype, p.device).data();
+    let out = Tensor::uninit_on(Shape::new(&[batches, m, n]), dtype, p.device).data();
     if p.device != Device::Meta {
         // The input as a view of the output: broadcast to the result, then with the dimensions
         // of 1 that the output has and the result doesn't.
@@ -229,7 +229,7 @@ fn addr_value(input: &Tensor, v1: &Tensor, v2: &Tensor, beta: Scalar, alpha: Sca
     } else {
         (beta, alpha)
     };
-    let out = Tensor::empty_on(shape.clone(), dtype, v1.device());
+    let out = Tensor::uninit_on(shape.clone(), dtype, v1.device());
     if v1.device() != Device::Meta {
         let i = input.data();
         let c = TensorData {

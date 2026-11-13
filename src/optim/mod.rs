@@ -600,7 +600,7 @@ fn addcdiv(a: &Tensor, b: &Tensor, c: &Tensor, value: f64) -> Tensor {
 /// [`check_coefficient`]); `step` checks the scalars before it updates anything.
 #[track_caller]
 fn fused(op: Fused, a: &Tensor, b: &Tensor, c: Option<&Tensor>) -> Tensor {
-    let out = Tensor::empty_on(a.shape(), a.dtype(), a.device());
+    let out = Tensor::uninit_on(a.shape(), a.dtype(), a.device());
     if a.device() != Device::Meta {
         let (value, dtype) = match op {
             Fused::ScaledAdd(alpha) => (alpha, a.dtype()),

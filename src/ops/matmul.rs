@@ -122,6 +122,6 @@ impl Product {
     /// A new contiguous `[B, M, N]` output.
     pub(crate) fn empty(&self) -> TensorData {
         let shape = Shape::new(&[self.batch, self.m, self.n]);
-        Tensor::empty_on(shape, self.a.dtype, self.device).data()
+        Tensor::uninit_on(shape, self.a.dtype, self.device).data()
     }
 }

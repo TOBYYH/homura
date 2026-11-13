@@ -226,7 +226,7 @@ pub(crate) fn fill_unreported(dst: &TensorData, value: Scalar) -> Result<(), Dev
 /// its own (not meta), or why the memory couldn't be allocated. See [`try_transfer_into`].
 #[track_caller]
 pub(crate) fn try_transfer(data: &TensorData, device: Device) -> Result<TensorData, AllocError> {
-    let dst = Tensor::try_empty_on(data.layout.shape.clone(), data.dtype, device)?.data();
+    let dst = Tensor::try_uninit_on(data.layout.shape.clone(), data.dtype, device)?.data();
     try_transfer_into(&dst, data)?;
     Ok(dst)
 }

@@ -247,8 +247,8 @@ void malloc_failure() {
     create_and_destroy();
 }
 
-// Queuing the zeroing fails for lack of memory: HMR_OUT_OF_MEMORY, nothing left as the last
-// error, and the next submission works (review round 122, R146).
+// Queuing a fill fails for lack of memory: HMR_OUT_OF_MEMORY, nothing left as the last error,
+// and the next submission works (review round 122, R146); the byte is the one asked for.
 void memset_failure() {
     hmr_context_t ctx = nullptr;
     CHECK(hmr_context_create(0, &ctx) == HMR_OK);
@@ -256,14 +256,18 @@ void memset_failure() {
     CHECK(hmr_malloc(0, 64, &p) == HMR_OK);
     std::memset(p, 0xab, 64);
     fake::memset_error = hipErrorOutOfMemory;
-    CHECK(hmr_memset_zero(ctx, p, 64) == HMR_OUT_OF_MEMORY);
-    CHECK_ERROR("hipMemsetAsync(ptr, 0, nbytes, ctx->stream): out of memory");
+    CHECK(hmr_memset(ctx, p, 0, 64) == HMR_OUT_OF_MEMORY);
+    CHECK_ERROR("hipMemsetAsync(ptr, value, nbytes, ctx->stream): out of memory");
     CHECK(fake::last_error == hipSuccess);
     CHECK(fake::current_device == 1);
     fake::memset_error = hipSuccess;
-    CHECK(hmr_memset_zero(ctx, p, 64) == HMR_OK);
+    CHECK(hmr_memset(ctx, p, 0, 64) == HMR_OK);
     const unsigned char zeros[64] = {};
     CHECK(std::memcmp(p, zeros, 64) == 0);
+    CHECK(hmr_memset(ctx, p, 0xff, 64) == HMR_OK);
+    unsigned char ones[64];
+    std::memset(ones, 0xff, 64);
+    CHECK(std::memcmp(p, ones, 64) == 0);
     CHECK(hmr_free(0, p) == HMR_OK);
     CHECK(hmr_context_destroy(ctx) == HMR_OK);
     create_and_destroy();

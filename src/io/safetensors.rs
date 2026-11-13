@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::json::{self, Json};
 use crate::backend;
 use crate::nn::StateDict;
-use crate::storage::{FileMap, Storage};
+use crate::storage::{FileMap, Fill, Storage};
 use crate::tensor::{Layout, TensorData};
 use crate::{DType, Device, Error, Result, Shape, Tensor};
 
@@ -216,7 +216,7 @@ pub(super) fn read<R: Read + Seek>(r: &mut R) -> Result<Vec<(String, Tensor)>> {
         if pos != Some(start) {
             r.seek(SeekFrom::Start(start))?;
         }
-        let mut storage = Storage::new(e.end - e.begin, Device::Cpu);
+        let mut storage = Storage::new(e.end - e.begin, Device::Cpu, Fill::Zero);
         let bytes = storage.cpu_bytes_mut();
         r.read_exact(bytes)?;
         pos = Some(header.data_start + e.end as u64);
@@ -254,7 +254,7 @@ pub(super) unsafe fn read_mmap(file: &mut File) -> Result<Vec<(String, Tensor)>>
         let nbytes = e.end - e.begin;
         let size = e.dtype.size_in_bytes();
         if nbytes == 0 {
-            out.push(tensor(e, Storage::new(0, Device::Cpu)));
+            out.push(tensor(e, Storage::new(0, Device::Cpu, Fill::Zero)));
             continue;
         }
         // SAFETY: the header check makes the entries' byte ranges disjoint, and each one gets
@@ -262,7 +262,7 @@ pub(super) unsafe fn read_mmap(file: &mut File) -> Result<Vec<(String, Tensor)>>
         let mut mapped = unsafe { Storage::mapped(map.clone(), offset, nbytes) };
         check_bool(&e, mapped.cpu_bytes_mut())?;
         let storage = if size > 1 && (cfg!(target_endian = "big") || !offset.is_multiple_of(size)) {
-            let mut copy = Storage::new(nbytes, Device::Cpu);
+            let mut copy = Storage::new(nbytes, Device::Cpu, Fill::Zero);
             let bytes = copy.cpu_bytes_mut();
             bytes.copy_from_slice(mapped.cpu_bytes_mut());
             to_from_le(bytes, size);

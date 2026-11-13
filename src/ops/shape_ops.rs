@@ -33,7 +33,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
     let parts: Vec<_> = all.iter().filter(|t| t.layout.shape != [0]).collect();
     let inputs: Vec<Option<&Tensor>> = tensors.iter().map(|t| Some(t.borrow())).collect();
     let Some(first) = parts.first() else {
-        let out = Tensor::empty_on(Shape::new(&[0]), dtype, device);
+        let out = Tensor::uninit_on(Shape::new(&[0]), dtype, device);
         formulas::concat(&inputs, 0, vec![None; all.len()], &out);
         return out;
     };
@@ -65,7 +65,7 @@ pub fn concat<T: Borrow<Tensor>>(tensors: &[T], dim: i64) -> Tensor {
             .checked_add(s[dim])
             .expect("concat(): the result has too many elements");
     }
-    let out = Tensor::empty_on(shape, dtype, device);
+    let out = Tensor::uninit_on(shape, dtype, device);
     if device != Device::Meta {
         let out_data = out.data();
         let mut start = 0;
@@ -187,7 +187,7 @@ impl Tensor {
                 if upper { "triu" } else { "tril" }
             );
         }
-        let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+        let out = Tensor::uninit_on(src.layout.shape.clone(), src.dtype, src.device());
         if src.device() != Device::Meta {
             backend::triangle(&out.data(), &src, diagonal, upper);
         }
@@ -253,7 +253,7 @@ impl Tensor {
         } else {
             dims_mask(&dims, src.layout.shape.len())
         };
-        let out = Tensor::empty_on(src.layout.shape.clone(), src.dtype, src.device());
+        let out = Tensor::uninit_on(src.layout.shape.clone(), src.dtype, src.device());
         if src.device() != Device::Meta {
             backend::flip(&out.data(), &src, &mask);
         }
@@ -276,7 +276,7 @@ pub(crate) fn unfold_backward(
     step: usize,
 ) -> Tensor {
     let g = grad.data();
-    let out = Tensor::empty_on(input_shape.clone(), g.dtype, g.device());
+    let out = Tensor::uninit_on(input_shape.clone(), g.dtype, g.device());
     if g.device() != Device::Meta {
         backend::unfold_backward(&out.data(), &g, dim, size, step);
     }

@@ -353,7 +353,7 @@ fn adaptive_avg_pool2d_matches_the_cpu() {
         let x = values(dtype, 2 * n + 6, 60 + s as u64);
         for (lname, cpu, gpu) in inputs(&x, shape) {
             // Not [1, 1]: that output is `mean_dim`, a reduction (step 4a, in the tolerance class).
-            for out in [[3, 4], [9, 11], [13, 17], [5, 2], [2, 23], [1, 3]] {
+            for out in [[3, 4], [9, 11], [13, 17], [5, 2], [2, 23], [1, 3], [0, 3]] {
                 let what = format!("{dtype} {lname} {out:?}");
                 let c = F::adaptive_avg_pool2d(&cpu, out);
                 let g = F::adaptive_avg_pool2d(&gpu, out);
@@ -369,7 +369,8 @@ fn adaptive_avg_pool2d_matches_the_cpu() {
             shape,
         )
         .to(dtype);
-        for out in [[1, 1], [3, 4], [9, 11], [13, 17], [2, 23]] {
+        // An output size of 0: an empty gradient, so the input's is zero.
+        for out in [[1, 1], [3, 4], [9, 11], [13, 17], [2, 23], [0, 3]] {
             let what = format!("gradient {dtype} {out:?}");
             compare_gradients(
                 &what,

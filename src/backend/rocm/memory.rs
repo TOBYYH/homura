@@ -54,8 +54,8 @@ fn allocators() -> &'static [CachingAllocator<Hip>] {
     })
 }
 
-/// The ROCm memory of a storage: a block of its device's caching allocator, zeroed when
-/// allocated and returned to the cache when dropped. The device pointer is only kept as a raw
+/// The ROCm memory of a storage: a block of its device's caching allocator, filled as asked
+/// when allocated and returned to the cache when dropped. The device pointer is only kept as a raw
 /// pointer: no Rust reference to device memory is ever formed.
 #[derive(Debug)]
 pub(crate) struct DeviceBuffer {
@@ -106,14 +106,19 @@ impl Drop for DeviceBuffer {
     }
 }
 
-/// `nbytes` of zeroed memory on `rocm:index`, which exists, creating its context if needed.
+/// `nbytes` of memory on `rocm:index`, which exists, creating its context if needed: every byte
+/// set to `fill`, or left as the block held them without it.
 ///
 /// # Panics
 ///
 /// Panics for failures other than running out of memory (when creating the context, allocating
-/// or zeroing).
+/// or filling).
 #[track_caller]
-pub(crate) fn allocate(index: u32, nbytes: usize) -> Result<DeviceBuffer, AllocError> {
+pub(crate) fn allocate(
+    index: u32,
+    nbytes: usize,
+    fill: Option<u8>,
+) -> Result<DeviceBuffer, AllocError> {
     let out_of_memory = AllocError::OutOfMemory {
         device: Device::Rocm(index),
         requested: nbytes,
@@ -144,9 +149,12 @@ pub(crate) fn allocate(index: u32, nbytes: usize) -> Result<DeviceBuffer, AllocE
         nbytes,
         size: block.size,
     };
-    // New storage is zero, as on the CPU. The zeroing is queued before any work that uses the
-    // buffer, and after any that used the block before.
-    let zeroed = exec(index, || {
+    let Some(value) = fill else {
+        return Ok(buffer);
+    };
+    // The fill is queued before any work that uses the buffer, and after any that used the
+    // block before.
+    let filled = exec(index, || {
         #[cfg(test)]
         if take_injected_memset_failure() {
             return Err(super::Failure {
@@ -154,9 +162,9 @@ pub(crate) fn allocate(index: u32, nbytes: usize) -> Result<DeviceBuffer, AllocE
                 message: "hipMemsetAsync: out of memory (injected for testing)".into(),
             });
         }
-        buffer.ctx.memset_zero(buffer.ptr, nbytes)
+        buffer.ctx.memset(buffer.ptr, value, nbytes)
     });
-    match zeroed {
+    match filled {
         Ok(()) => Ok(buffer),
         // Queuing the fill can need memory too. Dropping the buffer returns the block to the
         // cache (review round 122, R146).
@@ -213,7 +221,8 @@ pub(crate) fn out_of_memory_message(index: u32, requested: usize) -> String {
 thread_local! {
     /// `hipMalloc` calls on this thread that report running out of memory without trying.
     static INJECTED_MALLOC_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// Zeroings on this thread that report running out of memory without being queued.
+    /// Fills of new buffers on this thread that report running out of memory without being
+    /// queued.
     static INJECTED_MEMSET_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -223,7 +232,8 @@ pub(super) fn inject_malloc_failures(n: u32) {
     INJECTED_MALLOC_FAILURES.set(n);
 }
 
-/// Makes the zeroing of the next `n` new buffers on this thread fail for lack of memory.
+/// Makes the fill of the next `n` new buffers that are filled on this thread fail for lack of
+/// memory.
 #[cfg(test)]
 pub(super) fn inject_memset_failures(n: u32) {
     INJECTED_MEMSET_FAILURES.set(n);

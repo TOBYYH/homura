@@ -89,8 +89,8 @@ hmr_status hmr_context_synchronize(hmr_context_t ctx);
 hmr_status hmr_malloc(int32_t device, uint64_t nbytes, void **out);
 hmr_status hmr_free(int32_t device, void *ptr);
 
-/* Queues the zeroing of `nbytes` at `ptr` on the context's stream (hipMemsetAsync). */
-hmr_status hmr_memset_zero(hmr_context_t ctx, void *ptr, uint64_t nbytes);
+/* Queues setting `nbytes` at `ptr` to the byte `value` on the context's stream (hipMemsetAsync). */
+hmr_status hmr_memset(hmr_context_t ctx, void *ptr, uint8_t value, uint64_t nbytes);
 
 /*
  * Copies `nbytes` between pageable host memory and the device, in the context's stream order,

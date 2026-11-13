@@ -113,7 +113,7 @@ pub(crate) fn binary_op(op: BinaryOp, lhs: Operand, rhs: Operand) -> Tensor {
         _ => compute,
     };
     let shape = broadcast_shapes(&a.shape(), &b.shape());
-    let out = Tensor::empty_on(shape.clone(), out_dtype, device);
+    let out = Tensor::uninit_on(shape.clone(), out_dtype, device);
     if device != Device::Meta {
         // As in PyTorch, `f16` and `bf16` products and quotients keep a scalar operand in their
         // `f32` computation type, while the other operations round it to the dtype first.
@@ -176,7 +176,7 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
         &broadcast_shapes(&cond.layout.shape, &x.shape()),
         &y.shape(),
     );
-    let out = Tensor::empty_on(shape.clone(), dtype, device);
+    let out = Tensor::uninit_on(shape.clone(), dtype, device);
     if device != Device::Meta {
         backend::where_(
             &out.data(),

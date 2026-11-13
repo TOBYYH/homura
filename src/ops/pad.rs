@@ -78,7 +78,7 @@ pub(crate) fn constant_pad_nd(input: &Tensor, pad: &[i64], value: Scalar) -> Ten
     let out = if !fills {
         match &cropped {
             Some(c) => Tensor::from_data(clone_data(c)),
-            None => Tensor::empty_on(crop_shape, dtype, device),
+            None => Tensor::uninit_on(crop_shape, dtype, device),
         }
     } else {
         // Checks `value` before anything is written, also on an empty result.

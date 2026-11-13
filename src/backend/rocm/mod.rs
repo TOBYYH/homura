@@ -82,7 +82,7 @@ fn workspace(bytes: i64, device: crate::Device) -> Option<crate::Tensor> {
     );
     // Not `bool::then`: a closure would hide the caller's location from an allocation failure.
     if bytes > 0 {
-        Some(crate::Tensor::empty_on(
+        Some(crate::Tensor::uninit_on(
             crate::Shape::new(&[bytes as usize]),
             crate::DType::U8,
             device,

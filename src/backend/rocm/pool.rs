@@ -6,6 +6,7 @@ use super::context::exec;
 use super::copy::{buffer, device_index};
 use super::index::full_desc;
 use super::{call, expect, ffi};
+use crate::Scalar;
 use crate::ops::Pool2d;
 use crate::tensor::TensorData;
 
@@ -76,7 +77,12 @@ pub(crate) fn adaptive_avg_pool2d(out: &TensorData, input: &TensorData) {
 /// See `cpu::adaptive_avg_pool2d_backward`. Every element of `out` is written.
 #[track_caller]
 pub(crate) fn adaptive_avg_pool2d_backward(out: &TensorData, grad: &TensorData) {
-    if grad.layout.num_elements() == 0 || out.layout.num_elements() == 0 {
+    if out.layout.num_elements() == 0 {
+        return;
+    }
+    // An empty output size gives an empty gradient: no window covers an input element.
+    if grad.layout.num_elements() == 0 {
+        expect(super::copy::try_fill(out, Scalar::Int(0)));
         return;
     }
     let [o, g] = full("adaptive_avg_pool2d_backward", [out, grad]);
@@ -96,8 +102,13 @@ pub(crate) fn unfold_backward(
     step: usize,
 ) {
     let (lo, lg) = (&out.layout, &grad.layout);
-    // Without elements on either side nothing is written, and the strides may be arbitrary.
-    if lo.num_elements() == 0 || lg.num_elements() == 0 {
+    // Without elements on either side nothing is read, and the strides may be arbitrary.
+    if lo.num_elements() == 0 {
+        return;
+    }
+    // Windows of size 0 give an empty gradient: no window covers an input element.
+    if lg.num_elements() == 0 {
+        expect(super::copy::try_fill(out, Scalar::Int(0)));
         return;
     }
     if lo.shape.is_empty() {

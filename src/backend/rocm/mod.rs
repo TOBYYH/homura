@@ -10,6 +10,7 @@ mod elementwise;
 #[allow(clippy::all, unsafe_op_in_unsafe_fn)]
 mod ffi;
 mod index;
+mod matmul;
 mod memory;
 mod pool;
 pub(crate) mod random;
@@ -20,11 +21,12 @@ use std::sync::OnceLock;
 
 pub(crate) use context::{context, exec};
 pub(crate) use copy::{download, read_bytes, read_host, try_copy, try_fill, upload, write_host};
-pub(crate) use elementwise::{binary, binary_scalar, flip, fused, triangle, unary, where_};
+pub(crate) use elementwise::{addr, binary, binary_scalar, flip, fused, triangle, unary, where_};
 pub(crate) use index::{
     gather, index_add, index_overwrite, index_positions, index_select, mask_coordinates,
     max_pool2d_backward, out_of_range, scatter_add,
 };
+pub(crate) use matmul::gemm;
 pub(crate) use memory::{
     DeviceBuffer, allocate, empty_cache, memory_stats, out_of_memory_message,
     reset_peak_memory_stats,

@@ -1,5 +1,5 @@
 //! Elementwise kernels on ROCm (`csrc/elementwise.hip`): the counterparts of the CPU backend's
-//! `unary`, `binary`, `binary_scalar`, `fused`, `where_`, `triangle` and `flip`, with the same
+//! `unary`, `binary`, `binary_scalar`, `fused`, `addr`, `where_`, `triangle` and `flip`, with the same
 //! arguments and the same results (bitwise, except for the device library's transcendental
 //! functions, see `csrc/elementwise.hip`).
 //!
@@ -9,8 +9,8 @@
 use super::context::exec;
 use super::copy::{buffer, descs, descs_with_dims, device_index};
 use super::{call, expect, ffi};
-use crate::backend::Fused;
 use crate::backend::cpu::{FloatElement, dispatch_float};
+use crate::backend::{Fused, Outer};
 use crate::ops::{BinaryOp, UnaryOp};
 use crate::tensor::TensorData;
 
@@ -190,6 +190,53 @@ pub(crate) fn fused(
             });
         }
     }
+}
+
+/// `out = beta * input + alpha * outer(v1, v2)`, as `cpu::addr`: the four operands are
+/// described with the output's two dimensions, `v1` and `v2` broadcast along the other one.
+#[track_caller]
+pub(crate) fn addr(out: &TensorData, o: &Outer) {
+    let lo = &out.layout;
+    let (n, m) = (o.v1.layout.shape[0], o.v2.layout.shape[0]);
+    assert_eq!(lo.shape, [n, m]);
+    if lo.num_elements() == 0 {
+        return;
+    }
+    let reads = o.beta.to_f64() != 0.0;
+    let c = &o.input.layout;
+    assert_eq!(c.shape, lo.shape);
+    let (s1, s2) = (o.v1.layout.strides[0] as i64, o.v2.layout.strides[0] as i64);
+    let (so, sc) = (&lo.strides, &c.strides);
+    let dims = [
+        (n, [so[0] as i64, s1, 0, sc[0] as i64]),
+        (m, [so[1] as i64, 0, s2, sc[1] as i64]),
+    ];
+    let offsets = [lo, &o.v1.layout, &o.v2.layout, c].map(|l| l.offset as i64);
+    let [d_out, d1, d2, d_in] = expect(descs_with_dims(
+        "addr",
+        [out, o.v1, o.v2, o.input],
+        offsets,
+        &dims,
+    ));
+    let float = out.dtype.is_floating_point();
+    let (alpha, beta) = if float {
+        (o.alpha.to_f64(), o.beta.to_f64())
+    } else {
+        (0.0, 0.0)
+    };
+    let (alpha_int, beta_int) = if float {
+        (0, 0)
+    } else {
+        (o.alpha.to_i64(), o.beta.to_i64())
+    };
+    let input: *const ffi::hmr_tensor_desc = if reads { &d_in } else { std::ptr::null() };
+    // SAFETY: as in `unary`; every element of the descriptions lies inside its operand's
+    // layout, and the input is only read (and only described) when it is used.
+    run("addr", out, |ctx| unsafe {
+        ffi::hmr_addr(
+            ctx, &d_out, &d1, &d2, input, alpha, beta, alpha_int, beta_int,
+        )
+    });
 }
 
 /// `out = cond ? x : y`, as `cpu::where_`.

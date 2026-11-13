@@ -11,6 +11,8 @@ pub(crate) trait Float: Copy + 'static {
     const ONE: Self;
     /// Converts a constant.
     fn of(v: f64) -> Self;
+    /// Widens to `f64`, exactly.
+    fn wide(self) -> f64;
     fn erf(self) -> Self;
 }
 
@@ -20,6 +22,10 @@ impl Float for f32 {
     #[inline]
     fn of(v: f64) -> Self {
         v as f32
+    }
+    #[inline]
+    fn wide(self) -> f64 {
+        self as f64
     }
     #[inline]
     fn erf(self) -> Self {
@@ -33,6 +39,10 @@ impl Float for f64 {
     #[inline]
     fn of(v: f64) -> Self {
         v
+    }
+    #[inline]
+    fn wide(self) -> f64 {
+        self
     }
     #[inline]
     fn erf(self) -> Self {

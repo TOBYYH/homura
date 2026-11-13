@@ -26,7 +26,7 @@ mod pool;
 mod reduce;
 
 pub(crate) use iter::{Plan, walk_strides};
-pub(crate) use linalg::matmul;
+pub(crate) use linalg::{addr, gemm};
 pub(crate) use misc::{
     flip, gather, index_add, index_overwrite, index_positions, index_select, mask_coordinates,
     out_of_range, scatter_add, softmax, triangle, unfold_backward,

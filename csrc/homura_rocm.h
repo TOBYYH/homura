@@ -222,6 +222,21 @@ hmr_status hmr_fused(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
                      const hmr_tensor_desc *a, const hmr_tensor_desc *b,
                      const hmr_tensor_desc *c, double coefficient, int32_t small);
 
+/*
+ * addr: out[i][j] = beta * input[i][j] + alpha * v1[i] * v2[j], with the steps of the CPU's
+ * kernel (src/backend/cpu/linalg.rs, addr), for every dtype. All four descriptions have the
+ * output's two dimensions [n, m]: v1 with stride 0 along the columns, v2 along the rows, and
+ * the input broadcast; `input` is NULL when beta is zero (it isn't read).
+ *   floats (coefficients rounded to the dtype, in `alpha` and `beta`): a = alpha * v1[i]
+ *     (skipped for alpha == 1), p = a * v2[j], out = p or (beta == 1 ? c : beta * c) + p, each
+ *     step in the computation type (f32 for F16, BF16 and F32, f64 for F64) rounded to the dtype;
+ *   integers (`alpha_int`, `beta_int`): wrapping, alpha * (v1[i] * v2[j]) + beta * c;
+ *   Bool (`alpha_int`, `beta_int` 0 or 1): (v1[i] and alpha and v2[j]) or c.
+ */
+hmr_status hmr_addr(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *v1,
+                    const hmr_tensor_desc *v2, const hmr_tensor_desc *input, double alpha,
+                    double beta, int64_t alpha_int, int64_t beta_int);
+
 /* out = cond ? x : y; cond is Bool, x and y have out's dtype. */
 hmr_status hmr_where(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *cond,
                      const hmr_tensor_desc *x, const hmr_tensor_desc *y);
@@ -437,6 +452,103 @@ hmr_status hmr_unfold_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
                                const hmr_tensor_desc *grad, int32_t dim, int64_t size,
                                int64_t step);
 
+/*
+ * Matrix products with their writeback (csrc/gemm.hip): cpu::gemm (src/backend/cpu/linalg.rs).
+ *
+ * For each output batch o, row i and column j:
+ *   p = sum over k of a[b][i][k] * b[b][k][j], for the batch b = o, or summed over all batches
+ *       (sum_batches, addbmm) after rounding each batch's product to the computation type;
+ *   out[o][i][j] = scaled ? beta * c[o][i][j] + alpha * p : p, with the CPU's steps and roundings.
+ * The operands are the addresses of element (0, 0, 0) with element strides for (batch, row,
+ * column); a stride may be 0 (broadcasting) and any value for a dimension of size 0 or 1. The
+ * output has batch batches (1 with sum_batches); its elements are distinct and don't overlap the
+ * factors or the input. With k == 0 (or no batches to sum) the products are exact zeros.
+ *
+ * Floats accumulate in their computation type (f32 for F32, f64 for F64), with the fused
+ * multiply-add of the path; sums of batches in f64. Integers wrap in 64 bits and are truncated
+ * once. F16 and BF16 have no path yet (M4 step 5b), Bool none.
+ */
+typedef struct hmr_gemm_desc {
+    int32_t dtype;
+    /* Nonzero: the output is the sum of the batches' products (one output batch). */
+    int32_t sum_batches;
+    /* Nonzero: beta * c + alpha * p; zero: p, and c and the coefficients are unused. */
+    int32_t scaled;
+    /* Nonzero: c is read (scaled and beta != 0). */
+    int32_t reads_input;
+    int64_t batch, m, n, k;
+    const void *a;
+    const void *b;
+    const void *c;
+    void *out;
+    /* Strides in elements: (batch, row, column) of a [batch, m, k], b [batch, k, n], c and out
+     * [batches of the output, m, n]. */
+    int64_t a_strides[3];
+    int64_t b_strides[3];
+    int64_t c_strides[3];
+    int64_t out_strides[3];
+    /* Floats: the coefficients' values, exact in the computation type. */
+    double alpha;
+    double beta;
+    /* Integers: the coefficients. */
+    int64_t alpha_int;
+    int64_t beta_int;
+} hmr_gemm_desc;
+
+/* The paths of hmr_gemm. HMR_GEMM_GENERIC takes every description of F32, F64 and the integer
+ * dtypes. The others are F32 kernels of rocm-exp's S series, named by its programs (the
+ * configuration table in rocm-exp/LOG.md): NN, NT, TN for the layouts they take; NARROW for
+ * M <= 16; SPLITK for those that split k into slices summed in a workspace. */
+#define HMR_GEMM_GENERIC 0
+#define HMR_GEMM_S08A_S7A5_UNAL 1
+#define HMR_GEMM_S07G_BK16 2
+#define HMR_GEMM_S08C_NARROW_T256 3
+#define HMR_GEMM_S08C_SPLITK_T128 4
+#define HMR_GEMM_S08B_S8A1_NT 5
+#define HMR_GEMM_S08B_NARROW_NT 6
+#define HMR_GEMM_S08B_SPLITK_NT_T128 7
+#define HMR_GEMM_S08B_S7G1_NT 8
+#define HMR_GEMM_S08B_S7G1_TN 9
+#define HMR_GEMM_S08B_NARROW_TN 10
+#define HMR_GEMM_PATHS 11
+
+/* The storage of the factors, as the paths see it: each with a unit stride along k (N for a, T
+ * for b) or along its other dimension (T for a, N for b); HMR_GEMM_STRIDED when one has neither. */
+#define HMR_GEMM_NN 0
+#define HMR_GEMM_NT 1
+#define HMR_GEMM_TN 2
+#define HMR_GEMM_TT 3
+#define HMR_GEMM_STRIDED 4
+
+/*
+ * Rewrites a description whose batches share b (b's batch stride is 0, as for a weight
+ * broadcast over the batches of `x @ w`) as one batch of batch * m rows, when the rows of
+ * consecutive batches of a, the output and the read input continue each other, as PyTorch's
+ * matmul folds `[..., m, k] @ [k, n]` into one mm. Other descriptions (and sums of batches) are
+ * left as they are. Both forms describe the same product; the folded one has one product of
+ * more rows to choose a path for. HMR_INVALID for a description hmr_gemm_select refuses for its
+ * sizes or strides.
+ */
+hmr_status hmr_gemm_fold(hmr_gemm_desc *desc);
+
+/*
+ * The path hmr_gemm takes for a description, by fixed rules of its dtype, layout, sizes and
+ * alignment (no timing), and the layout of its factors. HMR_INVALID for a description no path
+ * takes, or that a path forced by hmr_test_force_gemm_path doesn't take (with the reason).
+ */
+hmr_status hmr_gemm_select(const hmr_gemm_desc *desc, int32_t *path, int32_t *layout);
+
+/* The name of a path, for HOMURA_ROCM_GEMM_LOG; HMR_INVALID for an unknown one. */
+hmr_status hmr_gemm_path_name(int32_t path, const char **name);
+
+/* The bytes of workspace a path needs for a description (0: none). */
+hmr_status hmr_gemm_workspace(const hmr_gemm_desc *desc, int32_t path, int64_t *bytes);
+
+/* Queues the product on the context's stream along `path`, which hmr_gemm_select chose (or a
+ * path that takes the description), with at least the workspace hmr_gemm_workspace reported. */
+hmr_status hmr_gemm(hmr_context_t ctx, const hmr_gemm_desc *desc, int32_t path, void *workspace,
+                    int64_t workspace_bytes);
+
 /* The architectures this library was built for, separated by ';' (HOMURA_OFFLOAD_ARCH). */
 const char *hmr_built_archs(void);
 
@@ -454,6 +566,8 @@ typedef struct hmr_abi_info {
     uint32_t desc_offsets[6];
     int32_t dtype_values[10];
     int32_t max_dims;
+    uint32_t gemm_desc_size;
+    uint32_t gemm_desc_align;
 } hmr_abi_info;
 
 void hmr_abi_check(hmr_abi_info *out);
@@ -470,8 +584,8 @@ void hmr_abi_check(hmr_abi_info *out);
  * with HMR_HIP_ERROR, to test that a context created before such a failure is destroyed.
  * hmr_test_fail_data(n, out_of_memory): the calling thread's next n data operations (hmr_copy,
  * hmr_fill, hmr_copy_device, hmr_copy_to_host, hmr_copy_from_host, and the kernels, samplers,
- * reductions, indexing and pooling entries above) fail before queueing any work, as their HIP
- * call would: with hipErrorOutOfMemory if out_of_memory is nonzero, else with
+ * reductions, indexing, pooling and matrix product entries above) fail before queueing any
+ * work, as their HIP call would: with hipErrorOutOfMemory if out_of_memory is nonzero, else with
  * hipErrorInvalidHandle (review round 124, R148 and R149).
  * hmr_test_reduce_plan(): the plan hmr_reduce chooses for a reduction (csrc/reduce.hpp): the
  * lanes per output, the number of chunks of the reduced range and their size, to test that the
@@ -488,6 +602,8 @@ void hmr_abi_check(hmr_abi_info *out);
  * backward of max_pool2d visits over all input positions of a plane of height x width with this
  * geometry and output size, counted on the host with the kernel's own walk, to test that it
  * visits exactly the covering windows (review round 135, R159).
+ * hmr_test_force_gemm_path(path): hmr_gemm_select on the calling thread chooses `path` (-1: its
+ * own rules), or fails if that path doesn't take the description, to test every path.
  * hmr_test_live_streams(): the number of streams the calling thread created and hasn't destroyed.
  * hmr_test_current_device(): the calling thread's current HIP device (hipGetDevice).
  * hmr_test_set_current_device(): hipSetDevice for the calling thread.
@@ -504,6 +620,7 @@ hmr_status hmr_test_softmax_plan(const hmr_tensor_desc *src_rows, int64_t n, int
 hmr_status hmr_test_index_value(hmr_context_t ctx, const hmr_tensor_desc *index,
                                 uint64_t *slot);
 void hmr_test_wide_pool(int32_t on);
+void hmr_test_force_gemm_path(int32_t path);
 hmr_status hmr_test_pool_candidates(const int64_t *geometry, int64_t height, int64_t width,
                                     int64_t out_h, int64_t out_w, int64_t *count);
 int32_t hmr_test_live_streams(void);

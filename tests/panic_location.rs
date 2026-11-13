@@ -305,6 +305,7 @@ fn rocm_kernel_failures() {
     let half = homura::ones_with([6], (DType::F16, gpu));
     let cond = homura::ones_with([6], (DType::Bool, gpu));
     let m = homura::ones_with([2, 3], gpu);
+    let sq = homura::ones_with([3, 3], gpu);
     // Reduced in chunks, with a workspace.
     let wide = homura::ones_with([1, 70000], gpu);
     let p = nn::Parameter::new(homura::ones_with([6], gpu));
@@ -331,7 +332,17 @@ fn rocm_kernel_failures() {
         at!(failing(&m, oom).argmin());
         at!(failing(&m, oom).softmax(1));
         at!(failing(&m, oom).log_softmax(0));
+        // Matrix products (M4 step 5a).
+        at!(failing(&m, oom).matmul(&m.transpose(0, 1)));
+        at!(failing(&m.select(0, 0), oom).addmv(&m.transpose(0, 1), &m.select(1, 0), 1, 2));
+        at!(failing(&sq, oom).addbmm(&m.unsqueeze(0).transpose(1, 2), &m.unsqueeze(0), 1, 2));
+        at!(failing(&m, oom).addr(&m.select(1, 0), &m.select(0, 0), 1, 2));
     }
+    // Products the GPU has no path for: half precision (step 5b) and Bool, at the caller.
+    let hm = homura::ones_with([2, 2], (DType::F16, gpu));
+    at!(hm.matmul(&hm));
+    let bm = homura::ones_with([2, 2], (DType::Bool, gpu));
+    at!(bm.matmul(&bm));
     // More dimensions than the kernels take.
     let deep = homura::zeros_with(vec![2usize; 26], (DType::F32, gpu))
         .permute((0..26).rev().collect::<Vec<i64>>());

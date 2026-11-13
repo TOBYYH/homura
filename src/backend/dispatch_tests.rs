@@ -23,7 +23,7 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 34] = [
+const IMPLEMENTED: [&str; 36] = [
     "write_host",
     "read_host",
     "copy",
@@ -58,6 +58,8 @@ const IMPLEMENTED: [&str; 34] = [
     "adaptive_avg_pool2d",
     "adaptive_avg_pool2d_backward",
     "unfold_backward",
+    "gemm",
+    "addr",
 ];
 
 /// Asserts that `f` panics in the ROCm arm of the dispatch layer, in `kernel`.
@@ -160,7 +162,28 @@ fn reductions_and_matmul() {
     reaches("exclusive_cumprod", || {
         crate::ops::exclusive_cumprod(&gpu(&[2, 3]), 1, false)
     });
-    reaches("matmul", || gpu(&[2, 3]).matmul(&gpu(&[3, 4])));
+    reaches("gemm", || gpu(&[2, 3]).matmul(&gpu(&[3, 4])));
+    reaches("gemm", || {
+        gpu(&[2, 4]).addmm(&gpu(&[2, 3]), &gpu(&[3, 4]), 1, 2)
+    });
+    reaches("gemm", || {
+        gpu(&[3, 4]).addbmm(&gpu(&[2, 3, 3]), &gpu(&[2, 3, 4]), 1, 2)
+    });
+    reaches("addr", || gpu(&[2, 3]).addr(&gpu(&[2]), &gpu(&[3]), 1, 2));
+    // Without the input (a zero beta), and for every dtype: an elementwise kernel.
+    reaches("addr", || {
+        let b = |n| crate::zeros_with([n], (DType::Bool, GPU));
+        b(1).addr(&b(2), &b(3), false, true)
+    });
+    // Half precision products come with M4 step 5b.
+    let half = || crate::zeros_with([2, 2], (DType::F16, GPU));
+    let message = panic_message(|| half().matmul(&half()));
+    let expected = if cfg!(feature = "rocm") {
+        "gemm is not implemented on ROCm yet (rocm:0)"
+    } else {
+        "homura was built without ROCm support; enable the `rocm` feature"
+    };
+    assert_eq!(message, expected);
 }
 
 #[test]

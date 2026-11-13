@@ -1,5 +1,5 @@
 // Elementwise kernels: unary and binary ops, binary ops with a scalar, the optimizers' fused
-// steps, where, triangle and flip.
+// steps, addr's outer product, where, triangle and flip.
 //
 // They compute what the CPU reference backend computes (src/backend/cpu/mod.rs), operation by
 // operation in the same order: floating point math in f32 for F16, BF16 and F32 and in f64 for
@@ -679,6 +679,196 @@ bool fused(int op, const Operands<4> &ops, bool has_c, int64_t n, double coeffic
     });
 }
 
+// The steps of addr (hmr_addr, cpu::addr): `row` is v1[i] as it enters the products of row i,
+// `write` the output element of it, y = v2[j] and the input element c (READS: beta isn't zero).
+template <int DT, Kind K = Elem<DT>::kind>
+struct AddrSteps;
+
+// Floats: the coefficients are values of the computation type.
+template <int DT>
+struct AddrSteps<DT, kFloat> {
+    using T = typename Elem<DT>::T;
+    using C = typename Comp<DT>::C;
+    C alpha;
+    C beta;
+    __device__ T row(T x) const { return alpha == C(1) ? x : down<DT>(up<DT>(x) * alpha); }
+    template <bool READS>
+    __device__ T write(T a, T y, T c) const {
+        T p = down<DT>(up<DT>(a) * up<DT>(y));
+        if constexpr (!READS) {
+            return p;
+        } else {
+            T scaled = beta == C(1) ? c : down<DT>(up<DT>(c) * beta);
+            return down<DT>(up<DT>(scaled) + up<DT>(p));
+        }
+    }
+};
+
+// Integers: wrapping, alpha applied to the product.
+template <int DT>
+struct AddrSteps<DT, kInt> {
+    using T = typename Elem<DT>::T;
+    int64_t alpha;
+    int64_t beta;
+    __device__ T row(T x) const { return x; }
+    template <bool READS>
+    __device__ T write(T a, T y, T c) const {
+        uint64_t p = u64(a) * u64(y);
+        if (alpha != 1) p *= static_cast<uint64_t>(alpha);
+        if constexpr (!READS) {
+            return trunc<T>(p);
+        } else {
+            uint64_t scaled = beta == 1 ? u64(c) : u64(c) * static_cast<uint64_t>(beta);
+            return trunc<T>(scaled + p);
+        }
+    }
+};
+
+// Bools: products are and, sums are or (beta is true when the input is read).
+template <int DT>
+struct AddrSteps<DT, kBool> {
+    bool alpha;
+    __device__ uint8_t row(uint8_t x) const { return x != 0 && alpha; }
+    template <bool READS>
+    __device__ uint8_t write(uint8_t a, uint8_t y, uint8_t c) const {
+        return (READS && c != 0) || (a != 0 && y != 0);
+    }
+};
+
+// A two-dimensional grid-stride loop: threadIdx.x walks the columns (coalesced for a contiguous
+// output), threadIdx.y the rows, so a block of a narrow output covers several rows; v1[i] is read
+// and scaled once per row and thread. With VEC == 1 a thread computes one element per step, with
+// any strides. With VEC == 4 it computes four neighbouring columns with vector accesses (see
+// addr_vec4 for when): the output and v2 have a unit column stride, the input a unit or zero one,
+// and their rows start at multiples of four elements; the last group of a row of fewer than four
+// columns (only when the row length isn't a multiple of four, so for one row) is scalar.
+template <int DT, bool READS, int VEC>
+__global__ void addr_kernel(Operands<4> ops, AddrSteps<DT> f) {
+    using T = typename Elem<DT>::T;
+    const hmr_tensor_desc &o = ops.d[0];
+    const hmr_tensor_desc &x = ops.d[1];
+    const hmr_tensor_desc &y = ops.d[2];
+    const hmr_tensor_desc &c = ops.d[3];
+    int64_t rows = o.sizes[0];
+    int64_t cols = o.sizes[1];
+    T *out = static_cast<T *>(o.data) + o.offset;
+    const T *v1 = static_cast<const T *>(x.data) + x.offset;
+    const T *v2 = static_cast<const T *>(y.data) + y.offset;
+    const T *in = static_cast<const T *>(c.data) + c.offset;
+    int64_t groups = VEC == 1 ? cols : ceil_div(cols, VEC);
+    int64_t row_step = static_cast<int64_t>(gridDim.y) * blockDim.y;
+    int64_t col_step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    int64_t col0 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int64_t i = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y; i < rows;
+         i += row_step) {
+        T a = f.row(v1[i * x.strides[0]]);
+        T *orow = out + i * o.strides[0];
+        const T *crow = in + i * c.strides[0];
+        for (int64_t g = col0; g < groups; g += col_step) {
+            if constexpr (VEC == 1) {
+                T ci{};
+                if constexpr (READS) ci = crow[g * c.strides[1]];
+                orow[g * o.strides[1]] = f.template write<READS>(a, v2[g * y.strides[1]], ci);
+            } else {
+                int64_t j = VEC * g;
+                if (j + VEC <= cols) {
+                    Vec4<T> yv = *reinterpret_cast<const Vec4<T> *>(v2 + j);
+                    Vec4<T> cv{};
+                    if constexpr (READS) {
+                        if (c.strides[1] == 0) {
+                            for (int k = 0; k < VEC; ++k) cv.v[k] = crow[0];
+                        } else {
+                            cv = *reinterpret_cast<const Vec4<T> *>(crow + j);
+                        }
+                    }
+                    Vec4<T> r;
+                    for (int k = 0; k < VEC; ++k) {
+                        r.v[k] = f.template write<READS>(a, yv.v[k], cv.v[k]);
+                    }
+                    *reinterpret_cast<Vec4<T> *>(orow + j) = r;
+                } else {
+                    for (int64_t k = j; k < cols; ++k) {
+                        T ci{};
+                        if constexpr (READS) ci = crow[k * c.strides[1]];
+                        orow[k] = f.template write<READS>(a, v2[k], ci);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The block shape for `groups` column groups: as many as fit (a power of two, up to the whole
+// block), the rest of the block's threads on further rows.
+dim3 addr_block(int64_t groups) {
+    unsigned tx = 1;
+    while (tx < static_cast<unsigned>(kThreads) && tx < groups) tx *= 2;
+    return dim3(tx, kThreads / tx);
+}
+
+// Whether the vector kernel takes the operands: the output and v2 with a unit column stride and
+// the input with a unit or zero one (or not read), each row of those with a unit column stride
+// starting at a multiple of four elements (aligned base, a row stride that is a multiple of four
+// unless there is one row), and at least four columns.
+bool addr_vec4(const Operands<4> &ops, bool reads) {
+    const hmr_tensor_desc &o = ops.d[0];
+    int64_t rows = o.sizes[0];
+    int64_t es = element_size(o.dtype);
+    auto rows_aligned = [&](const hmr_tensor_desc &d) {
+        uintptr_t base = reinterpret_cast<uintptr_t>(d.data) + static_cast<uintptr_t>(d.offset * es);
+        return base % static_cast<uintptr_t>(4 * es) == 0 && (rows == 1 || d.strides[0] % 4 == 0);
+    };
+    if (o.sizes[1] < 4) return false;
+    if (o.strides[1] != 1 || !rows_aligned(o)) return false;
+    // v2's rows all start at its first element (row stride 0).
+    if (ops.d[2].strides[1] != 1 || !rows_aligned(ops.d[2])) return false;
+    const hmr_tensor_desc &c = ops.d[3];
+    if (reads && c.strides[1] != 0 && (c.strides[1] != 1 || !rows_aligned(c))) return false;
+    return true;
+}
+
+bool addr(const Operands<4> &ops, bool reads, double alpha, double beta, int64_t alpha_int,
+          int64_t beta_int, hipStream_t s) {
+    int dtype = ops.d[0].dtype;
+    for (int k = 1; k < 4; ++k) {
+        if (ops.d[k].dtype != dtype) return false;
+    }
+    int64_t rows = ops.d[0].sizes[0];
+    int64_t cols = ops.d[0].sizes[1];
+    bool vec = addr_vec4(ops, reads);
+    int64_t groups = vec ? ceil_div(cols, 4) : cols;
+    dim3 block = addr_block(groups);
+    int64_t gx = ceil_div(groups, block.x);
+    int64_t gy = ceil_div(rows, block.y);
+    dim3 grid(static_cast<unsigned>(gx < kMaxBlocks ? gx : kMaxBlocks),
+              static_cast<unsigned>(gy < 65535 ? gy : 65535));
+    return select(dtype, AllDtypes{}, [&](auto t) {
+        constexpr int DT = decltype(t)::v;
+        AddrSteps<DT> f;
+        if constexpr (Elem<DT>::kind == kFloat) {
+            using C = typename Comp<DT>::C;
+            // The coefficients are values of the dtype, so these conversions are exact.
+            f = {static_cast<C>(alpha), static_cast<C>(beta)};
+        } else if constexpr (Elem<DT>::kind == kInt) {
+            f = {alpha_int, beta_int};
+        } else {
+            (void)beta_int;
+            f = {alpha_int != 0};
+        }
+        auto launch = [&](auto reads_tag, auto vec_tag) {
+            constexpr bool R = decltype(reads_tag)::v != 0;
+            constexpr int V = decltype(vec_tag)::v;
+            hipLaunchKernelGGL((addr_kernel<DT, R, V>), grid, block, 0, s, ops, f);
+        };
+        if (reads) {
+            vec ? launch(Tag<1>{}, Tag<4>{}) : launch(Tag<1>{}, Tag<1>{});
+        } else {
+            vec ? launch(Tag<0>{}, Tag<4>{}) : launch(Tag<0>{}, Tag<1>{});
+        }
+        return true;
+    });
+}
+
 }  // namespace
 }  // namespace hmr
 
@@ -734,6 +924,22 @@ hmr_status hmr_fused(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
         if (n == 0) return HMR_OK;
         return hmr::launch_on(ctx, "fused", [&](hipStream_t s) {
             return hmr::fused(op, ops, c != nullptr, n, coefficient, small != 0, s);
+        });
+    });
+}
+
+hmr_status hmr_addr(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *v1,
+                    const hmr_tensor_desc *v2, const hmr_tensor_desc *input, double alpha,
+                    double beta, int64_t alpha_int, int64_t beta_int) {
+    return guarded([&] {
+        // Without the input, its slot repeats `v2` so that every slot holds a valid description.
+        hmr::Operands<4> ops{{*out, *v1, *v2, input != nullptr ? *input : *v2}};
+        int64_t n = 0;
+        if (hmr_status s = hmr::check_operands(ops, n)) return s;
+        if (out->ndim != 2) return hmr::fail(HMR_INVALID, "addr needs two dimensions");
+        if (n == 0) return HMR_OK;
+        return hmr::launch_on(ctx, "addr", [&](hipStream_t s) {
+            return hmr::addr(ops, input != nullptr, alpha, beta, alpha_int, beta_int, s);
         });
     });
 }

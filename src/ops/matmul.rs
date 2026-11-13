@@ -21,7 +21,42 @@ impl Tensor {
     /// dimensions don't match.
     #[track_caller]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
-        let (a, b) = (self.data(), other.data());
+        let p = Product::new(self, other);
+        let out = p.empty();
+        if p.device != Device::Meta {
+            let g = backend::Gemm {
+                a: &p.a,
+                b: &p.b,
+                sum_batches: false,
+                scale: None,
+            };
+            backend::gemm(&out, &g);
+        }
+        let out = Tensor::from_data(reshape_data(&out, p.shape.clone()));
+        crate::autograd::formulas::matmul(self, other, &out);
+        out
+    }
+}
+
+/// The operands of a matrix product with the semantics of `torch.matmul`, arranged for
+/// [`backend::gemm`]: `a` is `[B, M, K]` and `b` is `[B, K, N]`, where `B` merges the broadcast
+/// batch dimensions.
+pub(crate) struct Product {
+    pub(crate) a: TensorData,
+    pub(crate) b: TensorData,
+    pub(crate) device: Device,
+    /// The shape of the result, without the dimensions of 1-D operands.
+    pub(crate) shape: Shape,
+    pub(crate) batch: usize,
+    pub(crate) m: usize,
+    pub(crate) n: usize,
+}
+
+impl Product {
+    /// Checks the operands of `x @ y` (see [`Tensor::matmul`]) and arranges them.
+    #[track_caller]
+    pub(crate) fn new(x: &Tensor, y: &Tensor) -> Product {
+        let (a, b) = (x.data(), y.data());
         let device = common_device([&a, &b]);
         let (da, db) = (a.layout.shape.len(), b.layout.shape.len());
         if da == 0 || db == 0 {
@@ -66,10 +101,6 @@ impl Tensor {
         };
         let a3 = batched(&a, &a2, m, k);
         let b3 = batched(&b, &b2, k, n);
-        let out = Tensor::empty_on(Shape::new(&[batch_size, m, n]), a.dtype, device).data();
-        if device != Device::Meta {
-            backend::matmul(&out, &a3, &b3);
-        }
         let mut shape = batch.to_vec();
         if da > 1 {
             shape.push(m);
@@ -77,9 +108,20 @@ impl Tensor {
         if db > 1 {
             shape.push(n);
         }
-        // The result is contiguous, so this never copies.
-        let out = Tensor::from_data(reshape_data(&out, Shape::new(&shape)));
-        crate::autograd::formulas::matmul(self, other, &out);
-        out
+        Product {
+            a: a3,
+            b: b3,
+            device,
+            shape: Shape::new(&shape),
+            batch: batch_size,
+            m,
+            n,
+        }
+    }
+
+    /// A new contiguous `[B, M, N]` output.
+    pub(crate) fn empty(&self) -> TensorData {
+        let shape = Shape::new(&[self.batch, self.m, self.n]);
+        Tensor::empty_on(shape, self.a.dtype, self.device).data()
     }
 }

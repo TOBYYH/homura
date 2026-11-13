@@ -1,9 +1,10 @@
 //! Operations defined in terms of other operations, plus softmax.
 
-use super::{Operand, common_device, scalar_data};
+use super::{Operand, common_device, reshape_data, scalar_data};
 use crate::autograd::formulas::ScaledProduct;
 use crate::backend;
 use crate::shape::normalize_dim;
+use crate::tensor::TensorData;
 use crate::{DType, Device, Scalar, Shape, Tensor};
 
 #[track_caller]
@@ -95,16 +96,6 @@ fn scale(t: Tensor, s: Scalar) -> Tensor {
     if s.to_f64() == 1.0 { t } else { t.mul(s) }
 }
 
-/// `beta * input + alpha * product`, where the values of `input` are ignored when `beta` is zero
-/// (so NaN in it does not propagate), as PyTorch's `add*` operations do.
-fn scaled_sum(input: &Tensor, product: Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
-    let product = scale(product, alpha);
-    if beta.to_f64() == 0.0 {
-        return product;
-    }
-    scale(input.clone(), beta).add(&product)
-}
-
 /// The coefficient `name` converted to the floating point type `ty` that a kernel takes it in,
 /// as PyTorch's checked conversion does: rounded to `ty` whatever kind of scalar it is, and
 /// rejected if it is finite but out of the range of `ty` (infinities and NaN pass).
@@ -135,11 +126,12 @@ enum Kernel {
     Gemv,
 }
 
-/// `beta * input + alpha * product(x, y)` for the matrix products, with the dtype of the factors
-/// and `product` computing the matrix product itself.
+/// `beta * input + alpha * (x @ y)` for the matrix products, with the dtype of the factors;
+/// `addbmm` (`sum_batches`) sums the products of the batches, `(x @ y).sum(0)`. The kernel
+/// computes the writeback with the product ([`backend::gemm`]).
 ///
-/// The factors are checked before anything is computed, by computing `product` on metadata only,
-/// so that the checks and messages don't depend on the coefficients. The value follows the CPU
+/// The factors are checked before anything is computed, as `matmul` checks them, so that the
+/// checks and messages don't depend on the coefficients. The value follows the CPU
 /// kernels PyTorch dispatches to, so that a zero coefficient doesn't produce NaN where they
 /// don't:
 ///
@@ -163,11 +155,15 @@ fn scaled_matrix_product(
     (x, y): (&Tensor, &Tensor),
     coefficients: (Scalar, Scalar),
     kernel: Kernel,
-    product: Product,
+    sum_batches: bool,
 ) -> Tensor {
-    let device = common_device([&x.data(), &y.data()]);
-    let meta = |t: &Tensor| Tensor::empty_on(t.shape(), t.dtype(), Device::Meta);
-    let shape = product.apply(&meta(x), &meta(y)).shape();
+    let p = super::matmul::Product::new(x, y);
+    let (batches, m, n) = (if sum_batches { 1 } else { p.batch }, p.m, p.n);
+    let shape = if sum_batches {
+        Shape::new(&[m, n])
+    } else {
+        p.shape.clone()
+    };
     let dtype = x.dtype();
     let (beta, alpha) = check_input(input, x, &shape, coefficients, Coefficients::Truncate);
     let (beta, alpha) = if dtype.is_floating_point() {
@@ -181,72 +177,75 @@ fn scaled_matrix_product(
     } else {
         (beta, alpha)
     };
-    match dtype {
-        DType::F32 | DType::F64 if alpha.to_f64() == 0.0 => {
-            if beta.to_f64() == 0.0 {
-                crate::zeros_with(shape, (dtype, device))
-            } else {
-                scale(input.clone(), beta).expand(&shape).deep_clone()
-            }
-        }
-        DType::F16 | DType::BF16 => {
-            let p = product.apply(&x.to(DType::F32), &y.to(DType::F32));
-            scaled_sum(&input.to(DType::F32), p, beta, alpha).to(dtype)
-        }
-        _ => scaled_sum(input, product.apply(x, y), beta, alpha),
+    if matches!(dtype, DType::F32 | DType::F64) && alpha.to_f64() == 0.0 {
+        return if beta.to_f64() == 0.0 {
+            crate::zeros_with(shape, (dtype, p.device))
+        } else {
+            scale(input.clone(), beta).expand(&shape).deep_clone()
+        };
     }
-}
-
-/// The product of a scaled matrix product. An enum rather than a closure, so that a shape
-/// mismatch found by `matmul` reports the caller's location (`#[track_caller]` doesn't pass
-/// through closures).
-#[derive(Clone, Copy)]
-enum Product {
-    /// `x @ y`.
-    Matmul,
-    /// `(x @ y).sum(0)` of batches: integer sums are computed in `I64`; casting back wraps exactly
-    /// like accumulating in the input dtype would.
-    SumOfMatmul,
-}
-
-impl Product {
-    #[track_caller]
-    fn apply(self, x: &Tensor, y: &Tensor) -> Tensor {
-        match self {
-            Product::Matmul => x.matmul(y),
-            Product::SumOfMatmul => x.matmul(y).sum_dim(0, false).to(x.dtype()),
-        }
+    let out = Tensor::empty_on(Shape::new(&[batches, m, n]), dtype, p.device).data();
+    if p.device != Device::Meta {
+        // The input as a view of the output: broadcast to the result, then with the dimensions
+        // of 1 that the output has and the result doesn't.
+        let i = input.data();
+        let expanded = TensorData {
+            layout: i.layout.expand_to(&shape),
+            ..i.clone()
+        };
+        let c = reshape_data(&expanded, Shape::new(&[batches, m, n]));
+        let g = backend::Gemm {
+            a: &p.a,
+            b: &p.b,
+            sum_batches,
+            scale: Some(backend::Scale {
+                alpha,
+                beta,
+                input: &c,
+            }),
+        };
+        backend::gemm(&out, &g);
     }
+    Tensor::from_data(reshape_data(&out, shape))
 }
 
-/// `addr` of inputs already promoted to one dtype.
+/// `addr` of inputs already promoted to one dtype, computed by one kernel ([`backend::addr`]).
 ///
 /// Floating point values follow PyTorch's elementwise kernel, `beta * input + alpha * vec1 *
 /// vec2` evaluated left to right in the dtype with the coefficients rounded to it: `alpha`
 /// scales `vec1` before the outer product, so a zero or tiny `alpha` doesn't turn a finite
 /// result into NaN or infinity. Integers and bools compute the outer product first, which gives
-/// the same values; a broadcast product rather than a matmul, which doesn't support bool.
+/// the same values.
 #[track_caller]
 fn addr_value(input: &Tensor, v1: &Tensor, v2: &Tensor, beta: Scalar, alpha: Scalar) -> Tensor {
     let dtype = v1.dtype();
     let shape = Shape::new(&[v1.size(0), v2.size(0)]);
     let (beta, alpha) = check_input(input, v1, &shape, (beta, alpha), Coefficients::Strict);
-    #[track_caller]
-    fn outer(v1: &Tensor, v2: &Tensor) -> Tensor {
-        v1.unsqueeze(1).mul(v2.unsqueeze(0))
+    let (beta, alpha) = if dtype.is_floating_point() {
+        (
+            converted(beta, dtype, "beta"),
+            converted(alpha, dtype, "alpha"),
+        )
+    } else {
+        (beta, alpha)
+    };
+    let out = Tensor::empty_on(shape.clone(), dtype, v1.device());
+    if v1.device() != Device::Meta {
+        let i = input.data();
+        let c = TensorData {
+            layout: i.layout.expand_to(&shape),
+            ..i.clone()
+        };
+        let o = backend::Outer {
+            v1: &v1.data(),
+            v2: &v2.data(),
+            alpha,
+            beta,
+            input: &c,
+        };
+        backend::addr(&out.data(), &o);
     }
-    if !dtype.is_floating_point() {
-        return scaled_sum(input, outer(v1, v2), beta, alpha);
-    }
-    let (beta, alpha) = (
-        converted(beta, dtype, "beta"),
-        converted(alpha, dtype, "alpha"),
-    );
-    let product = outer(&scale(v1.clone(), alpha), v2);
-    if beta.to_f64() == 0.0 {
-        return product;
-    }
-    scale(input.clone(), beta).add(&product)
+    out
 }
 
 /// Records the node of the scaled product `out = beta * input + alpha * product(x, y)`, which the
@@ -320,13 +319,7 @@ impl Tensor {
         let out = {
             let _guard = crate::no_grad();
             let coefficients = (beta, alpha);
-            scaled_matrix_product(
-                self,
-                (mat1, mat2),
-                coefficients,
-                Kernel::Gemm,
-                Product::Matmul,
-            )
+            scaled_matrix_product(self, (mat1, mat2), coefficients, Kernel::Gemm, false)
         };
         scaled_product(ScaledProduct::Mm, self, mat1, mat2, beta, alpha, out)
     }
@@ -346,13 +339,7 @@ impl Tensor {
         let out = {
             let _guard = crate::no_grad();
             let coefficients = (beta, alpha);
-            scaled_matrix_product(
-                self,
-                (mat, vec),
-                coefficients,
-                Kernel::Gemv,
-                Product::Matmul,
-            )
+            scaled_matrix_product(self, (mat, vec), coefficients, Kernel::Gemv, false)
         };
         scaled_product(ScaledProduct::Mv, self, mat, vec, beta, alpha, out)
     }
@@ -418,7 +405,7 @@ impl Tensor {
         let out = {
             let _guard = crate::no_grad();
             let (batches, coefficients) = ((batch1, batch2), (beta, alpha));
-            scaled_matrix_product(self, batches, coefficients, Kernel::Gemm, Product::Matmul)
+            scaled_matrix_product(self, batches, coefficients, Kernel::Gemm, false)
         };
         scaled_product(ScaledProduct::Bmm, self, batch1, batch2, beta, alpha, out)
     }
@@ -445,13 +432,7 @@ impl Tensor {
         let out = {
             let _guard = crate::no_grad();
             let (batches, coefficients) = ((batch1, batch2), (beta, alpha));
-            scaled_matrix_product(
-                self,
-                batches,
-                coefficients,
-                Kernel::Gemm,
-                Product::SumOfMatmul,
-            )
+            scaled_matrix_product(self, batches, coefficients, Kernel::Gemm, true)
         };
         scaled_product(
             ScaledProduct::SumBmm,

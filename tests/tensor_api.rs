@@ -353,20 +353,22 @@ fn memory_methods_on_the_cpu_and_meta_devices() {
     assert_eq!(Device::Meta.memory_stats(), homura::MemoryStats::default());
 }
 
-/// ROCm tensors move data and run the elementwise kernels and reductions (M4 steps 2 to 4a);
-/// the other operations come in later steps.
+/// ROCm tensors move data and run the elementwise kernels, reductions and matrix products (M4
+/// steps 2 to 5a); half precision matrix products come in step 5b.
 #[cfg(feature = "rocm")]
 #[test]
-fn rocm_tensors_compute_elementwise_but_their_other_kernels_are_not_implemented_yet() {
+fn rocm_tensors_compute_but_half_matrix_products_are_not_implemented_yet() {
     let x = homura::ones_with([2, 3], Device::Rocm(0));
     assert_eq!(x.device(), Device::Rocm(0));
     assert_eq!(x.to_vec::<f32>(), [1.0; 6]);
     assert_eq!(x.exp().to_vec::<f32>(), [std::f32::consts::E; 6]);
     assert_eq!(x.sum().item::<f32>(), 6.0);
-    let e = std::panic::catch_unwind(|| x.matmul(&x.transpose(0, 1))).unwrap_err();
+    assert_eq!(x.matmul(&x.transpose(0, 1)).to_vec::<f32>(), [3.0; 4]);
+    let h = x.to(DType::F16);
+    let e = std::panic::catch_unwind(|| h.matmul(&h.transpose(0, 1))).unwrap_err();
     assert_eq!(
         e.downcast_ref::<String>().map(String::as_str),
-        Some("matmul is not implemented on ROCm yet (rocm:0)")
+        Some("gemm is not implemented on ROCm yet (rocm:0)")
     );
 }
 

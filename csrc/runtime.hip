@@ -341,6 +341,8 @@ void hmr_abi_check(hmr_abi_info *out) {
                                 HMR_I64,  HMR_F16, HMR_BF16, HMR_F32, HMR_F64};
     std::memcpy(out->dtype_values, dtypes, sizeof dtypes);
     out->max_dims = HMR_MAX_DIMS;
+    out->gemm_desc_size = sizeof(hmr_gemm_desc);
+    out->gemm_desc_align = alignof(hmr_gemm_desc);
 }
 
 void hmr_test_fail_stream_create(int32_t n) { hmr::failing_stream_creations = n; }

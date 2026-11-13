@@ -67,6 +67,23 @@ pub const HMR_REDUCE_MAX: i32 = 3;
 pub const HMR_REDUCE_MIN: i32 = 4;
 pub const HMR_REDUCE_ALL: i32 = 5;
 pub const HMR_REDUCE_ANY: i32 = 6;
+pub const HMR_GEMM_GENERIC: i32 = 0;
+pub const HMR_GEMM_S08A_S7A5_UNAL: i32 = 1;
+pub const HMR_GEMM_S07G_BK16: i32 = 2;
+pub const HMR_GEMM_S08C_NARROW_T256: i32 = 3;
+pub const HMR_GEMM_S08C_SPLITK_T128: i32 = 4;
+pub const HMR_GEMM_S08B_S8A1_NT: i32 = 5;
+pub const HMR_GEMM_S08B_NARROW_NT: i32 = 6;
+pub const HMR_GEMM_S08B_SPLITK_NT_T128: i32 = 7;
+pub const HMR_GEMM_S08B_S7G1_NT: i32 = 8;
+pub const HMR_GEMM_S08B_S7G1_TN: i32 = 9;
+pub const HMR_GEMM_S08B_NARROW_TN: i32 = 10;
+pub const HMR_GEMM_PATHS: i32 = 11;
+pub const HMR_GEMM_NN: i32 = 0;
+pub const HMR_GEMM_NT: i32 = 1;
+pub const HMR_GEMM_TN: i32 = 2;
+pub const HMR_GEMM_TT: i32 = 3;
+pub const HMR_GEMM_STRIDED: i32 = 4;
 pub type hmr_status = i32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -95,6 +112,30 @@ pub struct hmr_tensor_desc {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct hmr_gemm_desc {
+    pub dtype: i32,
+    pub sum_batches: i32,
+    pub scaled: i32,
+    pub reads_input: i32,
+    pub batch: i64,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub a: *const ::core::ffi::c_void,
+    pub b: *const ::core::ffi::c_void,
+    pub c: *const ::core::ffi::c_void,
+    pub out: *mut ::core::ffi::c_void,
+    pub a_strides: [i64; 3usize],
+    pub b_strides: [i64; 3usize],
+    pub c_strides: [i64; 3usize],
+    pub out_strides: [i64; 3usize],
+    pub alpha: f64,
+    pub beta: f64,
+    pub alpha_int: i64,
+    pub beta_int: i64,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct hmr_abi_info {
     pub abi_info_size: u32,
     pub properties_size: u32,
@@ -108,6 +149,8 @@ pub struct hmr_abi_info {
     pub desc_offsets: [u32; 6usize],
     pub dtype_values: [i32; 10usize],
     pub max_dims: i32,
+    pub gemm_desc_size: u32,
+    pub gemm_desc_align: u32,
 }
 unsafe extern "C" {
     pub fn hmr_last_error() -> *const ::core::ffi::c_char;
@@ -179,6 +222,17 @@ unsafe extern "C" {
         c: *const hmr_tensor_desc,
         coefficient: f64,
         small: i32,
+    ) -> hmr_status;
+    pub fn hmr_addr(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        v1: *const hmr_tensor_desc,
+        v2: *const hmr_tensor_desc,
+        input: *const hmr_tensor_desc,
+        alpha: f64,
+        beta: f64,
+        alpha_int: i64,
+        beta_int: i64,
     ) -> hmr_status;
     pub fn hmr_where(
         ctx: hmr_context_t,
@@ -412,6 +466,22 @@ unsafe extern "C" {
         size: i64,
         step: i64,
     ) -> hmr_status;
+    pub fn hmr_gemm_fold(desc: *mut hmr_gemm_desc) -> hmr_status;
+    pub fn hmr_gemm_select(
+        desc: *const hmr_gemm_desc,
+        path: *mut i32,
+        layout: *mut i32,
+    ) -> hmr_status;
+    pub fn hmr_gemm_path_name(path: i32, name: *mut *const ::core::ffi::c_char) -> hmr_status;
+    pub fn hmr_gemm_workspace(desc: *const hmr_gemm_desc, path: i32, bytes: *mut i64)
+    -> hmr_status;
+    pub fn hmr_gemm(
+        ctx: hmr_context_t,
+        desc: *const hmr_gemm_desc,
+        path: i32,
+        workspace: *mut ::core::ffi::c_void,
+        workspace_bytes: i64,
+    ) -> hmr_status;
     pub fn hmr_built_archs() -> *const ::core::ffi::c_char;
     pub fn hmr_abi_check(out: *mut hmr_abi_info);
     pub fn hmr_test_fail_stream_create(n: i32);
@@ -439,6 +509,7 @@ unsafe extern "C" {
         slot: *mut u64,
     ) -> hmr_status;
     pub fn hmr_test_wide_pool(on: i32);
+    pub fn hmr_test_force_gemm_path(path: i32);
     pub fn hmr_test_pool_candidates(
         geometry: *const i64,
         height: i64,

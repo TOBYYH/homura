@@ -3,9 +3,8 @@
 //! Operations call the free functions of this module, which have the signatures of the CPU
 //! backend's kernels and pick the backend by device. The meta device has no data: callers return
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
-//! ROCm kernels are added step by step; until then the ROCm arm of a kernel panics. Moving data
-//! (reading, writing, copying, filling and the transfers between devices), the elementwise
-//! kernels, the reductions, indexing and pooling work on ROCm.
+//! Every kernel has a ROCm counterpart, except the half precision matrix products, which come with
+//! M4 step 5b and panic until then.
 
 #[cfg(any(feature = "rocm", test))]
 pub(crate) mod caching;
@@ -44,18 +43,8 @@ fn meta(kernel: &str) -> ! {
     panic!("internal error: {kernel} dispatched for meta tensors, which have no data")
 }
 
-/// `match` on the device of `$data`: the CPU kernel `cpu::$kernel($args)`, or the panics above.
-macro_rules! dispatch {
-    ($data:expr, $kernel:ident($($arg:expr),* $(,)?)) => {
-        match $data.device() {
-            Device::Cpu => cpu::$kernel($($arg),*),
-            Device::Rocm(i) => rocm_todo(stringify!($kernel), i),
-            Device::Meta => meta(stringify!($kernel)),
-        }
-    };
-}
-
-/// [`dispatch`] for the kernels that the ROCm backend implements: `rocm::$kernel($args)`.
+/// `match` on the device of `$data`: the CPU kernel `cpu::$kernel($args)`, the ROCm kernel
+/// `rocm::$kernel($args)` (which panics without the `rocm` feature), or the panic for meta tensors.
 macro_rules! dispatch_rocm {
     ($data:expr, $kernel:ident($($arg:expr),* $(,)?)) => {
         match $data.device() {
@@ -528,7 +517,64 @@ pub(crate) fn exclusive_cumprod(out: &TensorData, src: &TensorData, dim: usize, 
     dispatch_rocm!(out, exclusive_cumprod(out, src, dim, reverse))
 }
 
+/// A batched matrix product and its writeback: the kernel of `matmul` and of the scaled products
+/// (`addmm`, `addmv`, `baddbmm`, `addbmm`), whose coefficients and input the operations check
+/// and convert before (`src/ops/composite.rs`).
+pub(crate) struct Gemm<'a> {
+    /// `[B, M, K]`, any strides (a stride of 0 broadcasts).
+    pub(crate) a: &'a TensorData,
+    /// `[B, K, N]`, any strides.
+    pub(crate) b: &'a TensorData,
+    /// `addbmm`: the output is `[1, M, N]`, the sum of the `B` products, each rounded to the
+    /// computation type first; otherwise it is `[B, M, N]`.
+    pub(crate) sum_batches: bool,
+    /// `beta * input + alpha * product`; the product itself when `None`.
+    pub(crate) scale: Option<Scale<'a>>,
+}
+
+/// The writeback of a scaled product, in the CPU's order of operations (see `cpu::gemm`).
+pub(crate) struct Scale<'a> {
+    /// Converted as the operation's CPU kernel takes them (`src/ops/composite.rs`). `F32` and
+    /// `F64` products with a zero `alpha` aren't computed by a kernel at all.
+    pub(crate) alpha: Scalar,
+    pub(crate) beta: Scalar,
+    /// The input as a view of the output's shape (broadcasting with strides of 0), of the
+    /// factors' dtype; not read when `beta` is zero.
+    pub(crate) input: &'a TensorData,
+}
+
+/// The outer product of `addr` and its writeback, `out = beta * input + alpha * outer(v1, v2)`
+/// (`out` is `[n, m]`), whose coefficients and input the operation checks and converts before
+/// (`src/ops/composite.rs`).
+///
+/// The steps are those of the composite of elementwise operations `addr` was computed with
+/// before (PyTorch's kernel for floats), each rounded to the dtype (half precision computes in
+/// f32): `a = alpha * v1[i]` (skipped for `alpha == 1`), `p = a * v2[j]`, then, unless `beta`
+/// is zero (when the input isn't read), `beta * c + p` (`beta * c` skipped for `beta == 1`).
+/// Integers wrap and apply `alpha` to the product instead, which gives the same values; bools
+/// use and for products and or for sums.
+pub(crate) struct Outer<'a> {
+    /// `[n]` and `[m]`, any strides.
+    pub(crate) v1: &'a TensorData,
+    pub(crate) v2: &'a TensorData,
+    /// Of the dtype (floats: rounded to it), see `Coefficients::Strict` in the operation.
+    pub(crate) alpha: Scalar,
+    pub(crate) beta: Scalar,
+    /// The input as a view of the output's shape (broadcasting with strides of 0); not read when
+    /// `beta` is zero.
+    pub(crate) input: &'a TensorData,
+}
+
 #[track_caller]
-pub(crate) fn matmul(out: &TensorData, a: &TensorData, b: &TensorData) {
-    dispatch!(out, matmul(out, a, b))
+pub(crate) fn addr(out: &TensorData, o: &Outer) {
+    dispatch_rocm!(out, addr(out, o))
+}
+
+#[track_caller]
+pub(crate) fn gemm(out: &TensorData, g: &Gemm) {
+    // Half precision products come with the WMMA kernels of M4 step 5b.
+    if let (Device::Rocm(i), crate::DType::F16 | crate::DType::BF16) = (out.device(), g.a.dtype) {
+        rocm_todo("gemm", i);
+    }
+    dispatch_rocm!(out, gemm(out, g))
 }

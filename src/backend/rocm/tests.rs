@@ -53,6 +53,9 @@ fn the_abi_matches_the_library() {
     let codes: Vec<i32> = crate::DType::ALL.iter().map(|&d| d as i32).collect();
     assert_eq!(abi.dtype_values.to_vec(), codes);
     assert_eq!(abi.max_dims, ffi::HMR_MAX_DIMS);
+    type G = ffi::hmr_gemm_desc;
+    assert_eq!(abi.gemm_desc_size as usize, size_of::<G>());
+    assert_eq!(abi.gemm_desc_align as usize, align_of::<G>());
 }
 
 #[test]
@@ -1506,4 +1509,315 @@ fn indexing_timings() {
             drop(mask_coordinates(&m.data()))
         });
     }
+}
+
+/// The description of `x @ y` (3-D GPU tensors) for the library.
+fn gemm_desc(x: &crate::Tensor, y: &crate::Tensor) -> ffi::hmr_gemm_desc {
+    let out = crate::Tensor::empty_on(
+        crate::Shape::new(&[x.size(0), x.size(1), y.size(2)]),
+        x.dtype(),
+        x.device(),
+    );
+    let g = crate::backend::Gemm {
+        a: &x.data(),
+        b: &y.data(),
+        sum_batches: false,
+        scale: None,
+    };
+    super::matmul::describe(&out.data(), &g)
+}
+
+#[test]
+fn gemm_selection_classifies_the_layouts() {
+    let _lock = memory_lock();
+    let gpu = crate::Device::Rocm(0);
+    let t = |shape: &[usize]| crate::zeros_with(shape.to_vec(), gpu);
+    // [B, M, K] and [B, K, N], each stored row-major (N) or transposed (T), or neither.
+    let n = |b: usize, r: usize, c: usize| t(&[b, r, c]);
+    let tr = |b: usize, r: usize, c: usize| t(&[b, c, r]).transpose(1, 2);
+    let strided = |b: usize, r: usize, c: usize| t(&[b, r, c, 2]).select(3, 1);
+    let cases = [
+        (n(2, 3, 4), n(2, 4, 5), ffi::HMR_GEMM_NN),
+        (n(2, 3, 4), tr(2, 4, 5), ffi::HMR_GEMM_NT),
+        (tr(2, 3, 4), n(2, 4, 5), ffi::HMR_GEMM_TN),
+        (tr(2, 3, 4), tr(2, 4, 5), ffi::HMR_GEMM_TT),
+        (strided(2, 3, 4), n(2, 4, 5), ffi::HMR_GEMM_STRIDED),
+        (n(2, 3, 4), strided(2, 4, 5), ffi::HMR_GEMM_STRIDED),
+        // A dimension of 1 has any stride: a column of B is both N and T, a row of A with a
+        // stride of 2 along k is T (not N).
+        (tr(1, 3, 4), n(1, 4, 1), ffi::HMR_GEMM_TN),
+        // A column of B stored transposed (column stride 4) is N too.
+        (n(1, 3, 4), tr(1, 4, 1), ffi::HMR_GEMM_NN),
+        (strided(1, 1, 4), tr(1, 4, 5), ffi::HMR_GEMM_TT),
+    ];
+    for (i, (x, y, layout)) in cases.iter().enumerate() {
+        let d = gemm_desc(x, y);
+        assert_eq!(super::matmul::select(&d).1, *layout, "case {i}");
+    }
+    assert_eq!(super::matmul::path_name(ffi::HMR_GEMM_GENERIC), "generic");
+}
+
+#[test]
+fn gemm_paths_can_be_forced_and_refuse_what_they_dont_take() {
+    let _lock = memory_lock();
+    let gpu = crate::Device::Rocm(0);
+    let x = crate::zeros_with([1, 2, 3], gpu);
+    let y = crate::zeros_with([1, 3, 4], gpu);
+    let d = gemm_desc(&x, &y);
+    let message = |f: &dyn Fn()| {
+        let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("panics");
+        e.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
+    super::matmul::force_path(Some(ffi::HMR_GEMM_GENERIC));
+    assert_eq!(super::matmul::select(&d).0, ffi::HMR_GEMM_GENERIC);
+    super::matmul::force_path(Some(ffi::HMR_GEMM_PATHS));
+    let m = message(&|| {
+        let _ = super::matmul::select(&d);
+    });
+    super::matmul::force_path(None);
+    assert_eq!(
+        m,
+        format!(
+            "matrix product path {0} can't take this description: unknown path {0}",
+            ffi::HMR_GEMM_PATHS
+        )
+    );
+    assert!(message(&|| drop(super::matmul::path_name(ffi::HMR_GEMM_PATHS))).contains("unknown"));
+    // Half precision has no path in step 5a; the library refuses it too.
+    let mut h = d;
+    h.dtype = crate::DType::F16 as i32;
+    assert_eq!(
+        message(&|| {
+            let _ = super::matmul::select(&h);
+        }),
+        format!(
+            "no ROCm matrix product path for dtype {}",
+            crate::DType::F16 as i32
+        )
+    );
+}
+
+/// A description of a contiguous F32 product `[batch, m, k] @ [batch, k, n]` in `layout` (only
+/// the sizes, strides and alignment matter to the selection; nothing is read).
+fn sized_desc(layout: i32, [batch, m, k, n]: [i64; 4]) -> ffi::hmr_gemm_desc {
+    // SAFETY: all-zero bytes are a valid description.
+    let mut d: ffi::hmr_gemm_desc = unsafe { std::mem::zeroed() };
+    d.dtype = crate::DType::F32 as i32;
+    (d.batch, d.m, d.n, d.k) = (batch, m, n, k);
+    let fake = 256 as *const std::ffi::c_void;
+    (d.a, d.b, d.c, d.out) = (fake, fake, fake, fake.cast_mut());
+    d.a_strides = match layout {
+        ffi::HMR_GEMM_TN | ffi::HMR_GEMM_TT => [m * k, 1, m],
+        _ => [m * k, k, 1],
+    };
+    d.b_strides = match layout {
+        ffi::HMR_GEMM_NT | ffi::HMR_GEMM_TT => [k * n, 1, k],
+        _ => [k * n, n, 1],
+    };
+    d.out_strides = [m * n, n, 1];
+    d
+}
+
+/// The selection rules: rocm-exp's measured preferences (LOG.md, the S series' configuration
+/// table) where the S paths take the description, the generic path otherwise.
+#[test]
+fn gemm_selection_follows_the_measured_rules() {
+    use ffi::*;
+    let (nn, nt, tn) = (HMR_GEMM_NN, HMR_GEMM_NT, HMR_GEMM_TN);
+    let cases = [
+        // NN: M <= 16 narrow; else S8a-1, split-K with a long k and 16 < M <= 128 (S7g-1, which
+        // rocm-exp chose for 16 < M <= 128 and 8192^3, is slower in this build: step 5a item 5).
+        (nn, [1, 1, 4096, 4096], HMR_GEMM_S08C_NARROW_T256),
+        (nn, [1, 16, 11008, 4096], HMR_GEMM_S08C_NARROW_T256),
+        (nn, [1, 128, 4096, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [1, 128, 11008, 4096], HMR_GEMM_S08C_SPLITK_T128),
+        (nn, [1, 1000, 1000, 1000], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [1, 4096, 4096, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [1, 8192, 8192, 8192], HMR_GEMM_S08A_S7A5_UNAL),
+        // Batches: no split-K (measured with one batch only).
+        (nn, [2, 1, 4096, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [2, 128, 11008, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        // NT.
+        (nt, [1, 1, 4096, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [3, 16, 4096, 11008], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 128, 11008, 4096], HMR_GEMM_S08B_SPLITK_NT_T128),
+        (nt, [1, 128, 4096, 4096], HMR_GEMM_S08B_S7G1_NT),
+        (nt, [1, 1024, 1024, 1024], HMR_GEMM_S08B_S8A1_NT),
+        // The narrow paths need k >= 32 M (NN) or 16 M (TN); NT needs the bound of its table for
+        // the r rows of its instance (M rounded up to a power of two) and n < 4096, < 8192 or
+        // larger (round 138, R161); below, the layout's tile path.
+        (nn, [1, 1, 32, 4096], HMR_GEMM_S08C_NARROW_T256),
+        (nn, [1, 1, 31, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [1, 4, 128, 4096], HMR_GEMM_S08C_NARROW_T256),
+        (nn, [1, 4, 127, 4096], HMR_GEMM_S08A_S7A5_UNAL),
+        (nn, [1, 16, 512, 256], HMR_GEMM_S08C_NARROW_T256),
+        (nn, [1, 16, 511, 256], HMR_GEMM_S08A_S7A5_UNAL),
+        (nt, [1, 1, 16, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 1, 15, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 1, 15, 256], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 2, 16, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 3, 24, 256], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 3, 23, 256], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 3, 40, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 3, 39, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 4, 24, 11008], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 4, 23, 11008], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 5, 64, 1024], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 5, 63, 1024], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 5, 80, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 5, 79, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 8, 80, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 9, 80, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 9, 192, 256], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 9, 144, 256], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 9, 352, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 9, 144, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [3, 16, 192, 2048], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [3, 16, 191, 2048], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [3, 16, 352, 4096], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [3, 16, 351, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 16, 256, 4096], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 16, 256, 8191], HMR_GEMM_S08B_S8A1_NT),
+        (nt, [1, 16, 256, 8192], HMR_GEMM_S08B_NARROW_NT),
+        (nt, [1, 16, 255, 11008], HMR_GEMM_S08B_S8A1_NT),
+        (tn, [1, 16, 256, 4096], HMR_GEMM_S08B_NARROW_TN),
+        (tn, [1, 16, 255, 4096], HMR_GEMM_S08B_S7G1_TN),
+        (tn, [1, 2, 32, 4096], HMR_GEMM_S08B_NARROW_TN),
+        (tn, [1, 2, 31, 4096], HMR_GEMM_S08B_S7G1_TN),
+        // TN.
+        (tn, [1, 16, 4096, 4096], HMR_GEMM_S08B_NARROW_TN),
+        (tn, [2, 16, 4096, 4096], HMR_GEMM_S08B_S7G1_TN),
+        (tn, [1, 128, 4096, 4096], HMR_GEMM_S08B_S7G1_TN),
+        (tn, [1, 2048, 2048, 2048], HMR_GEMM_S08B_S7G1_TN),
+        // TT and sizes past the S series' int range: the generic path.
+        (HMR_GEMM_TT, [1, 64, 64, 64], HMR_GEMM_GENERIC),
+        (nn, [1, 1 << 31, 1, 1], HMR_GEMM_GENERIC),
+        (nn, [1, 1, 1 << 31, 1], HMR_GEMM_GENERIC),
+        // Only K past the range (TN keeps both leading dimensions small).
+        (tn, [1, 2, 1 << 31, 2], HMR_GEMM_GENERIC),
+    ];
+    for (layout, size, path) in cases {
+        let d = sized_desc(layout, size);
+        let (got, l) = super::matmul::select(&d);
+        assert_eq!(l, layout, "{size:?}");
+        assert_eq!(
+            super::matmul::path_name(got),
+            super::matmul::path_name(path),
+            "{size:?}"
+        );
+    }
+    // What the S series doesn't take: other dtypes, k == 0, sums of batches.
+    let mut d = sized_desc(nn, [1, 64, 64, 64]);
+    d.dtype = crate::DType::F64 as i32;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_GENERIC);
+    let d = sized_desc(nn, [1, 64, 0, 64]);
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_GENERIC);
+    let mut d = sized_desc(nn, [3, 64, 64, 64]);
+    d.sum_batches = 1;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_GENERIC);
+    d.batch = 1;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_S08A_S7A5_UNAL);
+}
+
+/// `hmr_gemm_fold` of a description.
+fn folded(mut d: ffi::hmr_gemm_desc) -> ffi::hmr_gemm_desc {
+    // SAFETY: a valid description; the call only rewrites its sizes and strides.
+    super::expect(super::call(unsafe { ffi::hmr_gemm_fold(&mut d) }));
+    d
+}
+
+/// Batches that share b become the rows of one batch when the rows of a, the output and a read
+/// input continue from batch to batch (PyTorch's folding of `[..., m, k] @ [k, n]` into one mm);
+/// every other description is left as it is.
+#[test]
+fn gemm_fold_merges_batches_that_share_b() {
+    use ffi::*;
+    let size = |d: &hmr_gemm_desc| [d.batch, d.m, d.n, d.k];
+    // [4, 3, 5] @ [5, 7] broadcast: one batch of 12 rows, b as it was.
+    let mut d = sized_desc(HMR_GEMM_NN, [4, 3, 5, 7]);
+    d.b_strides[0] = 0;
+    let f = folded(d);
+    assert_eq!(size(&f), [1, 12, 7, 5]);
+    assert_eq!(
+        (&f.a_strides[1..], &f.out_strides[1..]),
+        (&[5, 1][..], &[7, 1][..])
+    );
+    assert_eq!(f.b_strides, d.b_strides);
+    // Single rows: the batch stride is the row stride (here a row of a padded batch).
+    let mut d = sized_desc(HMR_GEMM_NN, [6, 1, 8, 9]);
+    (d.b_strides[0], d.a_strides) = (0, [10, 3, 1]);
+    let f = folded(d);
+    assert_eq!(size(&f), [1, 6, 9, 8]);
+    assert_eq!(f.a_strides[1..], [10, 1][..]);
+    // A read input: whole batches, or one row for all (a bias) fold; one [m, n] matrix for all
+    // batches doesn't (its rows restart), nor does a description whose input isn't read.
+    let mut d = sized_desc(HMR_GEMM_NN, [4, 3, 5, 7]);
+    (d.b_strides[0], d.scaled, d.reads_input) = (0, 1, 1);
+    d.c_strides = [21, 7, 1];
+    assert_eq!((folded(d).m, folded(d).c_strides[1]), (12, 7));
+    d.c_strides = [0, 0, 1];
+    assert_eq!((folded(d).m, folded(d).c_strides[1]), (12, 0));
+    d.c_strides = [0, 7, 1];
+    assert_eq!(size(&folded(d)), size(&d));
+    d.reads_input = 0;
+    assert_eq!(folded(d).m, 12);
+    // Left as they are: b not shared, a's batches not continuing (broadcast, padded, or TN),
+    // a padded output, a sum of batches, one batch, and more rows than an i64 counts.
+    let mut shared = sized_desc(HMR_GEMM_NN, [4, 3, 5, 7]);
+    shared.b_strides[0] = 0;
+    let unchanged = [
+        sized_desc(HMR_GEMM_NN, [4, 3, 5, 7]),
+        hmr_gemm_desc {
+            a_strides: [0, 5, 1],
+            ..shared
+        },
+        hmr_gemm_desc {
+            a_strides: [16, 5, 1],
+            ..shared
+        },
+        hmr_gemm_desc {
+            b_strides: [0, 1, 5],
+            a_strides: [15, 1, 3],
+            ..shared
+        },
+        hmr_gemm_desc {
+            out_strides: [22, 7, 1],
+            ..shared
+        },
+        hmr_gemm_desc {
+            sum_batches: 1,
+            ..shared
+        },
+        hmr_gemm_desc { batch: 1, ..shared },
+        hmr_gemm_desc {
+            batch: 1 << 40,
+            m: 1 << 40,
+            ..shared
+        },
+    ];
+    for d in unchanged {
+        let f = folded(d);
+        assert_eq!(
+            (size(&f), f.a_strides, f.out_strides),
+            (size(&d), d.a_strides, d.out_strides),
+            "{:?} {:?}",
+            size(&d),
+            d.a_strides
+        );
+    }
+    // The folded description is chosen for: four rows of a long k take the narrow path.
+    let mut d = sized_desc(HMR_GEMM_NN, [4, 1, 4096, 11008]);
+    d.b_strides[0] = 0;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_S08A_S7A5_UNAL);
+    assert_eq!(
+        super::matmul::select(&folded(d)).0,
+        HMR_GEMM_S08C_NARROW_T256
+    );
+    // Sizes or strides the library refuses are refused here too.
+    d.m = -1;
+    let e = std::panic::catch_unwind(|| folded(d)).expect_err("refused");
+    assert!(
+        e.downcast_ref::<String>()
+            .is_some_and(|m| m.contains("negative size"))
+    );
 }

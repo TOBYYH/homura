@@ -40,15 +40,19 @@ __global__ void copy_kernel(hmr_tensor_desc dst, hmr_tensor_desc src, int64_t n)
     }
 }
 
-// Both operands flat and contiguous from their offsets: no index arithmetic.
+// Both operands flat and contiguous from their offsets, or the source uniform (is_uniform):
+// no index arithmetic. A uniform source's element is read and converted once.
 template <int D, int S>
 __global__ void copy_flat_kernel(typename Elem<D>::T *out, const typename Elem<S>::T *in,
-                                 int64_t n) {
+                                 int64_t n, bool uniform) {
     int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
-         i += step) {
-        out[i] = convert<D, S>(in[i]);
+    int64_t start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (uniform) {
+        typename Elem<D>::T value = convert<D, S>(in[0]);
+        for (int64_t i = start; i < n; i += step) out[i] = value;
+        return;
     }
+    for (int64_t i = start; i < n; i += step) out[i] = convert<D, S>(in[i]);
 }
 
 template <class T>
@@ -67,11 +71,12 @@ __global__ void fill_kernel(hmr_tensor_desc dst, T value, int64_t n) {
 template <int D, int S>
 void launch_copy(const hmr_tensor_desc &dst, const hmr_tensor_desc &src, int64_t n,
                  hipStream_t stream) {
-    if (is_flat(dst) && is_flat(src)) {
+    bool uniform = is_uniform(src);
+    if (is_flat(dst) && (is_flat(src) || uniform)) {
         auto *out = static_cast<typename Elem<D>::T *>(dst.data) + dst.offset;
         const auto *in = static_cast<const typename Elem<S>::T *>(src.data) + src.offset;
         hipLaunchKernelGGL((copy_flat_kernel<D, S>), blocks_for(n), dim3(kThreads), 0, stream, out,
-                           in, n);
+                           in, n, uniform);
     } else {
         hipLaunchKernelGGL((copy_kernel<D, S>), blocks_for(n), dim3(kThreads), 0, stream, dst, src,
                            n);

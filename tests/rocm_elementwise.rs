@@ -742,6 +742,119 @@ fn contiguous_paths_handle_every_offset_and_tail() {
     }
 }
 
+/// The operations of [`uniform_operands_are_bitwise`] with the single-element tensor `s` (and
+/// `t`, another one) broadcast against `x` and `y`, which have one shape, on one device; `m` is a
+/// Bool tensor of that shape.
+fn with_uniform_operands(
+    x: &Tensor,
+    y: &Tensor,
+    m: &Tensor,
+    s: &Tensor,
+    t: &Tensor,
+) -> Vec<Tensor> {
+    let dtype = x.dtype();
+    let n = x.num_elements();
+    let mut out = vec![
+        x.add(s),
+        s.add(x),
+        x.maximum(s),
+        s.less(x),
+        x.not_equal(s),
+        homura::where_(m, x, s),
+        homura::where_(m, s, x),
+        homura::where_(m, s, t),
+        homura::where_(&s.not_equal(t), x, y),
+        x.masked_fill(m, s),
+        s.expand([n]).contiguous(),
+        s.expand([n]).to(DType::F64),
+        s.expand([n]).to(DType::I8),
+        s.expand([n]).flip(0),
+    ];
+    if dtype != DType::Bool {
+        out.push(x.sub(s));
+        out.push(s.sub(x));
+    }
+    if !matches!(dtype, DType::Bool | DType::U8) {
+        out.push(s.expand([n]).neg());
+    }
+    out
+}
+
+#[test]
+fn uniform_operands_are_bitwise() {
+    // A single element broadcast against the other operands reaches the kernels as one dimension
+    // of stride 0 (uniform), which the flat paths read once: in each input position, with the
+    // other operands at every offset from 0 to 4 and every length up to 9 (aligned or not, each
+    // tail), past one block, and in the strided layouts of the general path.
+    for dtype in DTYPES {
+        let base = values(dtype, 48, 90);
+        let base_gpu = base.to(GPU);
+        // Special values (NaN, -0.0, the extremes) and random bit patterns, one at an offset.
+        for (k, index) in [1i64, 6, 13, 41].into_iter().enumerate() {
+            let s = base.narrow(0, index, 1).reshape(());
+            let sg = base_gpu.narrow(0, index, 1).reshape(());
+            let t = base.narrow(0, 47 - k as i64, 1).reshape(());
+            let tg = base_gpu.narrow(0, 47 - k as i64, 1).reshape(());
+            let check = |x: &Tensor,
+                         y: &Tensor,
+                         m: &Tensor,
+                         xg: &Tensor,
+                         yg: &Tensor,
+                         mg: &Tensor,
+                         what: &str| {
+                let cpu = with_uniform_operands(x, y, m, &s, &t);
+                let gpu = with_uniform_operands(xg, yg, mg, &sg, &tg);
+                for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+                    assert_bitwise(g, c, &format!("op {i} {dtype} scalar {index} {what}"));
+                }
+            };
+            let a = values(dtype, 1040, 91);
+            let b = values(dtype, 1040, 92);
+            let c = values(DType::Bool, 1040, 93);
+            let (ag, bg, cg) = (a.to(GPU), b.to(GPU), c.to(GPU));
+            for offset in 0..=4 {
+                for len in (1..=9).chain([1031]) {
+                    let what = format!("offset {offset} length {len}");
+                    let (x, y, m) = (
+                        a.narrow(0, offset, len),
+                        b.narrow(0, 4, len),
+                        c.narrow(0, offset, len),
+                    );
+                    let (xg, yg, mg) = (
+                        ag.narrow(0, offset, len),
+                        bg.narrow(0, 4, len),
+                        cg.narrow(0, offset, len),
+                    );
+                    check(&x, &y, &m, &xg, &yg, &mg, &what);
+                }
+            }
+            for ((p, q), r) in layouts(dtype, 94)
+                .iter()
+                .zip(&layouts(dtype, 95))
+                .zip(&layouts(DType::Bool, 96))
+            {
+                check(&p.cpu, &q.cpu, &r.cpu, &p.gpu, &q.gpu, &r.gpu, p.name);
+            }
+        }
+    }
+    // Past one round of the launch grid.
+    for dtype in [DType::F16, DType::F32] {
+        let s = values(dtype, 8, 97).narrow(0, 3, 1).reshape(());
+        let sg = s.to(GPU);
+        let c = values(DType::Bool, (1 << 24) + 1000, 98);
+        let cg = c.to(GPU);
+        for p in large_layouts(dtype, 99) {
+            let what = format!("{dtype} {}", p.name);
+            assert_bitwise(&p.gpu.add(&sg), &p.cpu.add(&s), &format!("add {what}"));
+            let (gpu, cpu) = (
+                homura::where_(&cg, &p.gpu, &sg),
+                homura::where_(&c, &p.cpu, &s),
+            );
+            assert_bitwise(&gpu, &cpu, &format!("where {what}"));
+        }
+    }
+}
+
 #[test]
 fn concurrent_submissions_give_the_serial_results() {
     // M4.12's robustness row: threads queueing kernels on one device at the same time get what

@@ -35,6 +35,13 @@ inline bool is_flat(const hmr_tensor_desc &d) {
     return d.ndim == 0 || (d.ndim == 1 && d.strides[0] == 1);
 }
 
+// One element read at every index: an input broadcast from a single element, which the Rust
+// side's dimension merging (copy::merge_dims) hands over as one dimension of stride 0. The flat
+// paths read its element once per thread (review/M4.md, uniform operands).
+inline bool is_uniform(const hmr_tensor_desc &d) {
+    return d.ndim == 1 && d.strides[0] == 0;
+}
+
 inline int element_size(int dtype) {
     switch (dtype) {
         case HMR_BOOL:

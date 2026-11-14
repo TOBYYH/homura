@@ -403,13 +403,36 @@ __global__ void map_kernel(Operands<1 + sizeof...(I)> ops, int64_t n, F f) {
     }
 }
 
-// All operands flat and contiguous from their offsets: no index arithmetic.
-template <class F, class O, class... I>
-__global__ void map_flat_kernel(int64_t n, F f, O *out, const I *...in) {
+// Whether input K of a flat launch is uniform (is_uniform): bit K of `uniform`. Without ANY,
+// none is, known at compile time: the kernels below branch once on `uniform == 0` into a loop
+// compiled as without uniform inputs, so those launches keep their code (a test of the bit
+// around each load made the compiler wait for each load in turn, 0.2-0.3 us more for a small
+// where, target/m4-uniform/isa).
+template <bool ANY, size_t K>
+__device__ inline bool uniform_at(unsigned uniform) {
+    return ANY && ((uniform >> K) & 1u);
+}
+
+template <bool ANY, class F, class O, class... I, size_t... K>
+__device__ void map_flat_body(int64_t n, const F &f, unsigned uniform, O *out,
+                              std::index_sequence<K...>, const I *...in) {
+    // Element 0 of each uniform input, read once.
+    std::tuple<I...> first{(uniform_at<ANY, K>(uniform) ? in[0] : I{})...};
     int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
          i += step) {
-        out[i] = f(in[i]...);
+        out[i] = f((uniform_at<ANY, K>(uniform) ? std::get<K>(first) : in[i])...);
+    }
+}
+
+// All operands flat and contiguous from their offsets, or uniform inputs (bits of `uniform`,
+// whose element 0 is read once): no index arithmetic.
+template <class F, class O, class... I>
+__global__ void map_flat_kernel(int64_t n, F f, unsigned uniform, O *out, const I *...in) {
+    if (uniform == 0) {
+        map_flat_body<false>(n, f, uniform, out, std::index_sequence_for<I...>{}, in...);
+    } else {
+        map_flat_body<true>(n, f, uniform, out, std::index_sequence_for<I...>{}, in...);
     }
 }
 
@@ -419,13 +442,17 @@ struct alignas(4 * sizeof(T)) Vec4 {
     T v[4];
 };
 
-// map_flat_kernel with four elements per thread, for operands whose first elements are aligned
-// to four elements: each operand is read and written with one vector access (step 3, item 1:
-// about 5% more bandwidth than one element per thread once the data is in DRAM, and twice as
-// much for F16 in the cache, target/m4-step3/bench). The last group of fewer than four reads
-// indices clamped into range, which needs no predicated loads, and guards only its stores.
-template <class F, class O, class... I>
-__global__ void map_vec4_kernel(int64_t n, F f, O *out, const I *...in) {
+// The four elements of `in` from `i`, or four copies of `first` for a uniform input.
+template <class T>
+__device__ inline Vec4<T> load4(const T *in, int64_t i, bool uniform, T first) {
+    if (uniform) return Vec4<T>{{first, first, first, first}};
+    return *reinterpret_cast<const Vec4<T> *>(in + i);
+}
+
+template <bool ANY, class F, class O, class... I, size_t... K>
+__device__ void map_vec4_body(int64_t n, const F &f, unsigned uniform, O *out,
+                              std::index_sequence<K...>, const I *...in) {
+    std::tuple<I...> first{(uniform_at<ANY, K>(uniform) ? in[0] : I{})...};
     int64_t groups = (n + 3) / 4;
     int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; g < groups;
@@ -436,16 +463,35 @@ __global__ void map_vec4_kernel(int64_t n, F f, O *out, const I *...in) {
             auto apply = [&](const auto &...x) {
                 for (int j = 0; j < 4; ++j) r.v[j] = f(x.v[j]...);
             };
-            apply(*reinterpret_cast<const Vec4<I> *>(in + i)...);
+            apply(load4(in, i, uniform_at<ANY, K>(uniform), std::get<K>(first))...);
             *reinterpret_cast<Vec4<O> *>(out + i) = r;
         } else {
             for (int j = 0; j < 4; ++j) {
                 int64_t k = i + j < n ? i + j : n - 1;
-                O r = f(in[k]...);
+                O r = f((uniform_at<ANY, K>(uniform) ? std::get<K>(first) : in[k])...);
                 if (i + j < n) out[i + j] = r;
             }
         }
     }
+}
+
+// map_flat_kernel with four elements per thread, for operands whose first elements are aligned
+// to four elements: each operand is read and written with one vector access (step 3, item 1:
+// about 5% more bandwidth than one element per thread once the data is in DRAM, and twice as
+// much for F16 in the cache, target/m4-step3/bench). The last group of fewer than four reads
+// indices clamped into range, which needs no predicated loads, and guards only its stores. A
+// uniform input is read once and repeated, so its alignment doesn't matter.
+template <class F, class O, class... I>
+__global__ void map_vec4_kernel(int64_t n, F f, unsigned uniform, O *out, const I *...in) {
+    if (uniform == 0) {
+        map_vec4_body<false>(n, f, uniform, out, std::index_sequence_for<I...>{}, in...);
+    } else {
+        map_vec4_body<true>(n, f, uniform, out, std::index_sequence_for<I...>{}, in...);
+    }
+}
+
+inline bool uniform_bit(unsigned uniform, size_t k) {
+    return (uniform >> k) & 1u;
 }
 
 template <class T>
@@ -460,20 +506,24 @@ void Map<F, O, I...>::launch_flat(const Operands<N> &ops, int64_t n, const F &f,
     O *out = static_cast<O *>(ops.d[0].data) + ops.d[0].offset;
     std::tuple<const I *...> in{
         (static_cast<const I *>(ops.d[K + 1].data) + ops.d[K + 1].offset)...};
-    if (aligned4(out) && (aligned4(std::get<K>(in)) && ...)) {
+    unsigned uniform = ((is_uniform(ops.d[K + 1]) ? 1u << K : 0u) | ... | 0u);
+    if (aligned4(out) && ((uniform_bit(uniform, K) || aligned4(std::get<K>(in))) && ...)) {
         hipLaunchKernelGGL((map_vec4_kernel<F, O, I...>), blocks_for((n + 3) / 4), dim3(kThreads),
-                           0, stream, n, f, out, std::get<K>(in)...);
+                           0, stream, n, f, uniform, out, std::get<K>(in)...);
     } else {
         hipLaunchKernelGGL((map_flat_kernel<F, O, I...>), blocks_for(n), dim3(kThreads), 0,
-                           stream, n, f, out, std::get<K>(in)...);
+                           stream, n, f, uniform, out, std::get<K>(in)...);
     }
 }
 
-// Queues out = f(inputs...) over the operands' elements.
+// Queues out = f(inputs...) over the operands' elements: the flat kernels when the output is
+// flat and each input flat or uniform, the general one otherwise.
 template <class F, class O, class... I>
 bool launch_map(const Operands<1 + sizeof...(I)> &ops, int64_t n, F f, hipStream_t stream) {
-    bool flat = true;
-    for (const hmr_tensor_desc &d : ops.d) flat = flat && is_flat(d);
+    bool flat = is_flat(ops.d[0]);
+    for (int k = 1; k < 1 + static_cast<int>(sizeof...(I)); ++k) {
+        flat = flat && (is_flat(ops.d[k]) || is_uniform(ops.d[k]));
+    }
     if (flat) {
         Map<F, O, I...>::launch_flat(ops, n, f, stream, std::index_sequence_for<I...>{});
     } else {

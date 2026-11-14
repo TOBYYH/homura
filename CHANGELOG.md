@@ -63,17 +63,18 @@ All notable changes to this project are documented in this file. The format is b
   at each input position from the windows that cover it. Positions are checked on the GPU, which
   reports the position the CPU reports, with its message, from a few bytes read back (one
   synchronization per call that takes an index tensor).
-- Matrix products of `F32`, `F64` and integer tensors on ROCm GPUs (`matmul`, `addmm`, `addmv`,
-  `baddbmm`, `addbmm`, and so `linear`), with homura's own kernels. Integer products give the
-  CPU's bits (wrapping in i64); float products accumulate in their own type with fused
-  multiply-adds, as PyTorch's GPU kernels do, where the CPU accumulates in f64, so they can
-  differ from the CPU's in the last places. The coefficients and the input are applied with the
-  product, with the CPU's steps and roundings, and the kernel is chosen by fixed rules, so the
+- Matrix products on ROCm GPUs (`matmul`, `addmm`, `addmv`, `baddbmm`, `addbmm`, and so
+  `linear`) of every dtype but `Bool`, with homura's own kernels (WMMA instructions for `F16`
+  and `BF16`). Integer products give the CPU's bits (wrapping in i64); float products accumulate
+  with fused multiply-adds in f32 (f64 for `F64`), as PyTorch's GPU kernels do, where the CPU
+  accumulates in f64, so they can differ from the CPU's in the last places. The coefficients and
+  the input are applied with the product, with the CPU's steps and roundings (half precision in
+  f32, rounded to the dtype once), and the kernel is chosen by fixed rules, so the
   same inputs give the same bits in every process (`HOMURA_ROCM_GEMM_LOG=1` prints the
   choices). Batches that share the right factor, as in `linear` without a bias on 3-D input,
   are computed as one product of all their rows, as PyTorch's `matmul` does. `addr` is one elementwise kernel on both devices, for every dtype, with the steps
-  and roundings of the separate operations it was computed with before. Half precision matrix
-  products and convolutions don't run on the GPU yet.
+  and roundings of the separate operations it was computed with before. Convolutions don't run
+  on the GPU yet.
 - `Tensor::try_to`, `try_zeros_with`, `try_ones_with` and `try_full_with` return
   `Error::OutOfMemory` (`OutOfMemoryError`: the device, the requested bytes and a message like
   PyTorch's) when a device refuses memory, including the staging of a transfer and a GPU's first

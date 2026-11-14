@@ -1,5 +1,6 @@
-// Shared by the matrix product sources (csrc/gemm.hip, csrc/gemm_s.hip): the writeback of
-// cpu::gemm, and the interface of the S series' paths, which gemm.hip selects and launches.
+// Shared by the matrix product sources (csrc/gemm.hip, csrc/gemm_s.hip, csrc/gemm_h.hip): the
+// writeback of cpu::gemm, and the interface of the S and H series' paths, which gemm.hip selects
+// and launches.
 #pragma once
 
 #include <string>
@@ -24,14 +25,23 @@ template <>
 struct Acc<HMR_F64> {
     using A = double;
 };
+template <>
+struct Acc<HMR_F16> {
+    using A = float;
+};
+template <>
+struct Acc<HMR_BF16> {
+    using A = float;
+};
 
 // The output element of the product `p`, with the input element at `c` (read only if needed),
 // in cpu::gemm's steps: alpha * p (skipped for alpha == 1), then beta * c + that (beta * c
-// skipped for beta == 1), each rounded; integers wrap.
+// skipped for beta == 1), each rounded to the computation type (f32 for half precision, whose
+// result is rounded to the dtype once at the end); integers wrap.
 template <int DT>
 __device__ inline typename Elem<DT>::T write(const hmr_gemm_desc &d, typename Acc<DT>::A p,
                                              const typename Elem<DT>::T *c) {
-    if constexpr (DT == HMR_F32 || DT == HMR_F64) {
+    if constexpr (Elem<DT>::kind == kFloat) {
         using C = typename Comp<DT>::C;
         if (!d.scaled) return down<DT>(p);
         C alpha = static_cast<C>(d.alpha), beta = static_cast<C>(d.beta);
@@ -93,5 +103,12 @@ std::string s_refusal(int32_t path, const hmr_gemm_desc &d, int layout);
 int32_t s_preferred(const hmr_gemm_desc &d, int layout);
 int64_t s_workspace(int32_t path, const hmr_gemm_desc &d);
 void s_launch(int32_t path, const hmr_gemm_desc &d, void *workspace, hipStream_t stream);
+
+// The H series (csrc/gemm_h.hip): F16 and BF16 paths ported from rocm-exp's measured programs,
+// with the same four functions.
+std::string h_refusal(int32_t path, const hmr_gemm_desc &d, int layout);
+int32_t h_preferred(const hmr_gemm_desc &d, int layout);
+int64_t h_workspace(int32_t path, const hmr_gemm_desc &d);
+void h_launch(int32_t path, const hmr_gemm_desc &d, void *workspace, hipStream_t stream);
 
 }  // namespace hmr

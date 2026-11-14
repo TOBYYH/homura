@@ -3,8 +3,7 @@
 //! Operations call the free functions of this module, which have the signatures of the CPU
 //! backend's kernels and pick the backend by device. The meta device has no data: callers return
 //! before dispatching for meta tensors, which the dispatch functions treat as an internal error.
-//! Every kernel has a ROCm counterpart, except the half precision matrix products, which come with
-//! M4 step 5b and panic until then.
+//! Every kernel has a ROCm counterpart.
 
 #[cfg(any(feature = "rocm", test))]
 pub(crate) mod caching;
@@ -23,17 +22,14 @@ use crate::storage::AllocError;
 use crate::tensor::{Tensor, TensorData};
 use crate::{Device, Element, Scalar};
 
-/// Panics for a kernel the ROCm backend doesn't implement yet.
+/// Panics for a ROCm kernel in a build without the `rocm` feature (with it, every kernel has a
+/// ROCm implementation since M4 step 5b).
+#[cfg(not(feature = "rocm"))]
 #[cold]
 #[track_caller]
 fn rocm_todo(kernel: &str, index: u32) -> ! {
-    #[cfg(not(feature = "rocm"))]
-    {
-        let _ = kernel;
-        crate::device::without_rocm(index)
-    }
-    #[cfg(feature = "rocm")]
-    panic!("{kernel} is not implemented on ROCm yet (rocm:{index})")
+    let _ = kernel;
+    crate::device::without_rocm(index)
 }
 
 /// Panics for a kernel called on meta tensors, which callers must not do.
@@ -592,9 +588,5 @@ pub(crate) fn addr(out: &TensorData, o: &Outer) {
 
 #[track_caller]
 pub(crate) fn gemm(out: &TensorData, g: &Gemm) {
-    // Half precision products come with the WMMA kernels of M4 step 5b.
-    if let (Device::Rocm(i), crate::DType::F16 | crate::DType::BF16) = (out.device(), g.a.dtype) {
-        rocm_todo("gemm", i);
-    }
     dispatch_rocm!(out, gemm(out, g))
 }

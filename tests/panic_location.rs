@@ -338,9 +338,7 @@ fn rocm_kernel_failures() {
         at!(failing(&sq, oom).addbmm(&m.unsqueeze(0).transpose(1, 2), &m.unsqueeze(0), 1, 2));
         at!(failing(&m, oom).addr(&m.select(1, 0), &m.select(0, 0), 1, 2));
     }
-    // Products the GPU has no path for: half precision (step 5b) and Bool, at the caller.
-    let hm = homura::ones_with([2, 2], (DType::F16, gpu));
-    at!(hm.matmul(&hm));
+    // Products of Bool, which no device multiplies, at the caller.
     let bm = homura::ones_with([2, 2], (DType::Bool, gpu));
     at!(bm.matmul(&bm));
     // More dimensions than the kernels take.

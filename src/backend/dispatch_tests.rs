@@ -202,15 +202,10 @@ fn reductions_and_matmul() {
         let b = |n| crate::zeros_with([n], (DType::Bool, GPU));
         b(1).addr(&b(2), &b(3), false, true)
     });
-    // Half precision products come with M4 step 5b.
-    let half = || crate::zeros_with([2, 2], (DType::F16, GPU));
-    let message = panic_message(|| half().matmul(&half()));
-    let expected = if cfg!(feature = "rocm") {
-        "gemm is not implemented on ROCm yet (rocm:0)"
-    } else {
-        "homura was built without ROCm support; enable the `rocm` feature"
-    };
-    assert_eq!(message, expected);
+    reaches("gemm", || {
+        let half = || crate::zeros_with([2, 2], (DType::F16, GPU));
+        half().matmul(&half())
+    });
 }
 
 #[test]

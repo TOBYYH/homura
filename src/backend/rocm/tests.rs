@@ -1721,17 +1721,14 @@ fn gemm_paths_can_be_forced_and_refuse_what_they_dont_take() {
         )
     );
     assert!(message(&|| drop(super::matmul::path_name(ffi::HMR_GEMM_PATHS))).contains("unknown"));
-    // Half precision has no path in step 5a; the library refuses it too.
+    // Bool has no path; the library refuses it with the CPU's message.
     let mut h = d;
-    h.dtype = crate::DType::F16 as i32;
+    h.dtype = crate::DType::Bool as i32;
     assert_eq!(
         message(&|| {
             let _ = super::matmul::select(&h);
         }),
-        format!(
-            "no ROCm matrix product path for dtype {}",
-            crate::DType::F16 as i32
-        )
+        "matmul is not supported for Bool tensors"
     );
 }
 
@@ -1855,6 +1852,103 @@ fn gemm_selection_follows_the_measured_rules() {
     assert_eq!(super::matmul::select(&d).0, HMR_GEMM_GENERIC);
     d.batch = 1;
     assert_eq!(super::matmul::select(&d).0, HMR_GEMM_S08A_S7A5_UNAL);
+}
+
+/// The half precision rules: rocm-exp's measured preferences (LOG-H.md, the H series'
+/// configuration table, F32 accumulation) where the H paths take the description.
+#[test]
+fn gemm_half_selection_follows_the_measured_rules() {
+    use ffi::*;
+    let (nn, nt, tn) = (HMR_GEMM_NN, HMR_GEMM_NT, HMR_GEMM_TN);
+    let cases = [
+        // NN.
+        (nn, [1, 1, 4096, 4096], HMR_GEMM_H06W1_NARROW),
+        (nn, [2, 1, 4096, 4096], HMR_GEMM_H06C_4A),
+        (nn, [1, 1, 11008, 4096], HMR_GEMM_H06C_4A),
+        (nn, [1, 16, 4096, 4096], HMR_GEMM_H06C_4A),
+        (nn, [1, 128, 4096, 4096], HMR_GEMM_H06NNG_4X),
+        (nn, [1, 128, 4096, 11008], HMR_GEMM_H06NNG_4X),
+        (nn, [1, 128, 11008, 4096], HMR_GEMM_H04A),
+        (nn, [1, 1000, 1000, 1000], HMR_GEMM_H06C_4A),
+        (nn, [1, 1024, 1024, 1024], HMR_GEMM_H04A),
+        (nn, [1, 4096, 4096, 4096], HMR_GEMM_H02N256),
+        (nn, [1, 4095, 4095, 4095], HMR_GEMM_H06C_N256),
+        (nn, [1, 8192, 8192, 8192], HMR_GEMM_H02N256),
+        // Round 142: N mod 256 in 1..128 takes the 128-wide edge kernel (beyond 1024^2 outputs);
+        // 192, 256 and 512 keep the 256-wide kernels.
+        (nn, [1, 131072, 64, 256], HMR_GEMM_H06C_4A),
+        (nn, [1, 16384, 128, 2048], HMR_GEMM_H06C_4A),
+        (nn, [1, 131072, 384, 2048], HMR_GEMM_H06C_4A),
+        (nn, [1, 131072, 192, 256], HMR_GEMM_H06C_N256),
+        (nn, [1, 131072, 512, 256], HMR_GEMM_H02N256),
+        // NT.
+        (nt, [1, 1, 4096, 4096], HMR_GEMM_H06NTW32),
+        (nt, [1, 16, 4096, 11008], HMR_GEMM_H06NTW32),
+        (nt, [1, 16, 4096, 100], HMR_GEMM_H06FK_NT4A),
+        (nt, [1, 128, 4096, 4096], HMR_GEMM_H06NTGP_4X),
+        (nt, [1, 128, 11008, 4096], HMR_GEMM_H06NTGP_4X),
+        (nt, [1, 128, 4096, 11008], HMR_GEMM_H06NTN_4A),
+        (nt, [1, 1000, 1000, 1000], HMR_GEMM_H06FK_NT4A),
+        (nt, [1, 1024, 1024, 1024], HMR_GEMM_H06NTN_4A),
+        (nt, [1, 2048, 2048, 2048], HMR_GEMM_H06NTK_N256),
+        (nt, [1, 4096, 4096, 4096], HMR_GEMM_H06NTK_N256),
+        (nt, [1, 2048, 2080, 2048], HMR_GEMM_H06FK_NT256),
+        (nt, [1, 2048, 2048, 2080], HMR_GEMM_H06FK_NT256),
+        (nt, [1, 4097, 4097, 4097], HMR_GEMM_H06FK_NT256),
+        (nt, [1, 8192, 8192, 8192], HMR_GEMM_H06FK_NT256),
+        (nt, [1, 8193, 8193, 8193], HMR_GEMM_H06FZ_N256),
+        (nt, [2, 8193, 8193, 8193], HMR_GEMM_H06FK_NT256),
+        // Narrow N for K < 1024 only.
+        (nt, [1, 131072, 64, 768], HMR_GEMM_H06FK_NT4A),
+        (nt, [1, 16384, 384, 1023], HMR_GEMM_H06FK_NT4A),
+        (nt, [1, 16384, 384, 1024], HMR_GEMM_H06FK_NT256),
+        (nt, [1, 131072, 128, 2048], HMR_GEMM_H06FK_NT256),
+        // TN (M = 1 is NN in memory).
+        (tn, [1, 16, 4096, 4096], HMR_GEMM_H06TZ_4A),
+        (tn, [1, 16, 4096, 11008], HMR_GEMM_H06TZ_4A),
+        (tn, [1, 16, 11008, 4096], HMR_GEMM_H06TNGB_4X),
+        (tn, [1, 5, 300, 77], HMR_GEMM_H06FK_TN4A),
+        (tn, [1, 128, 4096, 4096], HMR_GEMM_H06TNG_4X),
+        (tn, [1, 128, 11008, 4096], HMR_GEMM_H06TN_4A),
+        (tn, [1, 1000, 1000, 1000], HMR_GEMM_H06FK_TN4A),
+        (tn, [1, 1024, 1024, 1024], HMR_GEMM_H06TN_4A),
+        (tn, [1, 2048, 2048, 2048], HMR_GEMM_H06TN_N256),
+        (tn, [1, 8191, 8191, 8191], HMR_GEMM_H06FK_TN256),
+        (tn, [1, 131072, 64, 2048], HMR_GEMM_H06FK_TN4A),
+        (tn, [1, 131072, 384, 256], HMR_GEMM_H06FK_TN4A),
+        (tn, [1, 131072, 512, 256], HMR_GEMM_H06TN_N256),
+        // TT, and factors spanning 2^31 bytes or more: the generic path.
+        (HMR_GEMM_TT, [1, 64, 64, 64], HMR_GEMM_GENERIC),
+        (nn, [1, 1 << 20, 1, 1 << 10], HMR_GEMM_GENERIC),
+        (nn, [1, (1 << 20) - 1, 1, 1 << 10], HMR_GEMM_H06C_4A),
+    ];
+    // [batch, M, N, K], as the configuration table writes the shapes.
+    for dtype in [crate::DType::F16, crate::DType::BF16] {
+        for (layout, size, path) in cases {
+            let [b, m, n, k] = size;
+            let mut d = sized_desc(layout, [b, m, k, n]);
+            d.dtype = dtype as i32;
+            let (got, l) = super::matmul::select(&d);
+            assert_eq!(l, layout, "{dtype} {size:?}");
+            assert_eq!(
+                super::matmul::path_name(got),
+                super::matmul::path_name(path),
+                "{dtype} {size:?}"
+            );
+        }
+    }
+    // BF16 2048^3: H2a-g4l.
+    let mut d = sized_desc(nn, [1, 2048, 2048, 2048]);
+    d.dtype = crate::DType::BF16 as i32;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_H02G_G4L);
+    d.dtype = crate::DType::F16 as i32;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_H02N256);
+    // Rows that overlap (a row stride below the row length): the generic path.
+    let mut d = sized_desc(nn, [1, 256, 64, 256]);
+    d.dtype = crate::DType::F16 as i32;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_H04A);
+    d.a_strides[1] = 63;
+    assert_eq!(super::matmul::select(&d).0, HMR_GEMM_GENERIC);
 }
 
 /// `hmr_gemm_fold` of a description.

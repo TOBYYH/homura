@@ -477,9 +477,10 @@ hmr_status hmr_unfold_backward(hmr_context_t ctx, const hmr_tensor_desc *out,
  * output has batch batches (1 with sum_batches); its elements are distinct and don't overlap the
  * factors or the input. With k == 0 (or no batches to sum) the products are exact zeros.
  *
- * Floats accumulate in their computation type (f32 for F32, f64 for F64), with the fused
- * multiply-add of the path; sums of batches in f64. Integers wrap in 64 bits and are truncated
- * once. F16 and BF16 have no path yet (M4 step 5b), Bool none.
+ * Floats accumulate in their computation type (f32 for F16, BF16 and F32, f64 for F64), with the
+ * fused multiply-add of the path; sums of batches in f64. Half precision is written back in f32
+ * and rounded to the dtype once. Integers wrap in 64 bits and are truncated once. Bool has no
+ * path.
  */
 typedef struct hmr_gemm_desc {
     int32_t dtype;
@@ -508,10 +509,12 @@ typedef struct hmr_gemm_desc {
     int64_t beta_int;
 } hmr_gemm_desc;
 
-/* The paths of hmr_gemm. HMR_GEMM_GENERIC takes every description of F32, F64 and the integer
- * dtypes. The others are F32 kernels of rocm-exp's S series, named by its programs (the
- * configuration table in rocm-exp/LOG.md): NN, NT, TN for the layouts they take; NARROW for
- * M <= 16; SPLITK for those that split k into slices summed in a workspace. */
+/* The paths of hmr_gemm. HMR_GEMM_GENERIC takes every description of the float and integer
+ * dtypes. The others are named by the rocm-exp programs they were ported from: S, the F32
+ * kernels of the S series (the configuration table in rocm-exp/LOG.md), with NN, NT, TN for the
+ * layouts they take, NARROW for M <= 16 and SPLITK for those that split k into slices summed in
+ * a workspace; H, the F16 and BF16 kernels of the H series (the configuration table in
+ * rocm-exp/LOG-H.md, F32 accumulation). */
 #define HMR_GEMM_GENERIC 0
 #define HMR_GEMM_S08A_S7A5_UNAL 1
 #define HMR_GEMM_S07G_BK16 2
@@ -523,7 +526,28 @@ typedef struct hmr_gemm_desc {
 #define HMR_GEMM_S08B_S7G1_NT 8
 #define HMR_GEMM_S08B_S7G1_TN 9
 #define HMR_GEMM_S08B_NARROW_TN 10
-#define HMR_GEMM_PATHS 11
+#define HMR_GEMM_H04A 11
+#define HMR_GEMM_H06NTN_4A 12
+#define HMR_GEMM_H06TN_4A 13
+#define HMR_GEMM_H06C_4A 14
+#define HMR_GEMM_H06FK_NT4A 15
+#define HMR_GEMM_H06FK_TN4A 16
+#define HMR_GEMM_H02G_G4L 17
+#define HMR_GEMM_H02N256 18
+#define HMR_GEMM_H06TN_N256 19
+#define HMR_GEMM_H06C_N256 20
+#define HMR_GEMM_H06FK_TN256 21
+#define HMR_GEMM_H06NTK_N256 22
+#define HMR_GEMM_H06FK_NT256 23
+#define HMR_GEMM_H06NNG_4X 24
+#define HMR_GEMM_H06NTGP_4X 25
+#define HMR_GEMM_H06TNG_4X 26
+#define HMR_GEMM_H06TNGB_4X 27
+#define HMR_GEMM_H06NTW32 28
+#define HMR_GEMM_H06W1_NARROW 29
+#define HMR_GEMM_H06TZ_4A 30
+#define HMR_GEMM_H06FZ_N256 31
+#define HMR_GEMM_PATHS 32
 
 /* The storage of the factors, as the paths see it: each with a unit stride along k (N for a, T
  * for b) or along its other dimension (T for a, N for b); HMR_GEMM_STRIDED when one has neither. */

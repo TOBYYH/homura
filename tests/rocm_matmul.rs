@@ -139,15 +139,26 @@ fn moderate(dtype: DType) -> impl Fn(usize, u64) -> Tensor {
     }
 }
 
+const FLOATS: [DType; 4] = [DType::F16, DType::BF16, DType::F32, DType::F64];
+
+/// The computation type of a float dtype (the CPU's opmath, and the GPU's accumulator): f32 for
+/// half precision.
+fn op(dtype: DType) -> DType {
+    match dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        d => d,
+    }
+}
+
 /// `|gpu - cpu| <= c * K * eps * sum_k |a_ik * b_kj| + u_out(max(|gpu|, |cpu|))` (M4.12, GEMM),
-/// with `abs` the CPU's `|a| @ |b|` in f64.
+/// with `abs` the CPU's `|a| @ |b|` in f64 and `eps` the unit roundoff of the accumulator.
 #[track_caller]
 fn check_gemm(gpu: &Tensor, cpu: &Tensor, abs: &Tensor, k: usize, what: &str) {
     assert_eq!(gpu.device(), GPU, "{what}");
     assert_eq!(gpu.shape(), cpu.shape(), "{what}");
     assert_eq!(gpu.dtype(), cpu.dtype(), "{what}");
     let dtype = cpu.dtype();
-    let eps = unit_roundoff(dtype);
+    let eps = unit_roundoff(op(dtype));
     let (g, c, a) = (floats(gpu), floats(cpu), floats(abs));
     for i in 0..g.len() {
         let bound = 2.0 * k as f64 * eps * a[i] + ulp(dtype, g[i].abs().max(c[i].abs()));
@@ -162,7 +173,7 @@ fn check_gemm(gpu: &Tensor, cpu: &Tensor, abs: &Tensor, k: usize, what: &str) {
 
 #[test]
 fn float_products_are_within_the_gemm_class() {
-    for dtype in [DType::F32, DType::F64] {
+    for dtype in FLOATS {
         let v = moderate(dtype);
         for shape in SHAPES {
             for batch in [1, 3] {
@@ -195,19 +206,21 @@ fn check_scaled(
 ) {
     assert_eq!(gpu.shape(), cpu.shape(), "{what}");
     let dtype = cpu.dtype();
-    let eps = unit_roundoff(dtype);
+    // The intermediate steps round to the computation type, the result to the dtype.
+    let o = op(dtype);
+    let eps = unit_roundoff(o);
     let (g, c, pa, pv) = (floats(gpu), floats(cpu), floats(p_abs), floats(p));
     for i in 0..g.len() {
-        let mut e_p = 2.0 * k as f64 * eps * pa[i] + batches as f64 * ulp(dtype, pv[i]);
+        let mut e_p = 2.0 * k as f64 * eps * pa[i] + batches as f64 * ulp(o, pv[i]);
         if batches > 1 {
-            e_p += ulp(dtype, pv[i]) + batches as f64 * 2f64.powi(-53) * pa[i];
+            e_p += ulp(o, pv[i]) + batches as f64 * 2f64.powi(-53) * pa[i];
         }
         let mut bound = alpha.abs() * e_p + ulp(dtype, g[i].abs().max(c[i].abs()));
         if alpha != 1.0 {
-            bound += ulp(dtype, (alpha * pv[i]).abs());
+            bound += ulp(o, (alpha * pv[i]).abs());
         }
         if beta != 0.0 {
-            bound += ulp(dtype, c[i].abs().max(g[i].abs()));
+            bound += ulp(o, c[i].abs().max(g[i].abs()));
         }
         assert!(
             (g[i] - c[i]).abs() <= bound,
@@ -221,7 +234,7 @@ fn check_scaled(
 #[test]
 fn float_scaled_products_are_within_their_class() {
     let coefficients = [(1.0, 1.0), (0.0, 1.0), (1.0, 0.0), (-0.5, 3.0), (2.0, 0.1)];
-    for dtype in [DType::F32, DType::F64] {
+    for dtype in FLOATS {
         let v = moderate(dtype);
         for shape in SHAPES {
             let [m, k, n] = shape;
@@ -265,8 +278,9 @@ fn float_scaled_products_are_within_their_class() {
 
 #[test]
 fn exact_products_have_the_cpus_bits() {
-    // Small integers: every product and sum is exact in f32 and f64, whatever the order.
-    for dtype in [DType::F32, DType::F64] {
+    // Small integers: every product and sum is exact in f32 and f64, whatever the order (and
+    // half precision rounds the same exact f32 values once).
+    for dtype in FLOATS {
         let small = |n: usize, seed: u64| {
             homura::manual_seed(seed);
             homura::randint(-8, 9, [n]).to(dtype)
@@ -351,19 +365,247 @@ fn launches_are_split_at_the_grid_limits() {
     );
 }
 
+/// A factor of `rows x cols` in `dtype`, stored with 3 more columns per row that hold NaN (`inf`:
+/// Inf), as a view on the CPU and the same view on the GPU; `transposed` stores it as the
+/// transpose of a padded `cols x rows`.
+fn padded(
+    rows: usize,
+    cols: usize,
+    transposed: bool,
+    dtype: DType,
+    seed: u64,
+    inf: bool,
+) -> (Tensor, Tensor) {
+    let (r, c) = if transposed {
+        (cols, rows)
+    } else {
+        (rows, cols)
+    };
+    let fill = if inf { f64::INFINITY } else { f64::NAN };
+    let store = homura::full_with([r, c + 3], fill, dtype);
+    homura::manual_seed(seed);
+    store
+        .narrow(1, 0, c)
+        .copy_(&homura::randint(-8, 9, [r, c]).to(dtype));
+    let view = |t: &Tensor| {
+        let v = t.narrow(1, 0, c);
+        if transposed { v.transpose(0, 1) } else { v }
+    };
+    (view(&store), view(&store.to(GPU)))
+}
+
+/// The H paths read whole vectors and rely on zero reads past a factor's range for its rows past
+/// M or K; elements of a row past its end (the padding of a leading dimension) must not reach a
+/// result. With NaN and Inf in the padding, every H path that takes padded factors, forced, gives
+/// the CPU's bits on small integers (exact in f32).
 #[test]
-fn half_and_bool_products_are_rejected() {
+fn half_paths_ignore_the_padding_of_their_factors() {
+    for (path, name, layout, tiles) in H_PATHS {
+        let mut shapes = tiles.map_or(H_EDGES.to_vec(), h_tiles);
+        if name == "h06w1_narrow" {
+            shapes = vec![[3, 64, 7], [16, 1001, 300], [5, 4096, 257]];
+        }
+        for (i, [m, k, n]) in shapes.into_iter().enumerate() {
+            // h06ntw32 refuses an odd span of A (its range is rounded up to a dword).
+            if [m, k, n] == [1, 1, 1] || (name == "h06ntw32" && (m - 1) * (k + 3) % 2 == 1) {
+                continue;
+            }
+            let dtype = if i % 2 == 0 { DType::F16 } else { DType::BF16 };
+            let (ta, tb) = (layout == "TN", layout == "NT");
+            for inf in [false, true] {
+                let (xc, xg) = padded(m, k, ta, dtype, 51, inf);
+                let (yc, yg) = padded(k, n, tb, dtype, 52, inf);
+                let got = {
+                    let _f = force(path);
+                    xg.matmul(&yg)
+                };
+                let what = format!("{name} {dtype} {:?} inf {inf}", [m, k, n]);
+                assert_same(&got, &xc.matmul(&yc), &what);
+            }
+        }
+    }
+}
+
+/// Infinities and NaN reach the result like on the CPU through every H path, forced (M4.12):
+/// small integers with, in the last K element, a column of ones in A against +Inf and -Inf in B
+/// (columns of ±Inf), a NaN in A's last row, and an infinity against a zero in the first K
+/// element (NaN). A step of zero A against B's last step (which h06ntw32 computed for an odd
+/// number of K steps, K = 256 and 768) would turn the infinite columns into NaN.
+#[test]
+fn half_paths_propagate_infinities_and_nan() {
+    for (path, name, layout, tiles) in H_PATHS {
+        let mut shapes = tiles.map_or(H_EDGES.to_vec(), h_tiles);
+        if name == "h06w1_narrow" {
+            shapes = vec![[1, 1, 1], [3, 64, 7], [16, 1001, 300], [5, 4096, 257]];
+        }
+        for (i, [m, k, n]) in shapes.into_iter().enumerate() {
+            if [m, k, n] == [1, 1, 1] && layout != "NN" {
+                continue;
+            }
+            let dtype = if i % 2 == 0 { DType::F16 } else { DType::BF16 };
+            let ints = |len: usize, seed: u64| {
+                homura::manual_seed(seed);
+                homura::randint(-8, 9, [len]).to(DType::F32).to_vec::<f32>()
+            };
+            let (mut a, mut b) = (ints(m * k, 61), ints(k * n, 62));
+            for r in 0..m {
+                a[r * k + k - 1] = 1.0;
+            }
+            b[(k - 1) * n] = f32::INFINITY;
+            b[(k - 1) * n + n - 1] = f32::NEG_INFINITY;
+            a[(m - 1) * k] = f32::NAN;
+            if k > 1 {
+                a[0] = 0.0;
+                b[n - 1] = f32::INFINITY;
+            }
+            let x = Tensor::from_slice(&a, [m, k]).to(dtype);
+            let y = Tensor::from_slice(&b, [k, n]).to(dtype);
+            // Stored as the transpose of a contiguous matrix for TN's A and NT's B.
+            let on_gpu = |t: &Tensor, transposed: bool| {
+                if transposed {
+                    t.transpose(0, 1).contiguous().to(GPU).transpose(0, 1)
+                } else {
+                    t.to(GPU)
+                }
+            };
+            let (xg, yg) = (on_gpu(&x, layout == "TN"), on_gpu(&y, layout == "NT"));
+            let got = {
+                let _f = force(path);
+                xg.matmul(&yg)
+            };
+            let what = format!("{name} {dtype} {:?}", [m, k, n]);
+            assert_bitwise(&got, &x.matmul(&y), &what);
+        }
+    }
+}
+
+/// The TN paths of any shape read whole tiles along K; the rows of A and B past K must count as
+/// zero however large the leading dimension. With K = 2 and rows 2^27 elements apart (each factor
+/// 256 MiB), the byte offset of row 16 is 2^32 and wraps onto row 0 (row 17 onto row 1): a read
+/// that relies on offsets past the range adds the product a second time. With +Inf in A (row 3)
+/// and -Inf in B (column 5), and no zeros, a kernel that zeroes the rows past K of only one
+/// factor gives NaN there (the wrapped infinity times zero).
+#[test]
+fn tn_rows_past_k_count_as_zero_with_any_leading_dimension() {
+    let (m, k, n, ld) = (17usize, 2usize, 17usize, 1usize << 27);
+    for dtype in [DType::F16, DType::BF16] {
+        homura::manual_seed(71);
+        // A stored K x M (the transpose of A), B stored K x N, rows `ld` apart.
+        let nonzero = |rows: usize, cols: usize, at: usize, inf: f32| {
+            let s = homura::randint(0, 2, [rows * cols]).to(DType::F32) * 2.0 - 1.0;
+            let mut v = (homura::randint(1, 9, [rows * cols]).to(DType::F32) * s).to_vec::<f32>();
+            v[at] = inf;
+            Tensor::from_slice(&v, [rows, cols]).to(dtype)
+        };
+        let at = nonzero(k, m, 3, f32::INFINITY);
+        let b = nonzero(k, n, 5, f32::NEG_INFINITY);
+        let stored = |t: &Tensor, cols: usize| {
+            let flat = homura::zeros_with([ld + cols], (dtype, GPU));
+            for r in 0..k {
+                flat.narrow(0, (r * ld) as i64, cols)
+                    .copy_(&t.select(0, r as i64));
+            }
+            flat.unfold(0, cols, ld)
+        };
+        let (atg, bg) = (stored(&at, m), stored(&b, n));
+        assert_eq!(atg.shape(), at.shape());
+        let want = at.transpose(0, 1).matmul(&b);
+        for path in [-1, 16, 21] {
+            let got = {
+                let _f = force(path);
+                atg.transpose(0, 1).matmul(&bg)
+            };
+            assert_bitwise(&got, &want, &format!("{dtype} path {path}"));
+        }
+    }
+}
+
+/// h06ntw32 takes any A below 2^31 bytes (since round 142; it took less than 2^30 before): two
+/// rows of A 2^29 elements apart (A spans 1 GiB and 512 bytes). Its rows past M read from offsets
+/// that wrap (row 4 at 2^32 bytes onto row 0) only for rows of the result it doesn't write.
+#[test]
+fn narrow_nt_takes_a_factor_of_a_gibibyte() {
+    let (m, k, n, ld) = (2usize, 256usize, 32usize, 1usize << 29);
+    for dtype in [DType::F16, DType::BF16] {
+        homura::manual_seed(72);
+        let a = homura::randint(-8, 9, [m, k]).to(dtype);
+        let b = homura::randint(-8, 9, [n, k]).to(dtype);
+        let flat = homura::zeros_with([ld + k], (dtype, GPU));
+        for r in 0..m {
+            flat.narrow(0, (r * ld) as i64, k)
+                .copy_(&a.select(0, r as i64));
+        }
+        let ag = flat.unfold(0, k, ld);
+        assert_eq!(ag.shape(), a.shape());
+        let got = {
+            let _f = force(28);
+            ag.matmul(&b.to(GPU).transpose(0, 1))
+        };
+        assert_same(&got, &a.matmul(&b.transpose(0, 1)), &format!("{dtype}"));
+    }
+}
+
+/// A half precision factor of more than 2^31 bytes (the H paths' 32-bit offsets and buffer
+/// ranges refuse it): the generic path, with every row read from its own place. Row i of the
+/// left factor is i mod 3, so a row read 2^20 rows (2 GiB) off, or from a wrapped offset, gives
+/// another value.
+#[test]
+fn half_factors_past_2_31_bytes_take_the_generic_path() {
+    let (k, rows) = (1024usize, 3 * 349_528usize);
+    assert!(rows * k * 2 > 1 << 31);
+    let pattern = Tensor::from_slice(&[0.0f32, 1.0, 2.0], [3, 1]).expand([3, k]);
+    let a = pattern
+        .to((DType::F16, GPU))
+        .expand([rows / 3, 3, k])
+        .contiguous()
+        .reshape([rows, k]);
+    let b = values(DType::I8, k * 3, 41).reshape([k, 3]).to(DType::F16);
+    let sums = b.to(DType::F64).sum_dim(0, false).to_vec::<f64>();
     let message = |f: &dyn Fn()| {
         let e = catch_unwind(AssertUnwindSafe(f)).expect_err("panics");
         e.downcast_ref::<String>().cloned().unwrap_or_default()
     };
-    for dtype in [DType::F16, DType::BF16] {
-        let x = homura::ones([2, 2]).to((dtype, GPU));
-        assert_eq!(
-            message(&|| drop(x.matmul(&x))),
-            "gemm is not implemented on ROCm yet (rocm:0)"
-        );
+    let bg = b.to(GPU);
+    let m = message(&|| {
+        let _f = force(20);
+        drop(a.matmul(&bg))
+    });
+    assert_eq!(
+        m,
+        "matrix product path 20 can't take this description: a factor spans 2^31 bytes or more"
+    );
+    let out = a.matmul(&bg);
+    for i in [
+        0,
+        1,
+        2,
+        rows / 2,
+        (1 << 20) - 1,
+        1 << 20,
+        (1 << 20) + 1,
+        rows - 2,
+        rows - 1,
+    ] {
+        let got = out
+            .select(0, i as i64)
+            .to((DType::F64, Device::Cpu))
+            .to_vec::<f64>();
+        // Exact in f32, rounded to F16 once.
+        let want: Vec<f64> = sums.iter().map(|s| (i % 3) as f64 * s).collect();
+        let want = Tensor::from_slice(&want, [3])
+            .to(DType::F16)
+            .to(DType::F64)
+            .to_vec::<f64>();
+        assert_eq!(got, want, "row {i}");
     }
+}
+
+#[test]
+fn bool_products_are_rejected() {
+    let message = |f: &dyn Fn()| {
+        let e = catch_unwind(AssertUnwindSafe(f)).expect_err("panics");
+        e.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
     let x = Tensor::from_slice(&[true, false], [1, 2]);
     let y = x.reshape([2, 1]);
     let cpu = message(&|| drop(x.matmul(&y)));
@@ -509,11 +751,30 @@ fn logged_products() -> Vec<Tensor> {
     let c = v(70, 33).to(GPU);
     // Four batches of one row that share y: logged as one batch of four rows.
     let s = v(4 * 33, 34).reshape([4, 1, 33]).to(GPU);
+    // Half precision: the edge kernel, the narrow NT kernel, split-K in one launch (the slices
+    // summed in slice order whichever block finishes last) and staggered K starts.
+    let h = |n: usize, seed: u64, dtype: DType| moderate(dtype)(n, seed).to(GPU);
+    let xh = x.to(DType::F16);
+    let w32 = h(32 * 256, 35, DType::BF16)
+        .reshape([32, 256])
+        .transpose(0, 1);
+    let (r1, b1) = (
+        h(4096, 36, DType::F16).reshape([1, 4096]),
+        h(4096 * 4096, 37, DType::F16).reshape([4096, 4096]),
+    );
+    let (r128, b128) = (
+        h(128 * 512, 38, DType::BF16).reshape([128, 512]),
+        h(512 * 256, 39, DType::BF16).reshape([512, 256]),
+    );
     vec![
         x.matmul(&y),
         x.matmul(&y),
         c.addmm(&x, &y, 0.5, 2.0),
         s.matmul(&y),
+        xh.matmul(&y.to(DType::F16)),
+        h(16 * 256, 40, DType::BF16).reshape([16, 256]).matmul(&w32),
+        r1.matmul(&b1),
+        r128.matmul(&b128),
     ]
 }
 
@@ -549,6 +810,10 @@ fn the_choice_is_logged_once_and_the_same_in_another_process() {
             "homura: gemm f32 NN batch=1 m=65 n=70 k=33 sum_batches=0 scaled=0 -> s08a_s7a5_unal",
             "homura: gemm f32 NN batch=1 m=65 n=70 k=33 sum_batches=0 scaled=1 -> s08a_s7a5_unal",
             "homura: gemm f32 NN batch=1 m=4 n=70 k=33 sum_batches=0 scaled=0 -> s08a_s7a5_unal",
+            "homura: gemm f16 NN batch=1 m=65 n=70 k=33 sum_batches=0 scaled=0 -> h06c_4a",
+            "homura: gemm bf16 NT batch=1 m=16 n=32 k=256 sum_batches=0 scaled=0 -> h06ntw32",
+            "homura: gemm f16 NN batch=1 m=1 n=4096 k=4096 sum_batches=0 scaled=0 -> h06w1_narrow",
+            "homura: gemm bf16 NN batch=1 m=128 n=256 k=512 sum_batches=0 scaled=0 -> h06nng_4x",
         ]
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -768,6 +1033,124 @@ fn every_path_matches_the_cpu() {
     }
 }
 
+/// The H series' paths (`HMR_GEMM_H*` in csrc/homura_rocm.h): the layout they take and the
+/// multiples of (M, K, N) they need (`None`: any shape).
+const H_PATHS: [(i32, &str, &str, Option<[usize; 3]>); 21] = [
+    (11, "h04a", "NN", Some([128, 32, 128])),
+    (12, "h06ntn_4a", "NT", Some([128, 32, 128])),
+    (13, "h06tn_4a", "TN", Some([128, 32, 128])),
+    (14, "h06c_4a", "NN", None),
+    (15, "h06fk_nt4a", "NT", None),
+    (16, "h06fk_tn4a", "TN", None),
+    (17, "h02g_g4l", "NN", Some([128, 32, 128])),
+    (18, "h02n256", "NN", Some([128, 32, 256])),
+    (19, "h06tn_n256", "TN", Some([128, 32, 256])),
+    (20, "h06c_n256", "NN", None),
+    (21, "h06fk_tn256", "TN", None),
+    (22, "h06ntk_n256", "NT", Some([128, 64, 256])),
+    (23, "h06fk_nt256", "NT", None),
+    (24, "h06nng_4x", "NN", Some([128, 32, 128])),
+    (25, "h06ntgp_4x", "NT", Some([128, 32, 128])),
+    (26, "h06tng_4x", "TN", Some([128, 32, 128])),
+    // Any M (TN classifies M = 1 as NN).
+    (27, "h06tngb_4x", "TN", Some([5, 32, 128])),
+    (28, "h06ntw32", "NT", Some([3, 256, 32])),
+    (29, "h06w1_narrow", "NN", None),
+    (30, "h06tz_4a", "TN", None),
+    (31, "h06fz_n256", "NT", None),
+];
+
+/// (M, K, N) for a tile multiple path: one tile with one K step, and several tiles and K steps.
+fn h_tiles([m, k, n]: [usize; 3]) -> Vec<[usize; 3]> {
+    vec![[m, k, n], [2 * m, 3 * k, 3 * n], [3 * m, 2 * k, n]]
+}
+
+/// (M, K, N) for the any-shape paths: single elements, partial tiles and K steps, one K step
+/// past a multiple, k odd (the last element of a factor read on its own), a whole tile.
+const H_EDGES: [[usize; 3]; 8] = [
+    [1, 1, 1],
+    [3, 5, 7],
+    [17, 31, 9],
+    [127, 33, 129],
+    [130, 40, 257],
+    [257, 65, 131],
+    [128, 32, 128],
+    [5, 2081, 3],
+];
+
+/// Every H path, forced, on shapes it takes, in F16 and BF16: exact products have the CPU's bits,
+/// rounded ones are within the GEMM class, and the scaled entries within theirs.
+#[test]
+fn every_half_path_matches_the_cpu() {
+    for dtype in [DType::F16, DType::BF16] {
+        let v = moderate(dtype);
+        let small = |n: usize, seed: u64| {
+            homura::manual_seed(seed);
+            homura::randint(-8, 9, [n]).to(dtype)
+        };
+        for (path, name, layout, tiles) in H_PATHS {
+            let mut shapes = tiles.map_or(H_EDGES.to_vec(), h_tiles);
+            if name == "h06w1_narrow" {
+                // M <= 16: one row, a K step, several slices with a tail, columns past a block.
+                shapes = vec![
+                    [1, 1, 1],
+                    [3, 64, 7],
+                    [16, 1001, 300],
+                    [5, 4096, 257],
+                    [9, 130, 513],
+                ];
+            }
+            for shape in shapes {
+                let [m, k, n] = shape;
+                // A 1 x 1 x 1 product has every layout; the library calls it NN.
+                if shape == [1, 1, 1] && layout != "NN" {
+                    continue;
+                }
+                for batch in [1, 3] {
+                    let what = format!("{name} {dtype} {shape:?} batch {batch}");
+                    let [(xc, xg), (yc, yg)] = factors(shape, batch, layout, &small);
+                    let got = {
+                        let _f = force(path);
+                        xg.matmul(&yg)
+                    };
+                    assert_same(&got, &xc.matmul(&yc), &format!("{what} exact"));
+                    let [(xc, xg), (yc, yg)] = factors(shape, batch, layout, &v);
+                    let abs3 = xc.abs().to(DType::F64).matmul(&yc.abs().to(DType::F64));
+                    let p3 = xc.matmul(&yc).to(DType::F64);
+                    let got = {
+                        let _f = force(path);
+                        xg.matmul(&yg)
+                    };
+                    check_gemm(&got, &xc.matmul(&yc), &abs3, k, &what);
+                    for (entry, f) in [ENTRIES[1], ENTRIES[3], ENTRIES[4]] {
+                        if entry == "addbmm" && batch > 1 {
+                            continue;
+                        }
+                        let shape_c = input_shape(entry, batch, m, n);
+                        let cc = v(shape_c.iter().product(), 14).reshape(shape_c.clone());
+                        let cg = cc.to(GPU);
+                        let (pa, p) = match entry {
+                            "addmm" => (abs3.select(0, 0), p3.select(0, 0)),
+                            "baddbmm" => (abs3.clone(), p3.clone()),
+                            _ => (abs3.sum_dim(0, false), p3.sum_dim(0, false)),
+                        };
+                        for (beta, alpha) in [(1.0, 1.0), (-0.5, 3.0), (0.0, 2.0)] {
+                            let (b, a) = (Scalar::Float(beta), Scalar::Float(alpha));
+                            let gpu = {
+                                let _f = force(path);
+                                f(&cg, &xg, &yg, b, a)
+                            };
+                            let cpu = f(&cc, &xc, &yc, b, a);
+                            let what = format!("{what} {entry} beta {beta} alpha {alpha}");
+                            check_scaled(&gpu, &cpu, &pa, &p, k, 1, (beta, alpha), &what);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A forced path that doesn't take the description is an error, not a wrong result.
 #[test]
 fn forced_paths_refuse_what_they_dont_take() {
@@ -838,6 +1221,85 @@ fn the_writeback_rounds_each_step() {
     assert_eq!(cpu.to_vec::<f64>(), [0.0]);
     let got = cd.to(GPU).addmm(&od.to(GPU), &od.to(GPU), e64, alpha64);
     assert_same(&got, &cpu, "f64");
+}
+
+/// Half precision: the writeback computes in f32 and rounds to the dtype once, a zero alpha
+/// doesn't skip the product (`0 * Inf` is NaN), and a long k of ones accumulates exactly in f32
+/// (an output left at zero would fail).
+#[test]
+fn half_products_round_once_in_f32() {
+    for dtype in [DType::F16, DType::BF16] {
+        // e is the dtype's epsilon: alpha * x = 1 + 2e + e^2 in f32, and the input's -(1 + 2e)
+        // leaves e^2; rounding alpha * x to the dtype first would leave 0.
+        let e = if dtype == DType::F16 {
+            2f64.powi(-10)
+        } else {
+            2f64.powi(-7)
+        };
+        let t = |v: f64| Tensor::from_slice(&[v], [1, 1]).to(dtype);
+        let (x, one, c) = (t(1.0 + e), t(1.0), t(-(1.0 + 2.0 * e)));
+        let cpu = c.addmm(&one, &x, 1, 1.0 + e);
+        assert_eq!(cpu.to(DType::F64).to_vec::<f64>(), [e * e], "{dtype}");
+        let inf = t(f64::INFINITY);
+        let nan = c.addmm(&inf, &one, 1, 0);
+        assert!(nan.to(DType::F64).to_vec::<f64>()[0].is_nan(), "{dtype}");
+        // The rules' path, and every H path that takes a 1 x 1 product (h06c_4a, h06c_n256,
+        // h06w1_narrow), forced.
+        for path in [-1, 14, 20, 29] {
+            let _f = force(path);
+            let gpu = c.to(GPU).addmm(&one.to(GPU), &x.to(GPU), 1, 1.0 + e);
+            assert_same(&gpu, &cpu, &format!("{dtype} writeback, path {path}"));
+            // A zero alpha computes the product: Inf gives NaN, as on the CPU.
+            let gpu = c.to(GPU).addmm(&inf.to(GPU), &one.to(GPU), 1, 0);
+            assert_same(&gpu, &nan, &format!("{dtype} alpha 0, path {path}"));
+        }
+        // addbmm adds the batches' f32 products in f64: [2^24, 1, -2^24] gives 1 (BF16 holds
+        // 2^24; in f32 the sum would be 0).
+        if dtype == DType::BF16 {
+            let b1 = Tensor::from_slice(&[16777216.0f32, 1.0, -16777216.0], [3, 1, 1]).to(dtype);
+            let b2 = homura::ones([3, 1, 1]).to(dtype);
+            let z = homura::zeros([1, 1]).to(dtype);
+            let cpu = z.addbmm(&b1, &b2, 1, 1);
+            assert_eq!(cpu.to(DType::F64).to_vec::<f64>(), [1.0]);
+            let gpu = z.to(GPU).addbmm(&b1.to(GPU), &b2.to(GPU), 1, 1);
+            assert_same(&gpu, &cpu, "addbmm cancellation");
+        }
+        // beta * c is rounded to f32 before alpha * p is added (no fused multiply-add): with
+        // c = 1 + 2^-7, beta = 1 + 2^-23 and alpha * p = -(1 + 2^-7 + 2^-23), the CPU gets 0, a
+        // fused one 2^-30 (BF16 has f32's exponents; F16 would flush it to zero).
+        if dtype == DType::BF16 {
+            let (b, a) = (
+                1.0 + 2f64.powi(-23),
+                -(1.0 + 2f64.powi(-7) + 2f64.powi(-23)),
+            );
+            let c = t(1.0 + 2f64.powi(-7));
+            let cpu = c.addmm(&one, &one, b, a);
+            assert_eq!(cpu.to(DType::F64).to_vec::<f64>(), [0.0]);
+            for path in [-1, 14, 20, 29] {
+                let _f = force(path);
+                let gpu = c.to(GPU).addmm(&one.to(GPU), &one.to(GPU), b, a);
+                assert_same(&gpu, &cpu, &format!("beta * c rounded, path {path}"));
+            }
+        }
+        // A sum past the dtype's range is infinite after the one rounding.
+        let big = t(300.0);
+        let cpu = big.matmul(&big);
+        let expected = if dtype == DType::F16 {
+            f64::INFINITY
+        } else {
+            90112.0
+        };
+        assert_eq!(cpu.to(DType::F64).to_vec::<f64>(), [expected], "{dtype}");
+        assert_same(&big.to(GPU).matmul(&big.to(GPU)), &cpu, "overflow");
+        // Ones over a long k: exactly k in f32, rounded to the dtype once (4097 to 4096).
+        for k in [1024, 2080, 4097] {
+            let a = homura::ones([5, k]).to((dtype, GPU));
+            let b = homura::ones([k, 7]).to((dtype, GPU));
+            let got = a.matmul(&b).to((DType::F64, Device::Cpu)).to_vec::<f64>();
+            let rounded = t(k as f64).to(DType::F64).item::<f64>();
+            assert_eq!(got, vec![rounded; 35], "{dtype} k {k}");
+        }
+    }
 }
 
 const ALL: [DType; 10] = [

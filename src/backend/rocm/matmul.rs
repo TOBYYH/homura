@@ -176,7 +176,7 @@ fn log(desc: &ffi::hmr_gemm_desc, dtype: DType, path: i32, layout: i32) {
     }
 }
 
-/// `out = gemm(g)`; F16 and BF16 are rejected before (`backend::gemm`).
+/// `out = gemm(g)`.
 #[track_caller]
 pub(crate) fn gemm(out: &TensorData, g: &Gemm) {
     let dtype = g.a.dtype;

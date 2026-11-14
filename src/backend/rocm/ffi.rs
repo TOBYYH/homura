@@ -206,6 +206,14 @@ unsafe extern "C" {
         a: *const hmr_tensor_desc,
         b: *const hmr_tensor_desc,
     ) -> hmr_status;
+    pub fn hmr_binary_constant(
+        ctx: hmr_context_t,
+        op: i32,
+        out: *const hmr_tensor_desc,
+        a: *const hmr_tensor_desc,
+        bits: u64,
+        constant_first: i32,
+    ) -> hmr_status;
     pub fn hmr_binary_scalar(
         ctx: hmr_context_t,
         op: i32,

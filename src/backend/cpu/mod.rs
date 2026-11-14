@@ -465,6 +465,25 @@ pub(crate) fn binary(op: BinaryOp, out: &TensorData, a: &TensorData, b: &TensorD
     }
 }
 
+/// `out = op(a, c)`, or `op(c, a)` if `constant_first`, with `c` the value converted to `a`'s
+/// dtype as [`fill`] converts it: [`binary`] with a tensor of that value broadcast to `a`'s shape.
+pub(crate) fn binary_constant(
+    op: BinaryOp,
+    out: &TensorData,
+    a: &TensorData,
+    value: Scalar,
+    constant_first: bool,
+) {
+    let c = crate::Tensor::uninit_on(crate::Shape::scalar(), a.dtype, crate::Device::Cpu).data();
+    fill(&c, value);
+    let c = c.expand_to(&a.layout.shape);
+    if constant_first {
+        binary(op, out, &c, a)
+    } else {
+        binary(op, out, a, &c)
+    }
+}
+
 /// `out = a * s`, `a / s` or `s / a` (`scalar_first`) for `Mul` and `Div` of a floating point
 /// `a`, with the scalar `s` converted to the computation type of `a`'s dtype instead of to the
 /// dtype itself, as in PyTorch's CPU kernels: `f16` and `bf16` are multiplied or divided by the

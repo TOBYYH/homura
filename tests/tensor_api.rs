@@ -680,3 +680,21 @@ fn stepped_ranges_at_the_limits_of_their_type() {
         )
     );
 }
+
+#[test]
+fn half_precision_products_keep_a_scalar_in_f32() {
+    // PyTorch 2.14.1: `x * (1/3)` keeps the scalar in f32 (rounding it to the dtype first gives
+    // 2.33203125 for f16 and 2.34375 for bf16); `+` and `-` round it to the dtype.
+    let exact = |t: &Tensor| t.to(DType::F64).to_vec::<f64>();
+    for (dtype, mul, add, sub) in [
+        (DType::F16, 2.333984375, 7.33203125, 6.66796875),
+        (DType::BF16, 2.328125, 7.34375, 6.65625),
+    ] {
+        let x = homura::full([1], 7.0).to(dtype);
+        let s = 1.0 / 3.0;
+        assert_eq!(exact(&x.mul(s)), [mul], "{dtype} x * s");
+        assert_eq!(exact(&(s / &x)), [0.047607421875], "{dtype} s / x");
+        assert_eq!(exact(&x.add(s)), [add], "{dtype} x + s");
+        assert_eq!(exact(&x.sub(s)), [sub], "{dtype} x - s");
+    }
+}

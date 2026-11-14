@@ -1,5 +1,5 @@
 //! Elementwise kernels on ROCm (`csrc/elementwise.hip`): the counterparts of the CPU backend's
-//! `unary`, `binary`, `binary_scalar`, `fused`, `addr`, `where_`, `triangle` and `flip`, with the same
+//! `unary`, `binary`, `binary_constant`, `binary_scalar`, `fused`, `addr`, `where_`, `triangle` and `flip`, with the same
 //! arguments and the same results (bitwise, except for the device library's transcendental
 //! functions, see `csrc/elementwise.hip`).
 //!
@@ -7,8 +7,9 @@
 //! the lock's closure, where `#[track_caller]` still names the caller (review round 124, R149).
 
 use super::context::exec;
-use super::copy::{buffer, descs, descs_with_dims, device_index};
+use super::copy::{buffer, descs, descs_with_dims, device_index, scalar_bits};
 use super::{call, expect, ffi};
+use crate::Scalar;
 use crate::backend::cpu::{FloatElement, dispatch_float};
 use crate::backend::{Fused, Outer};
 use crate::ops::{BinaryOp, UnaryOp};
@@ -103,6 +104,28 @@ pub(crate) fn binary(op: BinaryOp, out: &TensorData, a: &TensorData, b: &TensorD
     // SAFETY: as in `unary`.
     run("binary", out, |ctx| unsafe {
         ffi::hmr_binary(ctx, binary_code(op), &o, &x, &y)
+    });
+}
+
+/// `out = op(a, c)`, or `op(c, a)` if `constant_first`, with `c` the value converted to `a`'s
+/// dtype as `fill` converts it, as `cpu::binary_constant`: the kernel of `binary` with the other
+/// operand fixed, so no tensor for the scalar.
+#[track_caller]
+pub(crate) fn binary_constant(
+    op: BinaryOp,
+    out: &TensorData,
+    a: &TensorData,
+    value: Scalar,
+    constant_first: bool,
+) {
+    check_shape(out, a);
+    let bits = scalar_bits(value, a.dtype);
+    let Some([o, x]) = checked("binary_constant", [out, a]) else {
+        return;
+    };
+    // SAFETY: as in `unary`.
+    run("binary_constant", out, |ctx| unsafe {
+        ffi::hmr_binary_constant(ctx, binary_code(op), &o, &x, bits, constant_first as i32)
     });
 }
 

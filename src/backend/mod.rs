@@ -309,6 +309,19 @@ pub(crate) fn binary(op: BinaryOp, out: &TensorData, a: &TensorData, b: &TensorD
     dispatch_rocm!(out, binary(op, out, a, b))
 }
 
+/// `out = op(a, c)`, or `op(c, a)` if `constant_first`, with `c` the value converted to `a`'s
+/// dtype as [`fill`] converts it.
+#[track_caller]
+pub(crate) fn binary_constant(
+    op: BinaryOp,
+    out: &TensorData,
+    a: &TensorData,
+    value: Scalar,
+    constant_first: bool,
+) {
+    dispatch_rocm!(out, binary_constant(op, out, a, value, constant_first))
+}
+
 #[track_caller]
 pub(crate) fn binary_scalar(
     op: BinaryOp,

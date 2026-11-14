@@ -1,5 +1,5 @@
-// Elementwise kernels: unary and binary ops, binary ops with a scalar, the optimizers' fused
-// steps, addr's outer product, where, triangle and flip.
+// Elementwise kernels: unary and binary ops, binary ops with a constant or a scalar, the
+// optimizers' fused steps, addr's outer product, where, triangle and flip.
 //
 // They compute what the CPU reference backend computes (src/backend/cpu/mod.rs), operation by
 // operation in the same order: floating point math in f32 for F16, BF16 and F32 and in f64 for
@@ -9,6 +9,7 @@
 // are bitwise equal; exp, log, sin, cos, tanh, log1p and pow come from the device library and
 // may differ from the CPU's libm in the last place.
 #include <cmath>
+#include <cstring>
 #include <tuple>
 #include <utility>
 
@@ -566,10 +567,19 @@ bool unary(int op, const Operands<2> &ops, int64_t n, hipStream_t s) {
     });
 }
 
-bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
-    int dtype = ops.d[1].dtype;
-    int out = ops.d[0].dtype;
-    if (ops.d[2].dtype != dtype) return false;
+// The kernel of a binary op: its functor, output element and operand element.
+template <class F_, class O_, class T_>
+struct BinaryKernel {
+    using F = F_;
+    using O = O_;
+    using T = T_;
+};
+
+// Calls `launch(BinaryKernel<...>{})` with the functor of `op` for operands of `dtype` and an
+// output of `out`, as hmr_binary and hmr_binary_constant share it; false for a combination
+// cpu::binary doesn't support.
+template <class L>
+bool binary_kernel(int op, int dtype, int out, L &&launch) {
     if (op >= HMR_BINARY_GREATER && op <= HMR_BINARY_NOT_EQUAL) {
         if (out != HMR_BOOL) return false;
         return select(dtype, AllDtypes{}, [&](auto t) {
@@ -581,7 +591,7 @@ bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
                                                     HMR_BINARY_NOT_EQUAL>{},
                           [&](auto o) {
                               constexpr int OP = decltype(o)::v;
-                              return launch_map<Compare<OP, DT>, uint8_t, T, T>(ops, n, {}, s);
+                              return launch(BinaryKernel<Compare<OP, DT>, uint8_t, T>{});
                           });
         });
     }
@@ -589,16 +599,16 @@ bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
     if (op == HMR_BINARY_LOGICAL_AND || op == HMR_BINARY_LOGICAL_OR) {
         if (dtype != HMR_BOOL) return false;
         if (op == HMR_BINARY_LOGICAL_OR) {
-            return launch_map<BoolBinary<true>, uint8_t, uint8_t, uint8_t>(ops, n, {}, s);
+            return launch(BinaryKernel<BoolBinary<true>, uint8_t, uint8_t>{});
         }
-        return launch_map<BoolBinary<false>, uint8_t, uint8_t, uint8_t>(ops, n, {}, s);
+        return launch(BinaryKernel<BoolBinary<false>, uint8_t, uint8_t>{});
     }
     if (dtype == HMR_BOOL) {
         if (op == HMR_BINARY_ADD || op == HMR_BINARY_MAXIMUM) {
-            return launch_map<BoolBinary<true>, uint8_t, uint8_t, uint8_t>(ops, n, {}, s);
+            return launch(BinaryKernel<BoolBinary<true>, uint8_t, uint8_t>{});
         }
         if (op == HMR_BINARY_MUL || op == HMR_BINARY_MINIMUM) {
-            return launch_map<BoolBinary<false>, uint8_t, uint8_t, uint8_t>(ops, n, {}, s);
+            return launch(BinaryKernel<BoolBinary<false>, uint8_t, uint8_t>{});
         }
         return false;
     }
@@ -610,7 +620,7 @@ bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
             using T = typename Elem<DT>::T;
             return select(op, IntOps{}, [&](auto o) {
                 constexpr int OP = decltype(o)::v;
-                return launch_map<IntBinary<OP, DT>, T, T, T>(ops, n, {}, s);
+                return launch(BinaryKernel<IntBinary<OP, DT>, T, T>{});
             });
         });
     }
@@ -619,8 +629,50 @@ bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
         using T = typename Elem<DT>::T;
         return select(op, std::make_integer_sequence<int, HMR_BINARY_GREATER>{}, [&](auto o) {
             constexpr int OP = decltype(o)::v;
-            return launch_map<FloatBinary<OP, DT>, T, T, T>(ops, n, {}, s);
+            return launch(BinaryKernel<FloatBinary<OP, DT>, T, T>{});
         });
+    });
+}
+
+bool binary(int op, const Operands<3> &ops, int64_t n, hipStream_t s) {
+    int dtype = ops.d[1].dtype;
+    if (ops.d[2].dtype != dtype) return false;
+    return binary_kernel(op, dtype, ops.d[0].dtype, [&](auto k) {
+        using K = decltype(k);
+        return launch_map<typename K::F, typename K::O, typename K::T, typename K::T>(ops, n, {},
+                                                                                       s);
+    });
+}
+
+// A binary functor with one operand fixed: f(c, x) if FIRST, else f(x, c).
+template <class F, class T, bool FIRST>
+struct WithConstant {
+    F f;
+    T c;
+    __device__ auto operator()(T x) const {
+        if constexpr (FIRST) {
+            return f(c, x);
+        } else {
+            return f(x, c);
+        }
+    }
+};
+
+// binary with `b` (or, if `constant_first`, `a`) every element equal to the element whose bits
+// are the low bytes of `bits`: the same functor on the same elements, so the same results.
+bool binary_constant(int op, const Operands<2> &ops, int64_t n, uint64_t bits,
+                     bool constant_first, hipStream_t s) {
+    return binary_kernel(op, ops.d[1].dtype, ops.d[0].dtype, [&](auto k) {
+        using K = decltype(k);
+        using T = typename K::T;
+        T c;
+        std::memcpy(&c, &bits, sizeof(T));  // the low bytes on a little-endian host
+        if (constant_first) {
+            WithConstant<typename K::F, T, true> f{{}, c};
+            return launch_map<decltype(f), typename K::O, T>(ops, n, f, s);
+        }
+        WithConstant<typename K::F, T, false> f{{}, c};
+        return launch_map<decltype(f), typename K::O, T>(ops, n, f, s);
     });
 }
 
@@ -896,6 +948,19 @@ hmr_status hmr_binary(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
         if (n == 0) return HMR_OK;
         return hmr::launch_on(ctx, "binary", [&](hipStream_t s) {
             return hmr::binary(op, ops, n, s);
+        });
+    });
+}
+
+hmr_status hmr_binary_constant(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
+                               const hmr_tensor_desc *a, uint64_t bits, int32_t constant_first) {
+    return guarded([&] {
+        hmr::Operands<2> ops{{*out, *a}};
+        int64_t n = 0;
+        if (hmr_status s = hmr::check_operands(ops, n)) return s;
+        if (n == 0) return HMR_OK;
+        return hmr::launch_on(ctx, "binary_constant", [&](hipStream_t s) {
+            return hmr::binary_constant(op, ops, n, bits, constant_first != 0, s);
         });
     });
 }

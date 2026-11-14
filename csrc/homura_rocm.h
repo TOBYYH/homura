@@ -206,6 +206,12 @@ hmr_status hmr_unary(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
 hmr_status hmr_binary(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
                       const hmr_tensor_desc *a, const hmr_tensor_desc *b);
 
+/* out = op(a, c), or op(c, a) if constant_first, as hmr_binary with every element of the other
+ * operand equal to c: the element of a's dtype whose bytes are the low bytes of `bits` (as in
+ * hmr_fill). */
+hmr_status hmr_binary_constant(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,
+                               const hmr_tensor_desc *a, uint64_t bits, int32_t constant_first);
+
 /* out = a * s, a / s or (scalar_first) s / a for a floating point `a`, with `s` rounded to the
  * computation type (f32 for F16, BF16 and F32). Only HMR_BINARY_MUL and HMR_BINARY_DIV. */
 hmr_status hmr_binary_scalar(hmr_context_t ctx, int32_t op, const hmr_tensor_desc *out,

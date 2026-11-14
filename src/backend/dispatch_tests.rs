@@ -23,7 +23,7 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 36] = [
+const IMPLEMENTED: [&str; 37] = [
     "write_host",
     "read_host",
     "copy",
@@ -32,6 +32,7 @@ const IMPLEMENTED: [&str; 36] = [
     "download",
     "unary",
     "binary",
+    "binary_constant",
     "binary_scalar",
     "fused",
     "where_",
@@ -109,8 +110,10 @@ fn elementwise() {
     reaches("unary", || gpu(&[2]).exp());
     // Integers are promoted to the default float dtype: the cast (`cast_data`) comes first.
     reaches("copy", || crate::zeros_with([2], (DType::I64, GPU)).exp());
-    // A scalar operand of a non-zero value is made on the device (`scalar_data`) first.
-    reaches("fill", || gpu(&[2]).add(1.5));
+    // A scalar operand reaches the kernel as a constant, without a tensor of its own.
+    reaches("binary_constant", || gpu(&[2]).add(1.5));
+    reaches("binary_constant", || 1.5 - gpu(&[2]));
+    reaches("binary_constant", || gpu(&[2]).greater(0));
     reaches("binary", || gpu(&[2]).add(gpu(&[2])));
     // Half precision products keep a scalar operand in f32.
     reaches("binary_scalar", || {

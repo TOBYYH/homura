@@ -250,14 +250,11 @@ pub(crate) fn try_copy(dst: &TensorData, src: &TensorData) -> Result<(), Failure
     })
 }
 
-/// Sets every element of `dst` to `value`, converted as the CPU's `fill` converts it, or returns
-/// why the device didn't queue the fill (nothing was written then).
+/// `value` converted to `dtype` as the CPU's `fill` converts it, its bytes in the low bytes of
+/// the result (as `hmr_fill` and `hmr_binary_constant` read it).
 #[track_caller]
-pub(crate) fn try_fill(dst: &TensorData, value: Scalar) -> Result<(), Failure> {
-    let Some([d]) = descs("fill", [dst])? else {
-        return Ok(());
-    };
-    let bits = dispatch_all!(dst.dtype, T => {
+pub(crate) fn scalar_bits(value: Scalar, dtype: DType) -> u64 {
+    dispatch_all!(dtype, T => {
         let v = T::from_scalar(value);
         let mut bits = [0u8; 8];
         // SAFETY: `T` is at most 8 bytes and has no padding.
@@ -269,7 +266,17 @@ pub(crate) fn try_fill(dst: &TensorData, value: Scalar) -> Result<(), Failure> {
             )
         };
         u64::from_le_bytes(bits)
-    });
+    })
+}
+
+/// Sets every element of `dst` to `value`, converted as the CPU's `fill` converts it, or returns
+/// why the device didn't queue the fill (nothing was written then).
+#[track_caller]
+pub(crate) fn try_fill(dst: &TensorData, value: Scalar) -> Result<(), Failure> {
+    let Some([d]) = descs("fill", [dst])? else {
+        return Ok(());
+    };
+    let bits = scalar_bits(value, dst.dtype);
     let ctx = buffer("fill", dst).context();
     exec(device_index(dst), || ctx.fill(&d, bits))
 }

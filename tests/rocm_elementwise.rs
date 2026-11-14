@@ -7,7 +7,7 @@
 #[path = "common/rocm.rs"]
 mod rocm;
 
-use homura::{DType, GeluApproximate, Tensor};
+use homura::{DType, GeluApproximate, Scalar, Tensor};
 use rocm::{
     DTYPES, GPU, Pair, UlpStats, Words, assert_bitwise, check_transcendental, floats,
     large_layouts, layouts, pow2, ulp, unit_roundoff, values,
@@ -356,6 +356,140 @@ fn scalar_operands_are_bitwise() {
                 }
             }
         }
+    }
+}
+
+/// `f`'s result, or `None` if it panics (the panic hook is silenced meanwhile).
+fn unless_it_panics(f: impl FnOnce() -> Tensor + std::panic::UnwindSafe) -> Option<Tensor> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(f).ok();
+    std::panic::set_hook(hook);
+    r
+}
+
+#[test]
+fn every_binary_op_with_a_scalar_is_bitwise() {
+    // The scalar reaches the kernel as a constant of the dtype (hmr_binary_constant), except in
+    // F16 and BF16 products and quotients (binary_scalar). Integers beyond the dtype wrap, the
+    // last one rounds differently to f32 directly and through f64 (round 140), and float scalars
+    // promote integer and bool tensors.
+    let scalars = [
+        Scalar::Int(0),
+        Scalar::Int(3),
+        Scalar::Int(-1),
+        Scalar::Int(300),
+        Scalar::Int(-129),
+        Scalar::Int(i64::MAX),
+        Scalar::Int(i64::MIN),
+        Scalar::Int((1 << 62) + (1 << 38) + 1),
+        Scalar::Float(2.5),
+        Scalar::Float(1.0 / 3.0),
+        Scalar::Float(-0.0),
+        Scalar::Float(f64::NAN),
+        Scalar::Float(f64::NEG_INFINITY),
+        Scalar::Float(1e300),
+        Scalar::Bool(true),
+        Scalar::Bool(false),
+    ];
+    type Op = fn(&Tensor, Scalar) -> Tensor;
+    let ops: [(&str, Op); 19] = [
+        ("add", |a, s| a.add(s)),
+        ("sub", |a, s| a.sub(s)),
+        ("mul", |a, s| a.mul(s)),
+        ("div", |a, s| a.div(s)),
+        ("pow", |a, s| a.pow(s)),
+        ("maximum", |a, s| a.maximum(s)),
+        ("minimum", |a, s| a.minimum(s)),
+        ("greater", |a, s| a.greater(s)),
+        ("greater_equal", |a, s| a.greater_equal(s)),
+        ("less", |a, s| a.less(s)),
+        ("less_equal", |a, s| a.less_equal(s)),
+        ("equal", |a, s| a.equal(s)),
+        ("not_equal", |a, s| a.not_equal(s)),
+        ("logical_and", |a, s| a.logical_and(s)),
+        ("logical_or", |a, s| a.logical_or(s)),
+        // The scalar first.
+        ("s + a", |a, s| {
+            scalar_first(s, a, |x, a| x + a, |x, a| x + a)
+        }),
+        ("s - a", |a, s| {
+            scalar_first(s, a, |x, a| x - a, |x, a| x - a)
+        }),
+        ("s * a", |a, s| {
+            scalar_first(s, a, |x, a| x * a, |x, a| x * a)
+        }),
+        ("s / a", |a, s| {
+            scalar_first(s, a, |x, a| x / a, |x, a| x / a)
+        }),
+    ];
+    let mut checked = 0;
+    for dtype in DTYPES {
+        for p in layouts(dtype, 21) {
+            for s in scalars {
+                for (name, f) in ops {
+                    let what = format!("{name} {dtype} {} with {s:?}", p.name);
+                    let cpu = unless_it_panics(|| f(&p.cpu, s));
+                    let gpu = unless_it_panics(|| f(&p.gpu, s));
+                    match (gpu, cpu) {
+                        // Float powers come from the device library (transcendental class):
+                        // against the GPU's tensor-tensor kernel, with the scalar as a tensor
+                        // of the computation type.
+                        (Some(gpu), Some(cpu))
+                            if name == "pow" && cpu.dtype().is_floating_point() =>
+                        {
+                            let dtype = cpu.dtype();
+                            let base = p.gpu.to(dtype);
+                            let e = match s {
+                                Scalar::Bool(v) => Tensor::from_slice(&[v], [1]),
+                                Scalar::Int(v) => Tensor::from_slice(&[v], [1]),
+                                Scalar::Float(v) => Tensor::from_slice(&[v], [1]),
+                            };
+                            let e = e.to(dtype).to(GPU).reshape(()).expand(base.shape());
+                            assert_bitwise(&gpu, &base.pow(&e), &what);
+                            checked += 1;
+                        }
+                        (Some(gpu), Some(cpu)) => {
+                            assert_bitwise(&gpu, &cpu, &what);
+                            checked += 1;
+                        }
+                        (None, None) => {}
+                        (gpu, _) => {
+                            panic!("{what}: panics on one device only ({:?})", gpu.is_none())
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 20_000, "{checked} results compared");
+    // Long contiguous half precision tensors, whose kernels read four elements at a time.
+    for dtype in [DType::F16, DType::BF16] {
+        for p in large_layouts(dtype, 22) {
+            for (name, f) in [ops[0], ops[1], ops[7], ops[16]] {
+                let what = format!("{name} {dtype} {}", p.name);
+                assert_bitwise(
+                    &f(&p.gpu, Scalar::Float(0.1)),
+                    &f(&p.cpu, Scalar::Float(0.1)),
+                    &what,
+                );
+            }
+        }
+    }
+}
+
+/// `int(s, a)` or `float(s, a)` for an integer or float `s`. Bool scalars have no operators with
+/// the scalar first: they panic, and the test skips them.
+fn scalar_first(
+    s: Scalar,
+    a: &Tensor,
+    int: fn(i64, &Tensor) -> Tensor,
+    float: fn(f64, &Tensor) -> Tensor,
+) -> Tensor {
+    match s {
+        Scalar::Int(v) => int(v, a),
+        Scalar::Float(v) => float(v, a),
+        Scalar::Bool(_) => panic!("no operator with a bool scalar first"),
     }
 }
 

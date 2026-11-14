@@ -561,6 +561,87 @@ fn where_and_masked_fill_are_bitwise() {
     }
 }
 
+#[test]
+fn where_and_masked_fill_with_scalars_are_bitwise() {
+    // A scalar branch reaches the kernel as a constant of the result's dtype
+    // (hmr_where_constant): in either position, both, and as masked_fill's value, which keeps
+    // the dtype of `self`. Integers beyond the dtype wrap (where) or panic (masked_fill), and
+    // the last one rounds differently to f32 directly and through f64.
+    let scalars = [
+        Scalar::Int(0),
+        Scalar::Int(-1),
+        Scalar::Int(300),
+        Scalar::Int(i64::MAX),
+        Scalar::Int(i64::MIN),
+        Scalar::Int((1 << 62) + (1 << 38) + 1),
+        Scalar::Float(2.5),
+        Scalar::Float(1.0 / 3.0),
+        Scalar::Float(-0.0),
+        Scalar::Float(f64::NAN),
+        Scalar::Float(f64::NEG_INFINITY),
+        Scalar::Float(1e300),
+        Scalar::Bool(true),
+    ];
+    type Op = fn(&Tensor, &Tensor, Scalar) -> Tensor;
+    let ops: [(&str, Op); 5] = [
+        ("where(c, x, s)", |c, x, s| homura::where_(c, x, s)),
+        ("where(c, s, x)", |c, x, s| homura::where_(c, s, x)),
+        ("where(c, s, 7)", |c, _, s| homura::where_(c, s, 7)),
+        ("where(c, -0.5, s)", |c, _, s| homura::where_(c, -0.5, s)),
+        ("masked_fill", |c, x, s| x.masked_fill(c, s)),
+    ];
+    let mut checked = 0;
+    for dtype in DTYPES {
+        for (p, c) in layouts(dtype, 40).iter().zip(&layouts(DType::Bool, 41)) {
+            for s in scalars {
+                for (name, f) in ops {
+                    let what = format!("{name} {dtype} {} with {s:?}", p.name);
+                    let cpu = unless_it_panics(|| f(&c.cpu, &p.cpu, s));
+                    let gpu = unless_it_panics(|| f(&c.gpu, &p.gpu, s));
+                    match (gpu, cpu) {
+                        (Some(gpu), Some(cpu)) => {
+                            assert_bitwise(&gpu, &cpu, &what);
+                            checked += 1;
+                        }
+                        (None, None) => {}
+                        (gpu, _) => {
+                            panic!("{what}: panics on one device only ({:?})", gpu.is_none())
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 5_000, "{checked} results compared");
+    // Every offset and tail of the contiguous paths, and past one round of the launch grid.
+    for dtype in [DType::U8, DType::F16, DType::F64] {
+        let (a, m) = (values(dtype, 16, 42), values(DType::Bool, 16, 43));
+        let (ag, mg) = (a.to(GPU), m.to(GPU));
+        for offset in 0..=4 {
+            for len in 0..=9 {
+                let what = format!("{dtype} offset {offset} length {len}");
+                let (x, c) = (a.narrow(0, offset, len), m.narrow(0, offset, len));
+                let (xg, cg) = (ag.narrow(0, offset, len), mg.narrow(0, offset, len));
+                for (name, f) in ops {
+                    let s = Scalar::Int(5);
+                    assert_bitwise(&f(&cg, &xg, s), &f(&c, &x, s), &format!("{name} {what}"));
+                }
+            }
+        }
+    }
+    for dtype in [DType::F16, DType::BF16] {
+        let c = values(DType::Bool, (1 << 24) + 1000, 44);
+        let cg = c.to(GPU);
+        for p in large_layouts(dtype, 45) {
+            for (name, f) in ops {
+                let what = format!("{name} {dtype} {}", p.name);
+                let s = Scalar::Float(0.1);
+                assert_bitwise(&f(&cg, &p.gpu, s), &f(&c, &p.cpu, s), &what);
+            }
+        }
+    }
+}
+
 /// The panic message of `f`.
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let e = std::panic::catch_unwind(f).expect_err("expected a panic");

@@ -1029,7 +1029,16 @@ fn scalar_fills_check_overflow_like_pytorch() {
             Device::Meta
         );
         let meta_mask = homura::ones_with([2], (DType::Bool, Device::Meta));
-        assert_eq!(meta.masked_fill(&meta_mask, value).device(), Device::Meta);
+        let filled = meta.masked_fill(&meta_mask, value);
+        assert_eq!(filled.device(), Device::Meta);
+        // The value is not converted on Meta, and the result still keeps the dtype of `self`
+        // (a Bool tensor filled with a float stays Bool), as in PyTorch.
+        assert_eq!(filled.dtype(), dtype, "meta masked_fill {what}");
+        assert_eq!(
+            meta.masked_fill_(&meta_mask, value).dtype(),
+            dtype,
+            "meta masked_fill_ {what}"
+        );
     }
 
     // `full` without a dtype converts floats to the default dtype.

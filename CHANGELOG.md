@@ -39,11 +39,11 @@ All notable changes to this project are documented in this file. The format is b
   sin, cos, tanh, erf, pow and the functions built from them, which use the GPU's math library and
   may differ in the last places (relative to their largest intermediate value, so more where they
   cancel, as gelu does for large negative inputs). A scalar operand (`x + 2`, `x > 0`,
-  `clamp_min(0)`) goes to the kernel as a constant, without a tensor of its own; a single element
-  broadcast against the other operands (a 0-dimensional tensor, `masked_fill`'s value,
-  `expand(...).contiguous()`) is read once, so contiguous operands keep their vector loads. The
-  steps of `Sgd`, `Adam` and `AdamW` on GPU parameters give the CPU's (and PyTorch's) bits, with
-  the coefficient checks of the CPU.
+  `clamp_min(0)`, `where_(c, x, 0.0)`, `masked_fill(m, 0.0)`) goes to the kernel as a constant,
+  without a tensor of its own; a single element broadcast against the other operands (a
+  0-dimensional tensor, `masked_fill`'s tensor value, `expand(...).contiguous()`) is read once,
+  so contiguous operands keep their vector loads. The steps of `Sgd`, `Adam` and `AdamW` on GPU
+  parameters give the CPU's (and PyTorch's) bits, with the coefficient checks of the CPU.
 - Random sampling on ROCm GPUs runs there with the same generator: `rand`, `uniform_`,
   `randint` and `dropout` give the CPU's samples bit for bit for the same seed, also when calls
   on both devices alternate; `randn` and `normal_` use the GPU's log, cos and sin.

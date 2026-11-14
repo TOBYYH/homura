@@ -575,3 +575,26 @@ pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &Te
         map3::<bool, T, T, T>(out, cond, x, y, |c, a, b| if c { a } else { b })
     });
 }
+
+/// A branch of [`where_constant`]: a tensor of the output's shape and dtype, or a value
+/// converted to the output's dtype as [`fill`] converts it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Branch<'a> {
+    Tensor(&'a TensorData),
+    Constant(Scalar),
+}
+
+/// `out = cond ? x : y` with a branch that may be a constant: [`where_`] with a tensor of that
+/// value broadcast to the output's shape.
+pub(crate) fn where_constant(out: &TensorData, cond: &TensorData, x: Branch, y: Branch) {
+    let data = |b: Branch| match b {
+        Branch::Tensor(t) => t.clone(),
+        Branch::Constant(value) => {
+            let c = crate::Tensor::uninit_on(crate::Shape::scalar(), out.dtype, crate::Device::Cpu)
+                .data();
+            fill(&c, value);
+            c.expand_to(&out.layout.shape)
+        }
+    };
+    where_(out, cond, &data(x), &data(y))
+}

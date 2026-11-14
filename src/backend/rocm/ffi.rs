@@ -250,6 +250,15 @@ unsafe extern "C" {
         x: *const hmr_tensor_desc,
         y: *const hmr_tensor_desc,
     ) -> hmr_status;
+    pub fn hmr_where_constant(
+        ctx: hmr_context_t,
+        out: *const hmr_tensor_desc,
+        cond: *const hmr_tensor_desc,
+        x: *const hmr_tensor_desc,
+        x_bits: u64,
+        y: *const hmr_tensor_desc,
+        y_bits: u64,
+    ) -> hmr_status;
     pub fn hmr_triangle(
         ctx: hmr_context_t,
         out: *const hmr_tensor_desc,

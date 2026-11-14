@@ -165,30 +165,53 @@ pub fn where_(condition: &Tensor, x: impl Into<Operand>, y: impl Into<Operand>) 
             cond.dtype
         );
     }
-    let (x_operand, y_operand) = (x.into(), y.into());
-    let (x, y) = (Resolved::new(&x_operand), Resolved::new(&y_operand));
+    let (x, y) = (x.into(), y.into());
+    let mut rt = ResultType::new();
+    Resolved::new(&x).add_to(&mut rt);
+    Resolved::new(&y).add_to(&mut rt);
+    select(condition, &x, &y, rt.result())
+}
+
+/// [`where_`] with the result's dtype given (`masked_fill` keeps the dtype of `self`): a tensor
+/// operand is converted to it, a scalar one is passed to the kernel as a constant of it, without
+/// a tensor of its own.
+#[track_caller]
+fn select(condition: &Tensor, x_operand: &Operand, y_operand: &Operand, dtype: DType) -> Tensor {
+    let cond = condition.data();
+    let (x, y) = (Resolved::new(x_operand), Resolved::new(y_operand));
     let mut devices = vec![&cond];
     devices.extend(x.tensor());
     devices.extend(y.tensor());
     let device = common_device(devices);
-    let mut rt = ResultType::new();
-    x.add_to(&mut rt);
-    y.add_to(&mut rt);
-    let dtype = rt.result();
     let shape = broadcast_shapes(
         &broadcast_shapes(&cond.layout.shape, &x.shape()),
         &y.shape(),
     );
     let out = Tensor::uninit_on(shape.clone(), dtype, device);
     if device != Device::Meta {
-        backend::where_(
-            &out.data(),
-            &cond.expand_to(&shape),
-            &x.materialize(dtype, device, &shape),
-            &y.materialize(dtype, device, &shape),
-        );
+        let cond = cond.expand_to(&shape);
+        match (&x, &y) {
+            (Resolved::Tensor(_), Resolved::Tensor(_)) => backend::where_(
+                &out.data(),
+                &cond,
+                &x.materialize(dtype, device, &shape),
+                &y.materialize(dtype, device, &shape),
+            ),
+            _ => {
+                let data = |r: &Resolved| r.tensor().map(|_| r.materialize(dtype, device, &shape));
+                let (xd, yd) = (data(&x), data(&y));
+                fn branch<'a>(r: &Resolved, d: &'a Option<TensorData>) -> backend::Branch<'a> {
+                    match (r, d) {
+                        (Resolved::Tensor(_), Some(d)) => backend::Branch::Tensor(d),
+                        (Resolved::Scalar(s), _) => backend::Branch::Constant(*s),
+                        (Resolved::Tensor(_), None) => unreachable!("a tensor has its data"),
+                    }
+                }
+                backend::where_constant(&out.data(), &cond, branch(&x, &xd), branch(&y, &yd));
+            }
+        }
     }
-    crate::autograd::formulas::where_(condition, &x_operand, &y_operand, &out);
+    crate::autograd::formulas::where_(condition, x_operand, y_operand, &out);
     out
 }
 
@@ -417,22 +440,21 @@ impl Tensor {
     /// `masked_fill` rejects infinities and NaN for integer dtypes.
     #[track_caller]
     pub fn masked_fill(&self, mask: &Tensor, value: impl Into<Operand>) -> Tensor {
-        where_(mask, self.masked_fill_value(mask, value.into()), self)
+        let value = self.masked_fill_value(mask, value.into());
+        select(mask, &value, &Operand::Tensor(self.clone()), self.dtype())
     }
 
-    /// Checks the arguments of [`masked_fill`](Tensor::masked_fill) and returns `value` as a
-    /// zero-dimensional tensor of the dtype of `self`, converted with a recorded `to`.
+    /// Checks the arguments of [`masked_fill`](Tensor::masked_fill) and returns `value` for the
+    /// dtype of `self`: a scalar converted to it (a constant of the kernel), or a
+    /// zero-dimensional tensor converted with a recorded `to`.
     #[track_caller]
-    fn masked_fill_value(&self, mask: &Tensor, value: Operand) -> Tensor {
+    fn masked_fill_value(&self, mask: &Tensor, value: Operand) -> Operand {
         let m = mask.dtype();
         if m != DType::Bool {
             panic!("masked_fill only supports boolean masks, but got mask with dtype {m}");
         }
         match value {
-            Operand::Scalar(s) => {
-                let (dtype, device) = (self.dtype(), self.device());
-                Tensor::from_data(scalar_data(fill_value(s, dtype, device), dtype, device))
-            }
+            Operand::Scalar(s) => Operand::Scalar(fill_value(s, self.dtype(), self.device())),
             Operand::Tensor(t) => {
                 if t.num_dims() != 0 {
                     panic!(
@@ -442,11 +464,12 @@ impl Tensor {
                     );
                 }
                 // The value must fit the dtype like a scalar value (PyTorch reads it as one); it
-                // is still converted with a recorded `to`, so that it gets its gradient.
-                if t.device() != Device::Meta {
+                // is still converted with a recorded `to`, so that it gets its gradient. A value
+                // of the same dtype always fits: it isn't read (on a GPU, a read waits for it).
+                if t.device() != Device::Meta && t.dtype() != self.dtype() {
                     fill_value(scalar_value(&t), self.dtype(), self.device());
                 }
-                t.to(self.dtype())
+                Operand::Tensor(t.to(self.dtype()))
             }
         }
     }
@@ -458,7 +481,7 @@ impl Tensor {
         let begun = self.begin_in_place(&[Some(mask), tensor_of(&value)]);
         let computed = (self.masked_fill(mask, value.clone()), ());
         self.finish_in_place(begun, computed, false, |original, ()| {
-            let value = Operand::Tensor(self.masked_fill_value(mask, value.clone()));
+            let value = self.masked_fill_value(mask, value.clone());
             let original = Operand::Tensor(original.clone());
             crate::autograd::formulas::where_(mask, &value, &original, self)
         })

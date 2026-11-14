@@ -23,6 +23,7 @@ pub(crate) use context::{context, exec};
 pub(crate) use copy::{download, read_bytes, read_host, try_copy, try_fill, upload, write_host};
 pub(crate) use elementwise::{
     addr, binary, binary_constant, binary_scalar, flip, fused, triangle, unary, where_,
+    where_constant,
 };
 pub(crate) use index::{
     gather, index_add, index_overwrite, index_positions, index_select, mask_coordinates,

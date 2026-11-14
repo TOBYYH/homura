@@ -247,6 +247,13 @@ hmr_status hmr_addr(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_ten
 hmr_status hmr_where(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_tensor_desc *cond,
                      const hmr_tensor_desc *x, const hmr_tensor_desc *y);
 
+/* hmr_where with a constant branch: a null `x` (or `y`) is every element equal to the element of
+ * out's dtype whose bytes are the low bytes of `x_bits` (`y_bits`), as in hmr_fill. Either or
+ * both may be null. */
+hmr_status hmr_where_constant(hmr_context_t ctx, const hmr_tensor_desc *out,
+                              const hmr_tensor_desc *cond, const hmr_tensor_desc *x,
+                              uint64_t x_bits, const hmr_tensor_desc *y, uint64_t y_bits);
+
 /* out = src where the column minus the row index (the last two dimensions, ndim >= 2) is at
  * least (upper) or at most `diagonal`, else 0. */
 hmr_status hmr_triangle(hmr_context_t ctx, const hmr_tensor_desc *out,

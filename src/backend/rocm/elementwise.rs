@@ -1,5 +1,6 @@
 //! Elementwise kernels on ROCm (`csrc/elementwise.hip`): the counterparts of the CPU backend's
-//! `unary`, `binary`, `binary_constant`, `binary_scalar`, `fused`, `addr`, `where_`, `triangle` and `flip`, with the same
+//! `unary`, `binary`, `binary_constant`, `binary_scalar`, `fused`, `addr`, `where_`,
+//! `where_constant`, `triangle` and `flip`, with the same
 //! arguments and the same results (bitwise, except for the device library's transcendental
 //! functions, see `csrc/elementwise.hip`).
 //!
@@ -11,7 +12,7 @@ use super::copy::{buffer, descs, descs_with_dims, device_index, scalar_bits};
 use super::{call, expect, ffi};
 use crate::Scalar;
 use crate::backend::cpu::{FloatElement, dispatch_float};
-use crate::backend::{Fused, Outer};
+use crate::backend::{Branch, Fused, Outer};
 use crate::ops::{BinaryOp, UnaryOp};
 use crate::tensor::TensorData;
 
@@ -275,6 +276,44 @@ pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &Te
     run("where_", out, |ctx| unsafe {
         ffi::hmr_where(ctx, &o, &c, &a, &b)
     });
+}
+
+/// `out = cond ? x : y` with a branch that may be a constant, as `cpu::where_constant`: the
+/// constant is converted as `fill` converts it and passed to the kernel, so no tensor for it.
+#[track_caller]
+pub(crate) fn where_constant(out: &TensorData, cond: &TensorData, x: Branch, y: Branch) {
+    check_shape(out, cond);
+    let null = std::ptr::null::<ffi::hmr_tensor_desc>();
+    match (x, y) {
+        (Branch::Tensor(a), Branch::Tensor(b)) => where_(out, cond, a, b),
+        (Branch::Constant(v), Branch::Tensor(b)) | (Branch::Tensor(b), Branch::Constant(v)) => {
+            check_shape(out, b);
+            let bits = scalar_bits(v, out.dtype);
+            let x_constant = matches!(x, Branch::Constant(_));
+            let Some([o, c, t]) = checked("where_constant", [out, cond, b]) else {
+                return;
+            };
+            let (xd, yd) = if x_constant {
+                (null, &t as *const _)
+            } else {
+                (&t as *const _, null)
+            };
+            // SAFETY: as in `unary`; a null branch is the constant.
+            run("where_constant", out, |ctx| unsafe {
+                ffi::hmr_where_constant(ctx, &o, &c, xd, bits, yd, bits)
+            });
+        }
+        (Branch::Constant(u), Branch::Constant(v)) => {
+            let (xb, yb) = (scalar_bits(u, out.dtype), scalar_bits(v, out.dtype));
+            let Some([o, c]) = checked("where_constant", [out, cond]) else {
+                return;
+            };
+            // SAFETY: as in `unary`; both branches are constants.
+            run("where_constant", out, |ctx| unsafe {
+                ffi::hmr_where_constant(ctx, &o, &c, null, xb, null, yb)
+            });
+        }
+    }
 }
 
 /// The lower (`upper` false) or upper triangle of the matrices of `src` from `diagonal` on, as

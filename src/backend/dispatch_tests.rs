@@ -23,7 +23,7 @@ fn panic_message<R>(f: impl FnOnce() -> R) -> String {
 
 /// The kernels that the ROCm backend implements: with the `rocm` feature they reach the
 /// placeholder storage and panic there.
-const IMPLEMENTED: [&str; 37] = [
+const IMPLEMENTED: [&str; 38] = [
     "write_host",
     "read_host",
     "copy",
@@ -36,6 +36,7 @@ const IMPLEMENTED: [&str; 37] = [
     "binary_scalar",
     "fused",
     "where_",
+    "where_constant",
     "triangle",
     "flip",
     "uniform",
@@ -122,6 +123,29 @@ fn elementwise() {
     reaches("where_", || {
         let c = crate::zeros_with([2], (DType::Bool, GPU));
         crate::where_(&c, gpu(&[2]), gpu(&[2]))
+    });
+    // A scalar branch reaches the kernel as a constant, without a tensor of its own.
+    reaches("where_constant", || {
+        let c = crate::zeros_with([2], (DType::Bool, GPU));
+        crate::where_(&c, gpu(&[2]), 1.5)
+    });
+    reaches("where_constant", || {
+        let c = crate::zeros_with([2], (DType::Bool, GPU));
+        crate::where_(&c, 1.5, 0.0)
+    });
+    reaches("where_constant", || {
+        let m = crate::zeros_with([2], (DType::Bool, GPU));
+        gpu(&[2]).masked_fill(&m, 1.5)
+    });
+    // A zero-dimensional value of the same dtype isn't read (it always fits): straight to the
+    // kernel. One of another dtype is read first, to check that it fits.
+    reaches("where_", || {
+        let m = crate::zeros_with([2], (DType::Bool, GPU));
+        gpu(&[2]).masked_fill(&m, gpu(&[]))
+    });
+    reaches("read_host", || {
+        let m = crate::zeros_with([2], (DType::Bool, GPU));
+        gpu(&[2]).masked_fill(&m, crate::zeros_with([], (DType::I64, GPU)))
     });
     reaches("triangle", || gpu(&[2, 2]).triu(0));
     reaches("flip", || gpu(&[2, 2]).flip([0]));

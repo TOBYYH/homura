@@ -375,6 +375,23 @@ struct Select {
     __device__ T operator()(uint8_t c, T a, T b) const { return c != 0 ? a : b; }
 };
 
+// Select with a constant branch (hmr_where_constant): x fixed, y fixed, or both.
+template <class T>
+struct SelectX {
+    T x;
+    __device__ T operator()(uint8_t c, T b) const { return c != 0 ? x : b; }
+};
+template <class T>
+struct SelectY {
+    T y;
+    __device__ T operator()(uint8_t c, T a) const { return c != 0 ? a : y; }
+};
+template <class T>
+struct SelectXY {
+    T x, y;
+    __device__ T operator()(uint8_t c) const { return c != 0 ? x : y; }
+};
+
 // The general kernel: operands with arbitrary strides, a grid-stride loop over the output.
 template <class F, class O, class... I>
 struct Map {
@@ -1073,6 +1090,42 @@ hmr_status hmr_where(hmr_context_t ctx, const hmr_tensor_desc *out, const hmr_te
             return hmr::for_size(out->dtype, [&](auto size) {
                 using T = typename hmr::Bits<decltype(size)::v>::T;
                 return hmr::launch_map<hmr::Select<T>, T, uint8_t, T, T>(ops, n, {}, s);
+            });
+        });
+    });
+}
+
+hmr_status hmr_where_constant(hmr_context_t ctx, const hmr_tensor_desc *out,
+                              const hmr_tensor_desc *cond, const hmr_tensor_desc *x,
+                              uint64_t x_bits, const hmr_tensor_desc *y, uint64_t y_bits) {
+    return guarded([&] {
+        // A missing branch's slot repeats `cond` so that every slot holds a valid description;
+        // only the operands passed to the kernel are read.
+        hmr::Operands<4> all{{*out, *cond, x ? *x : *cond, y ? *y : *cond}};
+        int64_t n = 0;
+        if (hmr_status s = hmr::check_operands(all, n)) return s;
+        if (n == 0) return HMR_OK;
+        return hmr::launch_on(ctx, "where_constant", [&](hipStream_t s) {
+            if (cond->dtype != HMR_BOOL) return false;
+            if ((x && x->dtype != out->dtype) || (y && y->dtype != out->dtype)) return false;
+            return hmr::for_size(out->dtype, [&](auto size) {
+                using T = typename hmr::Bits<decltype(size)::v>::T;
+                T cx, cy;
+                std::memcpy(&cx, &x_bits, sizeof(T));  // the low bytes on a little-endian host
+                std::memcpy(&cy, &y_bits, sizeof(T));
+                if (x && y) {
+                    return hmr::launch_map<hmr::Select<T>, T, uint8_t, T, T>(all, n, {}, s);
+                }
+                if (y) {
+                    hmr::Operands<3> ops{{*out, *cond, *y}};
+                    return hmr::launch_map<hmr::SelectX<T>, T, uint8_t, T>(ops, n, {cx}, s);
+                }
+                if (x) {
+                    hmr::Operands<3> ops{{*out, *cond, *x}};
+                    return hmr::launch_map<hmr::SelectY<T>, T, uint8_t, T>(ops, n, {cy}, s);
+                }
+                hmr::Operands<2> ops{{*out, *cond}};
+                return hmr::launch_map<hmr::SelectXY<T>, T, uint8_t>(ops, n, {cx, cy}, s);
             });
         });
     });

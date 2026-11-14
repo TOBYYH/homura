@@ -13,7 +13,7 @@ pub(crate) mod locks;
 #[cfg(feature = "rocm")]
 pub(crate) mod rocm;
 
-pub(crate) use cpu::Fused;
+pub(crate) use cpu::{Branch, Fused};
 
 #[cfg(test)]
 mod dispatch_tests;
@@ -347,6 +347,13 @@ pub(crate) fn fused(
 #[track_caller]
 pub(crate) fn where_(out: &TensorData, cond: &TensorData, x: &TensorData, y: &TensorData) {
     dispatch_rocm!(out, where_(out, cond, x, y))
+}
+
+/// `out = cond ? x : y` with a branch that may be a constant, converted to the output's dtype as
+/// [`fill`] converts it.
+#[track_caller]
+pub(crate) fn where_constant(out: &TensorData, cond: &TensorData, x: Branch, y: Branch) {
+    dispatch_rocm!(out, where_constant(out, cond, x, y))
 }
 
 #[track_caller]

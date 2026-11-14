@@ -304,7 +304,7 @@ pub(crate) fn read_host<T: Element>(src: &TensorData) -> Vec<T> {
         exec(|| {
             Plan::new(&l.shape, [&l.strides]).for_each([l.offset], |[i]| {
                 // SAFETY: the layout lies inside the storage.
-                out.push(unsafe { *p.add(i) }.cast::<T>());
+                out.push(unsafe { *p.add(i) }.to_element::<T>());
             })
         });
     });
@@ -318,7 +318,7 @@ pub(crate) fn copy(dst: &TensorData, src: &TensorData) {
         dispatch_all!(src.dtype, T => map1::<T, T>(dst, &src, |x| x));
     } else {
         dispatch_all!(src.dtype, S => {
-            dispatch_all!(dst.dtype, D => map1::<S, D>(dst, &src, |x| x.cast::<D>()))
+            dispatch_all!(dst.dtype, D => map1::<S, D>(dst, &src, |x| x.to_element::<D>()))
         });
     }
 }

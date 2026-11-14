@@ -1,5 +1,5 @@
 // Element types and the conversions between them, shared by the kernels: they mirror homura's
-// Element::cast (src/dtype.rs) bit for bit, including NaN payloads:
+// Element::to_element (src/dtype.rs) bit for bit, including NaN payloads:
 // - a float source is converted to f64 exactly (a NaN keeps its payload and becomes quiet), then
 //   to the target: integers saturate to i64 (NaN is 0) and wrap, f32 rounds to nearest even
 //   (a NaN keeps the top of its payload and becomes quiet), f16 and bf16 go through f32 and

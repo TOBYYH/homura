@@ -183,7 +183,7 @@ pub trait Element:
     /// `255u8`). Other conversions deliberately differ: there PyTorch's result is platform
     /// dependent, for example `-2147483649.0` becomes `i32::MIN` on x86-64 but `i32::MAX` here.
     #[doc(hidden)]
-    fn cast<D: Element>(self) -> D {
+    fn to_element<D: Element>(self) -> D {
         match Self::DTYPE.kind() {
             Kind::Float => D::from_f64(self.to_f64()),
             Kind::Int => D::from_i64(self.to_i64()),
@@ -198,7 +198,7 @@ macro_rules! impl_int_element {
             fn to_f64(self) -> f64 { self as f64 }
             fn to_i64(self) -> i64 { self as i64 }
             fn to_bool(self) -> bool { self != 0 }
-            // Saturate to `i64`, then wrap: see `Element::cast`.
+            // Saturate to `i64`, then wrap: see `Element::to_element`.
             fn from_f64(v: f64) -> Self { v as i64 as $t }
             fn from_i64(v: i64) -> Self { v as $t }
             fn from_bool(v: bool) -> Self { v as $t }
@@ -609,19 +609,19 @@ mod tests {
 
     #[test]
     fn element_cast() {
-        assert_eq!((-1.7f32).cast::<i32>(), -1);
-        assert_eq!(300i64.cast::<u8>(), 44);
-        assert_eq!(300.0f32.cast::<u8>(), 44);
-        assert_eq!((-1.0f64).cast::<u8>(), 255);
-        assert_eq!((-129.9f32).cast::<i8>(), 127);
-        assert_eq!(f16::from_f32(-2.5).cast::<u8>(), 254);
-        assert_eq!(f64::NAN.cast::<i32>(), 0);
-        assert_eq!(f64::INFINITY.cast::<i64>(), i64::MAX);
-        assert_eq!(f64::INFINITY.cast::<i32>(), -1);
-        assert_eq!(1e30f32.cast::<i16>(), -1);
-        assert!(0.1f64.cast::<bool>());
-        assert_eq!(true.cast::<f16>(), f16::ONE);
-        assert_eq!(f16::from_f32(2.5).cast::<f32>(), 2.5);
+        assert_eq!((-1.7f32).to_element::<i32>(), -1);
+        assert_eq!(300i64.to_element::<u8>(), 44);
+        assert_eq!(300.0f32.to_element::<u8>(), 44);
+        assert_eq!((-1.0f64).to_element::<u8>(), 255);
+        assert_eq!((-129.9f32).to_element::<i8>(), 127);
+        assert_eq!(f16::from_f32(-2.5).to_element::<u8>(), 254);
+        assert_eq!(f64::NAN.to_element::<i32>(), 0);
+        assert_eq!(f64::INFINITY.to_element::<i64>(), i64::MAX);
+        assert_eq!(f64::INFINITY.to_element::<i32>(), -1);
+        assert_eq!(1e30f32.to_element::<i16>(), -1);
+        assert!(0.1f64.to_element::<bool>());
+        assert_eq!(true.to_element::<f16>(), f16::ONE);
+        assert_eq!(f16::from_f32(2.5).to_element::<f32>(), 2.5);
     }
 
     /// Half types are rounded through `f32`, matching PyTorch (golden venv, torch 2.14.1) on
@@ -632,24 +632,35 @@ mod tests {
         // F32 -> BF16 above a tie only in the last three bits of the f32 mantissa: torch 0x3f81
         // (`half::bf16::from_f64` gives 0x3f80).
         assert_eq!(
-            ((1.0 + p(-8) + p(-21)) as f32).cast::<bf16>().to_bits(),
+            ((1.0 + p(-8) + p(-21)) as f32)
+                .to_element::<bf16>()
+                .to_bits(),
             0x3f81
         );
-        assert_eq!((1.0 + p(-8) + p(-21)).cast::<bf16>().to_bits(), 0x3f81);
+        assert_eq!(
+            (1.0 + p(-8) + p(-21)).to_element::<bf16>().to_bits(),
+            0x3f81
+        );
         // F64 -> half just above a tie that F32 rounds away: torch rounds to even (down).
-        assert_eq!((1.0 + p(-8) + p(-40)).cast::<bf16>().to_bits(), 0x3f80);
-        assert_eq!((1.0 + p(-11) + p(-40)).cast::<f16>().to_bits(), 0x3c00);
+        assert_eq!(
+            (1.0 + p(-8) + p(-40)).to_element::<bf16>().to_bits(),
+            0x3f80
+        );
+        assert_eq!(
+            (1.0 + p(-11) + p(-40)).to_element::<f16>().to_bits(),
+            0x3c00
+        );
         // Integers go to f32 first: 2^24 + 1 rounds to 2^24 in f32, then is exact in bf16.
-        assert_eq!(((1i64 << 24) + 1).cast::<bf16>().to_f64(), p(24));
+        assert_eq!(((1i64 << 24) + 1).to_element::<bf16>().to_f64(), p(24));
         // 2^24 + 2^16 + 1: f32 rounds it to the bf16 tie 2^24 + 2^16, which rounds to even.
         assert_eq!(
-            ((1i64 << 24) + (1 << 16) + 1).cast::<bf16>().to_f64(),
+            ((1i64 << 24) + (1 << 16) + 1).to_element::<bf16>().to_f64(),
             p(24)
         );
-        assert_eq!(i64::MAX.cast::<bf16>().to_f64(), p(63));
-        assert_eq!(70000i64.cast::<f16>(), f16::INFINITY);
+        assert_eq!(i64::MAX.to_element::<bf16>().to_f64(), p(63));
+        assert_eq!(70000i64.to_element::<f16>(), f16::INFINITY);
         // NaN stays NaN (quiet) with its sign.
-        assert!(f64::NAN.cast::<f16>().is_nan());
-        assert!((-f64::NAN).cast::<bf16>().is_sign_negative());
+        assert!(f64::NAN.to_element::<f16>().is_nan());
+        assert!((-f64::NAN).to_element::<bf16>().is_sign_negative());
     }
 }

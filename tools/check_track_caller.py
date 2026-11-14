@@ -60,7 +60,7 @@ CALLBACK = (
     "would apply to the user's implementation and move panics in it to homura's call site"
 )
 ALLOWED = {
-    ("src/dtype.rs", "cast"): "Element::cast: hidden, infallible element conversion of the kernels",
+    ("src/dtype.rs", "to_element"): "Element::to_element: hidden, infallible element conversion of the kernels",
     ("src/autograd/function.rs", "forward"): CALLBACK,
     ("src/autograd/function.rs", "backward"): CALLBACK,
     ("src/nn/module.rs", "parameter"): CALLBACK,

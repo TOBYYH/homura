@@ -1,5 +1,5 @@
 // Copies, dtype conversions and fills of strided tensors. The conversions are those of elem.hpp,
-// which mirror homura's Element::cast.
+// which mirror homura's Element::to_element.
 #include "elem.hpp"
 #include "kernel.hpp"
 

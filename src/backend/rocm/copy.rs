@@ -209,7 +209,7 @@ pub(crate) fn read_host<T: Element>(src: &TensorData) -> Vec<T> {
                 // SAFETY: `bytes` holds `n` elements of `S` read from a tensor of that dtype;
                 // `Bool` bytes are 0 or 1 (the invariant of `Bool` data).
                 let v: S = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(i * size).cast()) };
-                v.cast::<T>()
+                v.to_element::<T>()
             })
             .collect()
     })
